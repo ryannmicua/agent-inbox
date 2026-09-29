@@ -121,6 +121,11 @@ func (s *PostgresStore) GetMessage(ctx context.Context, id, tenant string) (Deli
 		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2`, id, tenant))
 }
 
+func (s *PostgresStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
+	return scanMessage(s.db.QueryRowContext(ctx,
+		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2 AND recipient_id = $3`, id, tenant, recipient))
+}
+
 func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
 	encoded, err := json.Marshal(e)
 	if err != nil {

@@ -58,6 +58,7 @@ type Store interface {
 	Ping(context.Context) error
 	RecordNonce(context.Context, string, string, time.Time) error
 	GetMessage(context.Context, string, string) (DeliveredMessage, error)
+	GetReplyTarget(context.Context, string, string, string) (DeliveredMessage, error)
 	CreateMessage(context.Context, Envelope, string) (DeliveredMessage, bool, error)
 	ListMessages(context.Context, string, string, int) ([]DeliveredMessage, error)
 	Acknowledge(context.Context, string, string, string) (bool, error)
@@ -234,6 +235,10 @@ func (s *SQLiteStore) RecordNonce(ctx context.Context, agent, nonce string, now 
 
 func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
 	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
+}
+
+func (s *SQLiteStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
 }
 
 func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {

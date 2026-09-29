@@ -900,8 +900,106 @@ func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, status, apiErr = s.send(t, result, "agent-b")
-	if apiErr == nil || apiErr.Error.Code != "reply_correlation_mismatch" || status < 400 {
+	if apiErr == nil || apiErr.Error.Code != "invalid_reply_to" || status < 400 {
 		t.Fatalf("mis-correlated result was accepted: status=%d err=%+v", status, apiErr)
+	}
+}
+
+func TestReplyTargetPrivacyUsesOneClientRejection(t *testing.T) {
+	s := newTestSystem(t)
+	for i := range s.registry.Agents {
+		if s.registry.Agents[i].ID == "agent-c" {
+			s.registry.Agents[i].TenantID = "tenant-one"
+		}
+	}
+	writeRegistry(t, s.registryFile, s.registry)
+
+	unrelated := s.envelope(t, "agent-a", "agent-c", "instruction", `{"task":"private to agent-c"}`)
+	if _, status, apiErr := s.send(t, unrelated, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("unrelated instruction failed: HTTP %d %+v", status, apiErr)
+	}
+	addressed := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"for agent-b"}`)
+	if _, status, apiErr := s.send(t, addressed, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("addressed instruction failed: HTTP %d %+v", status, apiErr)
+	}
+	if _, err := s.store.GetReplyTarget(context.Background(), addressed.ID, "tenant-one", "agent-b"); err != nil {
+		t.Fatalf("reply target addressed to sender was hidden: %v", err)
+	}
+	if _, err := s.store.GetReplyTarget(context.Background(), unrelated.ID, "tenant-one", "agent-b"); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("reply lookup returned a message addressed to another agent: %v", err)
+	}
+	unknownID, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongTask, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name      string
+		replyTo   string
+		taskID    string
+		threadID  string
+		auditCode string
+	}{
+		{name: "unknown", replyTo: unknownID, taskID: wrongTask, threadID: addressed.ThreadID, auditCode: "reply_not_found"},
+		{name: "not addressed to sender", replyTo: unrelated.ID, taskID: unrelated.TaskID, threadID: unrelated.ThreadID, auditCode: "reply_not_found"},
+		{name: "correlation mismatch", replyTo: addressed.ID, taskID: wrongTask, threadID: addressed.ThreadID, auditCode: "reply_correlation_mismatch"},
+	}
+	var wantStatus int
+	var wantBody string
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			result := s.envelope(t, "agent-b", "agent-a", "result", `{"result":"ready"}`)
+			result.ReplyTo = test.replyTo
+			result.TaskID = test.taskID
+			result.ThreadID = test.threadID
+			if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages", body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var apiErr ErrorResponse
+			if err := json.Unmarshal(data, &apiErr); err != nil || apiErr.Error.Code != "invalid_reply_to" {
+				t.Fatalf("reply rejection disclosed its reason: HTTP %d %s (%v)", status, data, err)
+			}
+			if wantBody == "" {
+				wantBody, wantStatus = string(data), status
+			} else if string(data) != wantBody || status != wantStatus {
+				t.Fatalf("reply rejection differed: got HTTP %d %s, want HTTP %d %s", status, data, wantStatus, wantBody)
+			}
+		})
+	}
+
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotAuditCodes := make([]string, 0, len(cases))
+	for _, entry := range entries {
+		if entry.Action == "send" && entry.Outcome == "rejected" {
+			gotAuditCodes = append(gotAuditCodes, entry.Code)
+		}
+	}
+	for _, test := range cases {
+		found := false
+		for i, got := range gotAuditCodes {
+			if got == test.auditCode {
+				gotAuditCodes = append(gotAuditCodes[:i], gotAuditCodes[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("audit omitted private reply rejection reason %q: %+v", test.auditCode, entries)
+		}
 	}
 }
 

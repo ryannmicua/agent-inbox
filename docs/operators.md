@@ -1,11 +1,12 @@
 # Operator guide
 
-This guide covers operating the standalone inbox. The human control
-surface is the reviewed registry plus the local audit and monitoring commands;
-agents have no registry or administrative endpoint. The service accepts signed
-machine requests and sends human-visible event notifications through a generic
-webhook. Local Compose uses a bundled sink that logs notification events;
-production must configure a human-operated webhook.
+This guide covers operating the standalone inbox. Operators manage it through
+the reviewed registry plus audit and monitoring commands; agents have no
+registry or administrative endpoint. Human-authored requests use a separate
+organization-owned issue-tracker form, which is outside this pilot. The service
+accepts signed machine requests and sends human-visible event notifications
+through a generic webhook. Local Compose uses a bundled sink that logs
+notification events; production must configure a human-operated webhook.
 
 ## Requirements and first start
 
@@ -334,7 +335,7 @@ proxy when requests cross an untrusted network.
 | `wrong_tenant` | Sender and recipient have different registry tenants. Do not accept a tenant from the caller; review the human-approved assignment. |
 | `secret_detected` | A payload, provenance field, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
 | `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |
-| `reply_to_required` / `reply_correlation_mismatch` | A result must refer to the addressed message and reuse its task and thread IDs. |
+| `reply_to_required` / `invalid_reply_to` | A result must refer to a message addressed to its sender and reuse its task and thread IDs. The client response does not reveal whether a reference is missing, inaccessible, or mis-correlated; inspect the audit record for the internal reason. |
 | `message_id_conflict` | The ID already belongs to different content. Generate a new message ID; use an existing ID only for an identical retry. |
 | `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |

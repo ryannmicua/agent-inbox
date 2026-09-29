@@ -229,13 +229,17 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		return
 	}
 	if e.ReplyTo != "" {
-		original, err := s.store.GetMessage(r.Context(), e.ReplyTo, auth.agent.TenantID)
+		original, err := s.store.GetReplyTarget(r.Context(), e.ReplyTo, auth.agent.TenantID, auth.agent.ID)
 		if err != nil {
-			s.rejectSend(w, auth.agent, "reply_not_found", "reply_to must reference a stored message", messageID)
+			reason := "reply_not_found"
+			if !errors.Is(err, ErrMessageNotFound) {
+				reason = "reply_lookup_failed"
+			}
+			s.rejectReply(w, auth.agent, reason, messageID)
 			return
 		}
 		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
-			s.rejectSend(w, auth.agent, "reply_correlation_mismatch", "reply_to must correlate to the addressed message and task", messageID)
+			s.rejectReply(w, auth.agent, "reply_correlation_mismatch", messageID)
 			return
 		}
 	} else if e.Kind == "result" {
@@ -333,6 +337,10 @@ func (s *Server) rejectRecipient(w http.ResponseWriter, agent RegistryAgent, rea
 	s.rejectSendWithAuditCode(w, agent, "recipient_not_allowed", reason, "recipient is unavailable or not allowed", messageID)
 }
 
+func (s *Server) rejectReply(w http.ResponseWriter, agent RegistryAgent, reason, messageID string) {
+	s.rejectSendWithAuditCode(w, agent, "invalid_reply_to", reason, "reply_to must reference a correlated message addressed to this sender", messageID)
+}
+
 func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAgent, code, auditCode, message, messageID string) {
 	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
 		log.Printf("record rejected send by %s (%s): %v", agent.ID, auditCode, err)
@@ -340,7 +348,7 @@ func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAg
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
-	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed", "reply_correlation_mismatch":
+	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed":
 		status = http.StatusForbidden
 	case "message_id_conflict":
 		status = http.StatusConflict
