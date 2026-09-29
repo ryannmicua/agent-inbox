@@ -12,6 +12,7 @@ tmp_dir="$(mktemp -d)"
 project="agent-inbox-smoke-$$"
 export INBOX_HOST_PORT="${INBOX_HOST_PORT:-18080}"
 export INBOX_REGISTRY_FILE="$tmp_dir/registry.json"
+export INBOX_WEBHOOK_URL="http://127.0.0.1:9"
 compose=(docker compose --project-name "$project" -f compose.yaml)
 
 cleanup() {
@@ -61,7 +62,7 @@ python3 -c 'import json,sys; p=json.load(sys.stdin); assert len(p["messages"]) =
 
 result="$("$cli" send --server "$server" --agent agent-b --key "$tmp_dir/agent-b.key" --to agent-a --kind result --task "$task_id" --thread "$thread_id" --reply-to "$message_id" --payload '{"result":"ready"}')"
 result_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$result")"
-returned="$("$cli" receive --server "$server" --agent agent-a --key "$tmp_dir/agent-a.key")"
+returned="$("$cli" poll --server "$server" --agent agent-a --key "$tmp_dir/agent-a.key")"
 python3 -c 'import json,sys; p=json.load(sys.stdin); assert len(p["messages"]) == 1; m=p["messages"][0]; assert m["id"] == sys.argv[1]; assert m["reply_to"] == sys.argv[2]; assert m["kind"] == "result"' "$result_id" "$message_id" <<< "$returned"
 "$cli" ack --server "$server" --agent agent-a --key "$tmp_dir/agent-a.key" --message "$result_id" --note "result processed" >/dev/null
 

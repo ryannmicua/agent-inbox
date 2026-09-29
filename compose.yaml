@@ -9,7 +9,7 @@ services:
       INBOX_STORAGE: ${INBOX_STORAGE:-sqlite}
       INBOX_DB_PATH: /var/lib/agent-inbox/inbox.db
       INBOX_REGISTRY_PATH: /etc/agent-inbox/registry.json
-      INBOX_WEBHOOK_URL: ${INBOX_WEBHOOK_URL:-}
+      INBOX_WEBHOOK_URL: ${INBOX_WEBHOOK_URL:?INBOX_WEBHOOK_URL must point to a human notification endpoint}
       INBOX_RETRY_INTERVAL: ${INBOX_RETRY_INTERVAL:-30s}
       INBOX_MAX_DOORBELL_ATTEMPTS: ${INBOX_MAX_DOORBELL_ATTEMPTS:-3}
     ports:

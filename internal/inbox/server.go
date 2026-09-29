@@ -60,9 +60,9 @@ type authContext struct {
 	key   ed25519.PublicKey
 }
 
-func NewServer(store Store, registry RegistrySource, notifier Notifier, config ServerConfig) *Server {
+func NewServer(store Store, registry RegistrySource, notifier Notifier, config ServerConfig) (*Server, error) {
 	if notifier == nil {
-		notifier = NoopNotifier{}
+		return nil, errors.New("notifier is required")
 	}
 	if config.RequestSkew <= 0 {
 		config.RequestSkew = 5 * time.Minute
@@ -76,16 +76,12 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 	if config.MaxPollLimit <= 0 {
 		config.MaxPollLimit = 100
 	}
-	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub()}
+	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub()}, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
-		s.health(w, r)
-		return
-	}
-	if !strings.HasPrefix(r.URL.Path, "/v1/") {
-		writeError(w, http.StatusNotFound, "not_found", "route not found")
+	if !hasRequestSignature(r) {
+		writeAPIError(w, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"})
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
@@ -94,14 +90,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(body) > MaxRequestBytes {
-		identity := r.Header.Get(HeaderAgent)
-		s.recordRejected(r, identity, "request_too_large", "request body exceeds the configured limit")
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 64 KiB")
 		return
 	}
 	identity, apiErr := s.authenticate(r, body)
 	if apiErr != nil {
-		s.recordRejected(r, r.Header.Get(HeaderAgent), apiErr.Code, apiErr.Message)
 		writeAPIError(w, apiErr)
 		return
 	}
@@ -117,6 +110,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.poll(w, r, identity)
 	case r.URL.Path == "/v1/events" && r.Method == http.MethodGet:
 		s.events(w, r, identity)
+	case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
+		s.health(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/messages/") && strings.HasSuffix(r.URL.Path, "/ack") && r.Method == http.MethodPost:
 		s.ack(w, r, identity)
 	default:
@@ -130,9 +125,6 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 	timestamp := r.Header.Get(HeaderTimestamp)
 	nonce := r.Header.Get(HeaderNonce)
 	signature := r.Header.Get(HeaderSignature)
-	if agentID == "" || keyID == "" || timestamp == "" || nonce == "" || signature == "" {
-		return authContext{}, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"}
-	}
 	if !noncePattern.MatchString(nonce) {
 		return authContext{}, &APIError{Code: "invalid_nonce", Message: "request nonce must be 16 to 128 URL-safe characters"}
 	}
@@ -208,7 +200,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		return
 	}
 	if e.ReplyTo != "" {
-		original, err := s.store.GetMessage(r.Context(), e.ReplyTo)
+		original, err := s.store.GetMessage(r.Context(), e.ReplyTo, auth.agent.TenantID)
 		if err != nil {
 			s.rejectSend(w, auth.agent, "reply_not_found", "reply_to must reference a stored message")
 			return
@@ -335,8 +327,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		}
 		limit = parsed
 	}
-	includeAcked := r.URL.Query().Get("include_acked") == "true"
-	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, after, limit, includeAcked)
+	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, auth.agent.TenantID, after, limit)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
 		return
@@ -414,10 +405,16 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, auth authContext
 		case <-r.Context().Done():
 			return
 		case event := <-ch:
+			if !s.assignedToTenant(auth.agent.ID, auth.agent.TenantID) {
+				return
+			}
 			encoded, _ := json.Marshal(event)
 			_, _ = fmt.Fprintf(w, "id: %d\nevent: doorbell\ndata: %s\n\n", event.Sequence, encoded)
 			flusher.Flush()
 		case <-heartbeat.C:
+			if !s.assignedToTenant(auth.agent.ID, auth.agent.TenantID) {
+				return
+			}
 			_, _ = fmt.Fprint(w, ": heartbeat\n\n")
 			flusher.Flush()
 		}
@@ -454,6 +451,9 @@ func (s *Server) dispatchDue(ctx context.Context) {
 		return
 	}
 	for _, c := range candidates {
+		if !s.assignedToTenant(c.Recipient, c.TenantID) {
+			continue
+		}
 		if c.Attempts < s.config.MaxDoorbellAttempts {
 			s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
 			if err := s.store.MarkNotified(ctx, c.MessageID, s.now()); err != nil {
@@ -464,7 +464,7 @@ func (s *Server) dispatchDue(ctx context.Context) {
 		if c.Escalated {
 			continue
 		}
-		if err := s.notifier.Notify(ctx, Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient}); err != nil {
+		if err := s.notifier.Notify(ctx, Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID}); err != nil {
 			log.Printf("escalate unacknowledged message %s: %v", c.MessageID, err)
 			continue
 		}
@@ -475,10 +475,18 @@ func (s *Server) dispatchDue(ctx context.Context) {
 }
 
 func (s *Server) ring(message DeliveredMessage) {
+	if !s.assignedToTenant(message.RecipientID, message.TenantID) {
+		return
+	}
 	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
 	if err := s.store.MarkNotified(context.Background(), message.ID, s.now()); err != nil {
 		log.Printf("record initial doorbell for %s: %v", message.ID, err)
 	}
+}
+
+func (s *Server) assignedToTenant(agentID, tenantID string) bool {
+	agent, err := s.registry.Agent(agentID)
+	return err == nil && agent.TenantID == tenantID
 }
 
 func (s *Server) notify(event Notification) {
@@ -487,26 +495,12 @@ func (s *Server) notify(event Notification) {
 	}
 }
 
-func (s *Server) recordRejected(r *http.Request, agentID, code, message string) {
-	action := "api.request"
-	if r.URL.Path == "/v1/messages" && r.Method == http.MethodPost {
-		action = "send"
-	} else if strings.HasSuffix(r.URL.Path, "/ack") {
-		action = "ack"
-	}
-	entry := AuditRecord{Action: action, ActorID: agentID, Outcome: "rejected", Code: code}
-	if agent, err := s.registry.Agent(agentID); err == nil {
-		entry.TenantID = agent.TenantID
-	}
-	if len(r.URL.Path) < 2048 {
-		entry.Detail = map[string]any{"method": r.Method, "path": r.URL.Path, "reason": message}
-	}
-	if err := s.store.AppendAudit(context.Background(), entry); err != nil {
-		log.Printf("record rejected request: %v", err)
-	}
-	if action == "send" {
-		s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), SenderID: agentID, TenantID: entry.TenantID, Code: code})
-	}
+func hasRequestSignature(r *http.Request) bool {
+	return r.Header.Get(HeaderAgent) != "" &&
+		r.Header.Get(HeaderKeyID) != "" &&
+		r.Header.Get(HeaderTimestamp) != "" &&
+		r.Header.Get(HeaderNonce) != "" &&
+		r.Header.Get(HeaderSignature) != ""
 }
 
 func decodeStrict(body io.Reader, target any) error {

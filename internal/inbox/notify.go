@@ -24,10 +24,6 @@ type Notifier interface {
 	Notify(context.Context, Notification) error
 }
 
-type NoopNotifier struct{}
-
-func (NoopNotifier) Notify(context.Context, Notification) error { return nil }
-
 type WebhookNotifier struct {
 	URL    string
 	Client *http.Client
@@ -35,7 +31,7 @@ type WebhookNotifier struct {
 
 func (w WebhookNotifier) Notify(ctx context.Context, event Notification) error {
 	if w.URL == "" {
-		return nil
+		return errors.New("webhook URL is required")
 	}
 	body, err := json.Marshal(event)
 	if err != nil {

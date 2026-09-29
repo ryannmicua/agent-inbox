@@ -32,9 +32,6 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runKeygen(args[1:], stdout)
 	}
 	command := args[0]
-	if command == "receive" {
-		command = "poll"
-	}
 	if command != "send" && command != "poll" && command != "ack" && command != "wait" {
 		return fmt.Errorf("unknown command %q (run agent-inbox help)", args[0])
 	}
@@ -216,7 +213,7 @@ func usage(w io.Writer) {
 Commands:
   keygen --private-key PATH --public-key PATH
   send --server URL --agent ID --key PATH --to ID --kind instruction|result --payload-file FILE
-  poll [--after-seq N] [--limit N]      (receive is an alias)
+  poll [--after-seq N] [--limit N]
   ack --message UUID [--note TEXT]
   wait                                   (listen for doorbell prompts)
 

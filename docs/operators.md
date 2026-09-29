@@ -3,14 +3,16 @@
 This guide covers operating the standalone SQLite inbox. The human control
 surface is the reviewed registry plus the local audit and monitoring commands;
 agents have no registry or administrative endpoint. The service accepts signed
-machine requests and may send human-visible event notifications to a generic
-webhook. Its default webhook is a no-op.
+machine requests and sends human-visible event notifications to a required
+generic webhook.
 
 ## Requirements and first start
 
 - Docker Engine with the Compose plugin.
 - A registry file readable by the service. Start from the empty
   [`config/registry.json`](../config/registry.json).
+- A reachable human notification webhook URL, configured as
+  `INBOX_WEBHOOK_URL` before starting Compose.
 - A TLS-terminating reverse proxy for use outside a trusted local test. The
   service itself listens on plain HTTP and does not manage certificates.
 
@@ -19,17 +21,18 @@ webhook. Its default webhook is a no-op.
    only the public key from each agent through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).
-4. Start the Compose service:
+4. Set the webhook endpoint and start the Compose service:
 
    ```sh
+   export INBOX_WEBHOOK_URL="https://hooks.example.com/agent-inbox"
    docker compose up -d --build
    docker compose ps
    ```
 
-5. Confirm health and service logs:
+5. Confirm the local listener and SQLite health check, then inspect service logs:
 
    ```sh
-   curl --fail http://127.0.0.1:8080/healthz
+   docker compose exec -T server inboxd healthcheck
    docker compose logs --tail=100 server
    ```
 
@@ -53,7 +56,7 @@ its test volume.
 | `INBOX_STORAGE` | `sqlite` | Storage backend. Only `sqlite` ships in this pilot. |
 | `INBOX_DB_PATH` | `/var/lib/agent-inbox/inbox.db` | SQLite database path. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
-| `INBOX_WEBHOOK_URL` | empty | Optional generic HTTP webhook for consequential events. Empty selects no-op notifications. |
+| `INBOX_WEBHOOK_URL` | required | Generic HTTP webhook for consequential human-visible events. Compose refuses to start without it. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Total doorbell notifications, including the initial ring, before one escalation. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
@@ -131,19 +134,23 @@ Replace the file and confirm the old credentials receive `unregistered_agent`
 or `unknown_key`. Revocation affects new requests immediately; it does not
 delete already accepted messages or audit history.
 
+Changing an agent's tenant immediately isolates it from messages stored under
+its previous tenant. Those messages remain in the audit and storage history but
+no longer appear in that agent's polls, can no longer be acknowledged by it, and
+will not trigger further doorbells or escalations to it.
+
 ## Signing and delivery behavior
 
-All `/v1/` HTTP requests require Ed25519 request headers. Their canonical
-signing bytes are the UTF-8 text:
+Every HTTP request, including health checks and unknown routes, requires
+Ed25519 request headers. Their canonical signing bytes are the UTF-8 text:
 
 ```text
 agent-inbox-request-v1\n<agent-id>\n<key-id>\n<METHOD>\n<exact-path-and-query>\n<unix-seconds>\n<nonce>\n<lowercase-hex-sha256-of-body>
 ```
 
-`/healthz` is the only unsigned operational route. The signed nonce is stored
-with a uniqueness constraint and the timestamp must be within the configured
-skew. Each message has a second signature. Message signing bytes are
-`agent-inbox-envelope-v1\n` followed by compact JSON of the sender-authored
+The signed nonce is stored with a uniqueness constraint and the timestamp must
+be within the configured skew. Each message has a second signature. Message
+signing bytes are `agent-inbox-envelope-v1\n` followed by compact JSON of the sender-authored
 fields, in the order `type`, `id`, `task_id`, `thread_id`, optional `reply_to`,
 `sender_id`, `recipient_id`, `key_id`, `kind`, `created_at`, optional
 `asserted_authority`, `content_is_data`, `payload`, `artifacts`, and optional
@@ -169,7 +176,7 @@ The signed JSON API is:
 | `GET /v1/messages?after_seq=N&limit=N` | Poll only the authenticated agent's unacknowledged inbox in sequence order. |
 | `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true,"processed_at":"<RFC3339>"}`. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
-| `GET /healthz` | Unsigned process and storage health check; returns no message data. |
+| `GET /healthz` | Signed storage health check; returns no message data. |
 
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 `X-Request-Nonce`, and `X-Request-Signature` headers. The signature covers the
@@ -216,7 +223,7 @@ docker compose run --rm --no-deps \
     chmod 0600 /var/lib/agent-inbox/inbox.db
   '
 docker compose up -d server
-curl --fail http://127.0.0.1:8080/healthz
+docker compose exec -T server inboxd healthcheck
 ```
 
 The restore container mounts the same Compose named volume. Keep the source
@@ -232,7 +239,7 @@ backup outside the database volume and never restore over a running server.
    docker compose build --pull
    docker compose up -d --remove-orphans
    docker compose ps
-   curl --fail http://127.0.0.1:8080/healthz
+   docker compose exec -T server inboxd healthcheck
    ```
 
 The Compose named volume survives container replacement. This pilot creates
@@ -251,14 +258,17 @@ docker compose exec -T server inboxd audit \
 ```
 
 Output is JSON in descending audit sequence. Records include accepted and
-rejected sends, accepted and rejected acknowledgements, duplicate sends, and
-authentication failures. Audit rows are append-only: SQLite triggers reject
-updates and deletes. Restrict access to the database volume and audit output.
+authenticated rejected sends, accepted and rejected acknowledgements, duplicate
+sends, and unacknowledged escalations. Unauthenticated failures are not
+persisted. Audit rows are append-only: SQLite triggers reject updates and
+deletes. Restrict access to the database volume and audit output.
 
 Monitor:
 
-- `GET /healthz` for process and SQLite availability. It returns `200` when
-  storage responds and `503` if it does not.
+- `docker compose exec -T server inboxd healthcheck` and the Compose health
+  state for listener and SQLite availability. Use a signed `agent-inbox poll` request
+  to confirm an agent can reach the HTTP API; signed `GET /healthz` reports
+  storage availability.
 - `docker compose ps` health state and `docker compose logs server` for
   registry, storage, and webhook errors.
 - Database volume and filesystem free space, backup age, and backup restore
@@ -267,9 +277,9 @@ Monitor:
 - Unacknowledged messages through the audit log and receiver poll. A
   notification or transport outage does not prove the agent is dead.
 
-The health endpoint exposes only a status and storage result. All other `/v1/`
-requests are signed. Keep the service behind a TLS-terminating proxy when
-requests cross an untrusted network.
+The health endpoint exposes only a status and storage result. Every HTTP
+request is signed. Keep the service behind a TLS-terminating proxy when requests
+cross an untrusted network.
 
 ## Troubleshooting common rejections
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,6 +43,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	listen := envOr("INBOX_LISTEN_ADDR", ":8080")
 	dbPath := envOr("INBOX_DB_PATH", "/var/lib/agent-inbox/inbox.db")
 	registryPath := envOr("INBOX_REGISTRY_PATH", "/etc/agent-inbox/registry.json")
+	webhook := os.Getenv("INBOX_WEBHOOK_URL")
+	if webhook == "" {
+		return errors.New("INBOX_WEBHOOK_URL is required for human-visible notifications")
+	}
 	store, err := inbox.OpenStore(envOr("INBOX_STORAGE", "sqlite"), dbPath)
 	if err != nil {
 		return err
@@ -55,11 +60,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	config.RequestSkew = durationEnv("INBOX_REQUEST_SKEW", config.RequestSkew)
 	config.RetryInterval = durationEnv("INBOX_RETRY_INTERVAL", config.RetryInterval)
 	config.MaxDoorbellAttempts = intEnv("INBOX_MAX_DOORBELL_ATTEMPTS", config.MaxDoorbellAttempts)
-	notifier := inbox.Notifier(inbox.NoopNotifier{})
-	if webhook := os.Getenv("INBOX_WEBHOOK_URL"); webhook != "" {
-		notifier = inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}
+	service, err := inbox.NewServer(store, registry, inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, config)
+	if err != nil {
+		return err
 	}
-	service := inbox.NewServer(store, registry, notifier, config)
 	server := &http.Server{Addr: listen, Handler: service, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -143,18 +147,36 @@ func requireDatabaseFile(path string) error {
 func runHealthcheck(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	endpoint := flags.String("url", "http://127.0.0.1:8080/healthz", "health endpoint URL")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get(*endpoint)
+	dbPath := envOr("INBOX_DB_PATH", "/var/lib/agent-inbox/inbox.db")
+	if err := requireDatabaseFile(dbPath); err != nil {
+		return err
+	}
+	store, err := inbox.OpenStore(envOr("INBOX_STORAGE", "sqlite"), dbPath)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("health endpoint returned HTTP %d", response.StatusCode)
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := store.Ping(ctx); err != nil {
+		return err
+	}
+	host, port, err := net.SplitHostPort(envOr("INBOX_LISTEN_ADDR", ":8080"))
+	if err != nil {
+		return fmt.Errorf("parse listener address: %w", err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	connection, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+	if err != nil {
+		return err
+	}
+	if err := connection.Close(); err != nil {
+		return err
 	}
 	fmt.Fprintln(stdout, "healthy")
 	return nil
@@ -198,7 +220,7 @@ func usage(w io.Writer) {
 
 Run server with environment: INBOX_LISTEN_ADDR, INBOX_DB_PATH, INBOX_REGISTRY_PATH.
 Operator commands:
-  inboxd healthcheck [--url URL]
+  inboxd healthcheck
   inboxd audit --db PATH [--limit 100]
   inboxd backup --db PATH --out NEW_PATH`)
 }

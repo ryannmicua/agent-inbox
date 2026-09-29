@@ -47,6 +47,7 @@ type AuditEntry struct {
 type NotificationCandidate struct {
 	MessageID string
 	Recipient string
+	TenantID  string
 	Sequence  int64
 	Attempts  int
 	Escalated bool
@@ -57,9 +58,9 @@ type NotificationCandidate struct {
 type Store interface {
 	Ping(context.Context) error
 	RecordNonce(context.Context, string, string, time.Time) error
-	GetMessage(context.Context, string) (DeliveredMessage, error)
+	GetMessage(context.Context, string, string) (DeliveredMessage, error)
 	CreateMessage(context.Context, Envelope, string) (DeliveredMessage, bool, error)
-	ListMessages(context.Context, string, int64, int, bool) ([]DeliveredMessage, error)
+	ListMessages(context.Context, string, string, int64, int) ([]DeliveredMessage, error)
 	Acknowledge(context.Context, string, string, string, string) (bool, error)
 	AppendAudit(context.Context, AuditRecord) error
 	AuditEntries(context.Context, int) ([]AuditEntry, error)
@@ -195,8 +196,8 @@ func (s *SQLiteStore) RecordNonce(ctx context.Context, agent, nonce string, now 
 	return nil
 }
 
-func (s *SQLiteStore) GetMessage(ctx context.Context, id string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE id = ?`, id))
+func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
 }
 
 func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
@@ -214,9 +215,12 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		return DeliveredMessage{}, false, err
 	}
 	defer tx.Rollback()
-	var existingJSON string
-	err = tx.QueryRowContext(ctx, `SELECT envelope_json FROM messages WHERE id = ?`, e.ID).Scan(&existingJSON)
+	var existingJSON, existingTenant string
+	err = tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE id = ?`, e.ID).Scan(&existingJSON, &existingTenant)
 	if err == nil {
+		if existingTenant != tenant {
+			return DeliveredMessage{}, false, ErrMessageConflict
+		}
 		var existing Envelope
 		if json.Unmarshal([]byte(existingJSON), &existing) != nil {
 			return DeliveredMessage{}, false, errors.New("stored message is invalid")
@@ -262,13 +266,8 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	return DeliveredMessage{Envelope: e, TenantID: tenant, Sequence: sequence, AcceptedAt: now}, false, nil
 }
 
-func (s *SQLiteStore) ListMessages(ctx context.Context, recipient string, after int64, limit int, includeAcked bool) ([]DeliveredMessage, error) {
-	query := `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE recipient_id = ? AND sequence > ?`
-	if !includeAcked {
-		query += ` AND acknowledged_at IS NULL`
-	}
-	query += ` ORDER BY sequence ASC LIMIT ?`
-	rows, err := s.db.QueryContext(ctx, query, recipient, after, limit)
+func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string, after int64, limit int) ([]DeliveredMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE recipient_id = ? AND tenant_id = ? AND sequence > ? AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT ?`, recipient, tenant, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -290,16 +289,16 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant, note s
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient string
+	var recipient, messageTenant string
 	var acknowledged sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT recipient_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &acknowledged)
+	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &messageTenant, &acknowledged)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
 	if err != nil {
 		return false, err
 	}
-	if recipient != agent {
+	if recipient != agent || messageTenant != tenant {
 		return false, ErrNotRecipient
 	}
 	duplicate := acknowledged.Valid
@@ -369,7 +368,7 @@ func (s *SQLiteStore) AuditEntries(ctx context.Context, limit int) ([]AuditEntry
 
 func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry time.Duration, maxAttempts int) ([]NotificationCandidate, error) {
 	cutoff := now.UTC().Add(-retry).Format(time.RFC3339Nano)
-	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.sequence, n.attempts, n.escalated_at FROM messages m JOIN notification_state n ON n.message_id = m.id WHERE m.acknowledged_at IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= ?) AND (n.attempts < ? OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at FROM messages m JOIN notification_state n ON n.message_id = m.id WHERE m.acknowledged_at IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= ?) AND (n.attempts < ? OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +377,7 @@ func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry
 	for rows.Next() {
 		var c NotificationCandidate
 		var escalated sql.NullString
-		if err := rows.Scan(&c.MessageID, &c.Recipient, &c.Sequence, &c.Attempts, &escalated); err != nil {
+		if err := rows.Scan(&c.MessageID, &c.Recipient, &c.TenantID, &c.Sequence, &c.Attempts, &escalated); err != nil {
 			return nil, err
 		}
 		c.Escalated = escalated.Valid
@@ -393,8 +392,30 @@ func (s *SQLiteStore) MarkNotified(ctx context.Context, id string, now time.Time
 }
 
 func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ? WHERE message_id = ? AND escalated_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var tenant string
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM messages WHERE id = ?`, id).Scan(&tenant); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ? WHERE message_id = ? AND escalated_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return tx.Commit()
+	}
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "notified"}, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type rowScanner interface{ Scan(...any) error }

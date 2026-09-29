@@ -31,6 +31,7 @@ type testSystem struct {
 	store        *SQLiteStore
 	server       *httptest.Server
 	service      *Server
+	notifier     *recordingNotifier
 	agents       map[string]testAgent
 	clients      map[string]*Client
 }
@@ -59,14 +60,18 @@ func newTestSystem(t *testing.T) *testSystem {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewServer(store, FileRegistry{Path: registryPath}, NoopNotifier{}, DefaultServerConfig())
+	notifier := &recordingNotifier{store: store}
+	service, err := NewServer(store, FileRegistry{Path: registryPath}, notifier, DefaultServerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(service)
 	t.Cleanup(func() { server.Close(); store.Close() })
 	clients := make(map[string]*Client)
 	for id, pair := range agents {
 		clients[id] = &Client{Server: server.URL, Agent: id, KeyID: "primary", Private: pair.private}
 	}
-	return &testSystem{t: t, path: path, registryFile: registryPath, registry: registry, store: store, server: server, service: service, agents: agents, clients: clients}
+	return &testSystem{t: t, path: path, registryFile: registryPath, registry: registry, store: store, server: server, service: service, notifier: notifier, agents: agents, clients: clients}
 }
 
 func testRegistryAgent(id, tenant string, public ed25519.PublicKey, recipients, kinds []string, disabled bool) RegistryAgent {
@@ -205,6 +210,17 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 0 {
 		t.Fatalf("acknowledged message remained in unacked poll: %+v", got.Messages)
 	}
+	data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodGet, "/v1/messages?after_seq=0&limit=100&include_acked=true", nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("poll with an unsupported history parameter failed: HTTP %d err=%v", status, err)
+	}
+	var history PollResponse
+	if err := json.Unmarshal(data, &history); err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Messages) != 0 {
+		t.Fatalf("poll returned acknowledged history: %+v", history.Messages)
+	}
 	entries, err := s.store.AuditEntries(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
@@ -229,11 +245,13 @@ func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T)
 
 func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *testing.T) {
 	s := newTestSystem(t)
-	unsigned := httptest.NewRequest(http.MethodGet, "/v1/messages", nil)
-	response := httptest.NewRecorder()
-	s.server.Config.Handler.ServeHTTP(response, unsigned)
-	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "unsigned_request") {
-		t.Fatalf("unsigned request was not rejected: %d %s", response.Code, response.Body.String())
+	for _, path := range []string{"/v1/messages", "/healthz", "/outside"} {
+		unsigned := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		s.server.Config.Handler.ServeHTTP(response, unsigned)
+		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "unsigned_request") {
+			t.Fatalf("unsigned request to %s was not rejected: %d %s", path, response.Code, response.Body.String())
+		}
 	}
 	cases := []struct{ name, sender, recipient, kind, payload, want string }{
 		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "unregistered_agent"},
@@ -244,7 +262,11 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 		{"secret", "agent-a", "agent-b", "instruction", `{"token":"github_pat_123456789012345678901234567890"}`, "secret_detected"},
 		{"escaped-secret", "agent-a", "agent-b", "instruction", `{"token":"\u0067ithub_pat_123456789012345678901234567890"}`, "secret_detected"},
 	}
+	expectedAudits := 0
 	for _, test := range cases {
+		if test.want != "unregistered_agent" {
+			expectedAudits++
+		}
 		t.Run(test.name, func(t *testing.T) {
 			e := s.envelope(t, test.sender, test.recipient, test.kind, test.payload)
 			_, status, apiErr := s.send(t, e, test.sender)
@@ -257,13 +279,43 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if countAudit(entries, "send", "rejected") < len(cases) || countAudit(entries, "api.request", "rejected") == 0 {
+	if countAudit(entries, "send", "rejected") != expectedAudits {
 		t.Fatalf("rejected sends were not audited: %+v", entries)
+	}
+}
+
+func TestUnauthenticatedAndOversizedRequestsHaveNoAuditOrWebhookSideEffects(t *testing.T) {
+	s := newTestSystem(t)
+	unsigned := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"payload":{}}`))
+	response := httptest.NewRecorder()
+	s.server.Config.Handler.ServeHTTP(response, unsigned)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned request returned HTTP %d", response.Code)
+	}
+
+	oversized := strings.Repeat("x", MaxRequestBytes+1)
+	status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodPost, "/v1/messages", "/v1/messages", []byte(oversized), "oversized-request-0001")
+	if status != http.StatusRequestEntityTooLarge || code != "request_too_large" {
+		t.Fatalf("oversized request returned HTTP %d %q", status, code)
+	}
+
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 || s.notifier.count("message.rejected") != 0 {
+		t.Fatalf("pre-authentication requests caused durable side effects: audit=%+v rejection notifications=%d", entries, s.notifier.count("message.rejected"))
 	}
 }
 
 func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	s := newTestSystem(t)
+	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/healthz", "/healthz", nil, "signed-healthcheck-0001"); status != http.StatusOK || code != "" {
+		t.Fatalf("signed health check failed: HTTP %d %q", status, code)
+	}
+	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, "signed-unknown-path-01"); status != http.StatusNotFound || code != "not_found" {
+		t.Fatalf("signed unknown route did not reach route handling: HTTP %d %q", status, code)
+	}
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
 	body, _ := json.Marshal(e)
 	status1, code1 := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", "POST", "/v1/messages", "/v1/messages", body, "replay-nonce-000001")
@@ -363,7 +415,7 @@ func TestWALOnlineBackupAndAppendOnlyAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer copyStore.Close()
-	messages, err := copyStore.ListMessages(context.Background(), "agent-b", 0, 10, false)
+	messages, err := copyStore.ListMessages(context.Background(), "agent-b", "tenant-one", 0, 10)
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("backup did not contain committed message: len=%d err=%v", len(messages), err)
 	}
@@ -380,7 +432,7 @@ func (n *recordingNotifier) Notify(ctx context.Context, event Notification) erro
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if event.Event == "message.accepted" {
-		_, err := n.store.GetMessage(ctx, event.MessageID)
+		_, err := n.store.GetMessage(ctx, event.MessageID, event.TenantID)
 		n.persistedFirst = err == nil
 	}
 	n.events = append(n.events, event)
@@ -433,8 +485,106 @@ func TestDoorbellRetriesAreBoundedAndEscalateOnceAfterPersistence(t *testing.T) 
 	if notifier.count("message.unacknowledged_escalation") != 1 {
 		t.Fatalf("expected one escalation after bounded doorbells, got %d", notifier.count("message.unacknowledged_escalation"))
 	}
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countAudit(entries, "message.unacknowledged_escalation", "notified") != 1 {
+		t.Fatalf("escalation was not recorded exactly once in audit: %+v", entries)
+	}
 	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 1 {
 		t.Fatalf("unacknowledged message disappeared after escalation: %+v", got.Messages)
+	}
+}
+
+func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
+	s := newTestSystem(t)
+	base := time.Now().UTC()
+	s.service.now = func() time.Time { return base }
+	s.service.config.RetryInterval = time.Second
+	bells, remove := s.service.hub.subscribe("agent-b")
+	defer remove()
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	stream, err := s.clients["agent-b"].OpenEvents(streamCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	if stream.StatusCode != http.StatusOK {
+		t.Fatalf("event stream returned HTTP %d", stream.StatusCode)
+	}
+	instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"tenant-scoped"}`)
+	if _, status, apiErr := s.send(t, instruction, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("initial send failed: HTTP %d %+v", status, apiErr)
+	}
+	<-bells
+	eventScanner := bufio.NewScanner(stream.Body)
+	for eventScanner.Scan() {
+		if strings.HasPrefix(eventScanner.Text(), "data:") {
+			break
+		}
+	}
+	if err := eventScanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	for index := range s.registry.Agents {
+		s.registry.Agents[index].TenantID = "tenant-two"
+	}
+	writeRegistry(t, s.registryFile, s.registry)
+	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 0 {
+		t.Fatalf("tenant reassignment exposed an old message: %+v", got.Messages)
+	}
+	if status, code := s.ack(t, "agent-b", instruction.ID, true); status != http.StatusForbidden || code != "not_recipient" {
+		t.Fatalf("tenant reassignment allowed acknowledgement: HTTP %d %q", status, code)
+	}
+	if _, err := s.store.GetMessage(context.Background(), instruction.ID, "tenant-two"); err != ErrMessageNotFound {
+		t.Fatalf("tenant-scoped reply lookup returned old message: %v", err)
+	}
+	if _, status, apiErr := s.send(t, instruction, "agent-a"); status != http.StatusConflict || apiErr == nil || apiErr.Error.Code != "message_id_conflict" {
+		t.Fatalf("tenant reassignment returned a prior-tenant duplicate: HTTP %d %+v", status, apiErr)
+	}
+
+	base = base.Add(2 * time.Second)
+	s.service.dispatchDue(context.Background())
+	select {
+	case event := <-bells:
+		t.Fatalf("tenant reassignment rang an old-tenant doorbell: %+v", event)
+	default:
+	}
+	if s.notifier.count("message.unacknowledged_escalation") != 0 {
+		t.Fatal("tenant reassignment escalated an old-tenant message to the reassigned agent")
+	}
+	staleEventDone := make(chan error, 1)
+	go func() {
+		scanner := eventScanner
+		for scanner.Scan() {
+			if strings.HasPrefix(scanner.Text(), "data:") {
+				staleEventDone <- fmt.Errorf("reassigned agent received stale doorbell %s", scanner.Text())
+				return
+			}
+		}
+		staleEventDone <- scanner.Err()
+	}()
+	s.service.hub.publish("agent-b", DoorbellEvent{MessageID: instruction.ID, Recipient: "agent-b"})
+	select {
+	case err := <-staleEventDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reassigned agent's old event stream remained open")
+	}
+}
+
+func TestServerRequiresNotifier(t *testing.T) {
+	s := newTestSystem(t)
+	if _, err := NewServer(s.store, FileRegistry{Path: s.registryFile}, nil, DefaultServerConfig()); err == nil {
+		t.Fatal("server accepted a missing human notification destination")
+	}
+	if err := (WebhookNotifier{}).Notify(context.Background(), Notification{Event: "message.accepted"}); err == nil {
+		t.Fatal("empty webhook URL silently discarded a notification")
 	}
 }
 

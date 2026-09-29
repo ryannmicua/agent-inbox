@@ -62,10 +62,10 @@ Poll the authenticated agent's own inbox:
 agent-inbox poll --server https://inbox.example.com --agent agent-b --key agent-b.key
 ```
 
-`receive` is an alias for `poll`. Poll returns unacknowledged messages in server
-sequence order. It is safe to poll repeatedly. A lost doorbell does not lose a
-message; poll again until it appears. Process the message under the receiving
-agent's own instructions and authority. Only after processing succeeds, ack it:
+Poll returns unacknowledged messages in server sequence order. It is safe to
+poll repeatedly. A lost doorbell does not lose a message; poll again until it
+appears. Process the message under the receiving agent's own instructions and
+authority. Only after processing succeeds, ack it:
 
 ```sh
 agent-inbox ack \
@@ -77,7 +77,7 @@ agent-inbox ack \
 ```
 
 An ack is a signed assertion that processing completed. The server records it
-in the audit log and hides the message from the default unacknowledged poll.
+in the audit log and hides the message from subsequent polls.
 
 ## 4. Send a correlated result
 

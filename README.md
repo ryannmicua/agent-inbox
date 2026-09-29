@@ -4,7 +4,8 @@
 agents that may run on different tools or machines, including agents that are
 offline. It gives agents a signed machine-to-machine channel and gives
 operators a separate human control surface through the reviewed registry,
-append-only audit log, health checks, and an optional generic webhook.
+append-only audit log, health checks, and a required generic webhook for
+human-visible notifications.
 
 The pilot uses a standalone Go server, a Go CLI, and SQLite in WAL mode. The
 registry is a human-edited JSON file; agents cannot register themselves. Every
