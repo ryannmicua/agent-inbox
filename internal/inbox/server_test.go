@@ -1521,6 +1521,7 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 	base := time.Now().UTC()
 	s.service.now = func() time.Time { return base }
 	s.service.config.RetryInterval = time.Second
+	s.service.config.MaxDoorbellAttempts = 2
 	bells, remove := s.service.hub.subscribe("agent-b")
 	defer remove()
 	streamCtx, cancelStream := context.WithCancel(context.Background())
@@ -1573,7 +1574,13 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 	default:
 	}
 	if s.notifier.count("message.unacknowledged_escalation") != 0 {
-		t.Fatal("tenant reassignment escalated an old-tenant message to the reassigned agent")
+		t.Fatal("tenant reassignment escalated before the bounded retry schedule completed")
+	}
+	base = base.Add(2 * time.Second)
+	s.service.dispatchDue(context.Background())
+	s.service.dispatchDue(context.Background())
+	if s.notifier.count("message.unacknowledged_escalation") != 1 {
+		t.Fatalf("tenant reassignment did not produce one operator escalation: %d", s.notifier.count("message.unacknowledged_escalation"))
 	}
 	staleEventDone := make(chan error, 1)
 	go func() {

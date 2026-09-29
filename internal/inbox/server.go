@@ -570,16 +570,15 @@ func (s *Server) dispatchDue(ctx context.Context) {
 		return
 	}
 	for _, c := range candidates {
-		if !s.assignedToTenant(c.Recipient, c.TenantID) {
-			continue
-		}
 		if c.Escalated {
 			continue
 		}
 		if c.Attempts < s.config.MaxDoorbellAttempts {
-			s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
+			if s.assignedToTenant(c.Recipient, c.TenantID) {
+				s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
+			}
 			if err := s.store.MarkNotified(ctx, c.MessageID, s.now()); err != nil {
-				log.Printf("record doorbell for %s: %v", c.MessageID, err)
+				log.Printf("record notification attempt for %s: %v", c.MessageID, err)
 			}
 			continue
 		}

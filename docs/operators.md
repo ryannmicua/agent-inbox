@@ -70,7 +70,7 @@ its test volume.
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
 | `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Generic HTTP webhook for consequential human-visible events. Required at startup; use a human-operated endpoint in production. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
-| `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Total doorbell notifications, including the initial ring, before one escalation. |
+| `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. Tenant reassignment suppresses rings but does not cancel the schedule. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
@@ -162,7 +162,8 @@ streams are closed at the next heartbeat after their signing key is revoked.
 Changing an agent's tenant immediately isolates it from messages stored under
 its previous tenant. Those messages remain in the audit and storage history but
 no longer appear in that agent's polls, can no longer be acknowledged by it, and
-will not trigger further doorbells or escalations to it.
+will not trigger further doorbells to it. An unacknowledged message still follows
+the bounded notification schedule and escalates once to the operator webhook.
 
 ## Signing and delivery behavior
 
