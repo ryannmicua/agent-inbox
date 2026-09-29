@@ -65,8 +65,7 @@ type SendResponse struct {
 }
 
 type AckRequest struct {
-	Processed   bool   `json:"processed"`
-	ProcessedAt string `json:"processed_at"`
+	Processed bool `json:"processed"`
 }
 
 type PollResponse struct {

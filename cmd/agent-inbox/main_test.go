@@ -116,3 +116,74 @@ func TestSendWithoutIDGeneratesUUIDv4(t *testing.T) {
 		t.Fatalf("omitted --id did not produce a UUID v4: %q", received.ID)
 	}
 }
+
+func TestSendWithULIDDefaultsTaskAndThreadToMessageID(t *testing.T) {
+	const ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	receivedEnvelope := make(chan inbox.Envelope, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var received inbox.Envelope
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			http.Error(w, "invalid envelope", http.StatusBadRequest)
+			return
+		}
+		receivedEnvelope <- received
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	publicKey := filepath.Join(t.TempDir(), "agent.pub")
+	if err := inbox.WriteKeyPair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{
+		"send", "--server", server.URL, "--agent", "agent-a", "--key", privateKey,
+		"--to", "agent-b", "--kind", "instruction", "--id", ulid, "--payload", `{"task":"check"}`,
+	}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("send with ULID and omitted task/thread failed: %v", err)
+	}
+	got := <-receivedEnvelope
+	if got.ID != ulid || got.TaskID != ulid || got.ThreadID != ulid {
+		t.Fatalf("ULID defaults were not applied to message, task, and thread IDs: %+v", got)
+	}
+}
+
+func TestAckCommandSendsOnlyProcessedAssertion(t *testing.T) {
+	requestBody := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages/01ARZ3NDEKTSV4RRFFQ69G5FAV/ack" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		requestBody <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"acknowledged":true}`)
+	}))
+	defer server.Close()
+
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	publicKey := filepath.Join(t.TempDir(), "agent.pub")
+	if err := inbox.WriteKeyPair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{
+		"ack", "--server", server.URL, "--agent", "agent-b", "--key", privateKey,
+		"--message", "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+	}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("ack command failed: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(<-requestBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 1 || body["processed"] != true {
+		t.Fatalf("ack command did not send only processed=true: %v", body)
+	}
+}

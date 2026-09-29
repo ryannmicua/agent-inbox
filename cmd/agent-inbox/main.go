@@ -82,7 +82,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if *ackID == "" {
 			return errors.New("--message is required")
 		}
-		body, _ := json.Marshal(inbox.AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+		body, _ := json.Marshal(inbox.AckRequest{Processed: true})
 		return requestJSON(ctx, client, "POST", "/v1/messages/"+*ackID+"/ack", body, stdout)
 	case "wait":
 		for {

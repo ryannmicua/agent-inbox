@@ -20,8 +20,10 @@ notification events; production must configure a human-operated webhook.
   service itself listens on plain HTTP and does not manage certificates.
 
 1. Clone this repository and enter its directory.
-2. Have each agent operator generate an Ed25519 keypair with the CLI. Collect
-   only the public key from each agent through a human-approved channel.
+2. Install or build the `agent-inbox` CLI on operator and agent workstations,
+   following [the agent guide](agents.md). The server image contains `inboxd`
+   only. Have each agent operator generate an Ed25519 keypair with the CLI and
+   provide only the public key through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).
 4. Copy the environment example, replace the local sink URL with a reachable
@@ -154,7 +156,8 @@ single key, set `"disabled": true` on that `public_keys` entry or remove it.
 Replace the file and confirm requests signed by the old credentials receive
 `authentication_failed`. The periodic server log reports aggregate counts by
 authentication failure reason. Revocation affects new requests immediately; it
-does not delete already accepted messages or audit history.
+does not delete already accepted messages or audit history. Open doorbell
+streams are closed at the next heartbeat after their signing key is revoked.
 
 Changing an agent's tenant immediately isolates it from messages stored under
 its previous tenant. Those messages remain in the audit and storage history but
@@ -206,7 +209,7 @@ The signed JSON API is:
 | --- | --- |
 | `POST /v1/messages` | Submit a signed envelope to its explicit `recipient_id`. |
 | `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged inbox in sequence order. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
-| `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true,"processed_at":"<RFC3339>"}`. |
+| `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true}`; the server records the acknowledgement time. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
 
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,

@@ -207,7 +207,7 @@ func (s *testSystem) poll(t *testing.T, clientID string) PollResponse {
 
 func (s *testSystem) ack(t *testing.T, clientID, messageID string, processed bool) (int, string) {
 	t.Helper()
-	body, _ := json.Marshal(AckRequest{Processed: processed, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	body, _ := json.Marshal(AckRequest{Processed: processed})
 	data, status, err := s.clients[clientID].Do(context.Background(), http.MethodPost, "/v1/messages/"+messageID+"/ack", body)
 	if err != nil {
 		t.Fatal(err)
@@ -250,14 +250,14 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if status, code := s.ack(t, "agent-a", instruction.ID, true); status != http.StatusNotFound || code != "message_not_found" {
 		t.Fatalf("non-recipient ack should use the generic missing-message response, got HTTP %d %q", status, code)
 	}
-	ackWithNote := []byte(fmt.Sprintf(`{"processed":true,"processed_at":%q,"note":"legacy note"}`, time.Now().UTC().Format(time.RFC3339Nano)))
-	ackData, ackStatus, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages/"+instruction.ID+"/ack", ackWithNote)
+	ackWithRemovedTimestamp := []byte(fmt.Sprintf(`{"processed":true,"processed_at":%q}`, time.Now().UTC().Format(time.RFC3339Nano)))
+	ackData, ackStatus, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages/"+instruction.ID+"/ack", ackWithRemovedTimestamp)
 	if err != nil || ackStatus != http.StatusBadRequest {
-		t.Fatalf("removed ack note field was not rejected: HTTP %d err=%v body=%s", ackStatus, err, ackData)
+		t.Fatalf("removed processed_at field was not rejected: HTTP %d err=%v body=%s", ackStatus, err, ackData)
 	}
 	var ackErr ErrorResponse
 	if err := json.Unmarshal(ackData, &ackErr); err != nil || ackErr.Error.Code != "processing_required" {
-		t.Fatalf("removed ack note field returned an unclear error: %s (%v)", ackData, err)
+		t.Fatalf("removed processed_at field returned an unclear error: %s (%v)", ackData, err)
 	}
 	result := s.envelope(t, "agent-b", "agent-a", "result", `{"text":"completed"}`)
 	result.TaskID, result.ThreadID, result.ReplyTo = instruction.TaskID, instruction.ThreadID, instruction.ID
@@ -547,7 +547,7 @@ func TestAckRejectionsDoNotRevealMessageExistence(t *testing.T) {
 		{name: "another recipient", messageID: sameTenant.ID, auditCode: "not_recipient"},
 		{name: "another tenant", messageID: anotherTenant.ID, auditCode: "wrong_tenant"},
 	}
-	ackBody, err := json.Marshal(AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	ackBody, err := json.Marshal(AckRequest{Processed: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +755,7 @@ func TestNotificationFailuresAreAuditedWithoutChangingResponses(t *testing.T) {
 		t.Fatalf("notification failure changed successful send response: HTTP %d err=%+v", status, apiErr)
 	}
 
-	ack, err := json.Marshal(AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	ack, err := json.Marshal(AckRequest{Processed: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1001,6 +1001,8 @@ func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"id_type":"supported"}`)
 			envelope.ID = test.id
+			envelope.TaskID = test.id
+			envelope.ThreadID = test.id
 			if err := SignEnvelope(&envelope, s.agents["agent-a"].private); err != nil {
 				t.Fatal(err)
 			}
@@ -1415,6 +1417,60 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("reassigned agent's old event stream remained open")
+	}
+}
+
+func TestEventStreamClosesWhenSigningKeyIsRevoked(t *testing.T) {
+	for _, revoke := range []struct {
+		name   string
+		remove bool
+	}{
+		{name: "disabled"},
+		{name: "removed", remove: true},
+	} {
+		t.Run(revoke.name, func(t *testing.T) {
+			s := newTestSystem(t)
+			stream, err := s.clients["agent-b"].OpenEvents(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Body.Close()
+			if stream.StatusCode != http.StatusOK {
+				t.Fatalf("event stream returned HTTP %d", stream.StatusCode)
+			}
+
+			for i := range s.registry.Agents {
+				if s.registry.Agents[i].ID != "agent-b" {
+					continue
+				}
+				if revoke.remove {
+					s.registry.Agents[i].PublicKeys = nil
+				} else {
+					s.registry.Agents[i].PublicKeys[0].Disabled = true
+				}
+			}
+			writeRegistry(t, s.registryFile, s.registry)
+			events := bufio.NewScanner(stream.Body)
+			done := make(chan error, 1)
+			go func() {
+				for events.Scan() {
+					if strings.HasPrefix(events.Text(), "data:") {
+						done <- fmt.Errorf("revoked signing key received a doorbell: %s", events.Text())
+						return
+					}
+				}
+				done <- events.Err()
+			}()
+			s.service.hub.publish("agent-b", DoorbellEvent{MessageID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Recipient: "agent-b"})
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("stream did not close after signing-key revocation")
+			}
+		})
 	}
 }
 

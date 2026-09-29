@@ -30,7 +30,6 @@ const (
 )
 
 var (
-	uuidPattern      = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	messageIDPattern = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
 	noncePattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 	shaPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -275,8 +274,8 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 		return &validationError{"invalid_id", "id must be a UUID v4, UUID v7, or ULID"}
 	}
 	for label, value := range map[string]string{"task_id": e.TaskID, "thread_id": e.ThreadID} {
-		if !uuidPattern.MatchString(value) {
-			return &validationError{"invalid_" + label, label + " must be a UUID"}
+		if !messageIDPattern.MatchString(value) {
+			return &validationError{"invalid_" + label, label + " must be a UUID v4, UUID v7, or ULID"}
 		}
 	}
 	if e.ReplyTo != "" && !messageIDPattern.MatchString(e.ReplyTo) {
@@ -395,10 +394,6 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 		s.rejectAck(w, auth.agent, "processing_required", "acknowledgement must assert processed=true", http.StatusBadRequest)
 		return
 	}
-	if _, err := time.Parse(time.RFC3339Nano, body.ProcessedAt); err != nil {
-		s.rejectAck(w, auth.agent, "invalid_processed_at", "processed_at must be an RFC3339 timestamp", http.StatusBadRequest)
-		return
-	}
 	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID)
 	if err != nil {
 		switch {
@@ -450,14 +445,14 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, auth authContext
 		case <-r.Context().Done():
 			return
 		case event := <-ch:
-			if !s.assignedToTenant(auth.agent.ID, auth.agent.TenantID) {
+			if !s.streamAuthorized(auth) {
 				return
 			}
 			encoded, _ := json.Marshal(event)
 			_, _ = fmt.Fprintf(w, "id: %d\nevent: doorbell\ndata: %s\n\n", event.Sequence, encoded)
 			flusher.Flush()
 		case <-heartbeat.C:
-			if !s.assignedToTenant(auth.agent.ID, auth.agent.TenantID) {
+			if !s.streamAuthorized(auth) {
 				return
 			}
 			_, _ = fmt.Fprint(w, ": heartbeat\n\n")
@@ -583,6 +578,11 @@ func (s *Server) ring(message DeliveredMessage) {
 func (s *Server) assignedToTenant(agentID, tenantID string) bool {
 	agent, err := s.registry.Agent(agentID)
 	return err == nil && agent.TenantID == tenantID
+}
+
+func (s *Server) streamAuthorized(auth authContext) bool {
+	agent, key, err := s.registry.Key(auth.agent.ID, auth.keyID)
+	return err == nil && agent.ID == auth.agent.ID && agent.TenantID == auth.agent.TenantID && bytes.Equal(key, auth.key)
 }
 
 func (s *Server) notify(event Notification) {
