@@ -163,10 +163,9 @@ will not trigger further doorbells or escalations to it.
 
 ## Signing and delivery behavior
 
-Every `/v1/` API request requires Ed25519 request headers. `GET /healthz` is an
-unauthenticated liveness check that returns only a single status field.
-Unknown non-API paths return an empty 404 without authentication. The signed
-request canonical bytes are the UTF-8 text:
+Every HTTP request to the inbox service requires Ed25519 request headers,
+including requests to unknown paths. An authenticated request to an unknown
+path returns 404. The signed request canonical bytes are the UTF-8 text:
 
 ```text
 agent-inbox-request-v1\n<agent-id>\n<key-id>\n<METHOD>\n<exact-path-and-query>\n<unix-seconds>\n<nonce>\n<lowercase-hex-sha256-of-body>
@@ -209,7 +208,6 @@ The signed JSON API is:
 | `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged inbox in sequence order. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
 | `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true,"processed_at":"<RFC3339>"}`. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
-| `GET /healthz` | Unauthenticated liveness check; returns only a status field. |
 
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 `X-Request-Nonce`, and `X-Request-Signature` headers. The signature covers the
@@ -325,10 +323,10 @@ Monitor:
 - Unacknowledged messages through the audit log and receiver poll. A
   notification or transport outage does not prove the agent is dead.
 
-Unauthenticated `GET /healthz` exposes only a liveness status. The container's
-`inboxd healthcheck` separately checks database availability and the listener.
-All `/v1/` routes require signatures. Keep the service behind a TLS-terminating
-proxy when requests cross an untrusted network.
+The container's `inboxd healthcheck` opens and pings the configured database,
+then checks the listener's TCP port. The inbox service has no HTTP health
+endpoint; every HTTP request requires a signature. Keep the service behind a
+TLS-terminating proxy when requests cross an untrusted network.
 
 ## Troubleshooting common rejections
 

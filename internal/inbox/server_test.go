@@ -611,27 +611,19 @@ func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T)
 
 func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *testing.T) {
 	s := newTestSystem(t)
-	for _, path := range []string{"/v1/messages"} {
+	var unsignedBody string
+	for _, path := range []string{"/v1/messages", "/healthz", "/outside"} {
 		unsigned := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		s.server.Config.Handler.ServeHTTP(response, unsigned)
 		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "authentication_failed") {
 			t.Fatalf("unsigned request to %s was not rejected: %d %s", path, response.Code, response.Body.String())
 		}
-	}
-	unknown := httptest.NewRecorder()
-	s.server.Config.Handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/outside", nil))
-	if unknown.Code != http.StatusNotFound || unknown.Body.Len() != 0 {
-		t.Fatalf("unknown non-API route returned status %d and body %q, want an empty 404", unknown.Code, unknown.Body.String())
-	}
-	response := httptest.NewRecorder()
-	s.server.Config.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	var health map[string]string
-	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
-		t.Fatal(err)
-	}
-	if response.Code != http.StatusOK || len(health) != 1 || health["status"] != "ok" {
-		t.Fatalf("unauthenticated health response was not limited to service status: %d %s", response.Code, response.Body.String())
+		if unsignedBody == "" {
+			unsignedBody = response.Body.String()
+		} else if response.Body.String() != unsignedBody {
+			t.Fatalf("unsigned path %s returned a different response: %d %s", path, response.Code, response.Body.String())
+		}
 	}
 	cases := []struct{ name, sender, recipient, kind, payload, want string }{
 		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "authentication_failed"},
@@ -927,11 +919,11 @@ func TestOpenStoreRejectsPostgresqlAlias(t *testing.T) {
 
 func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	s := newTestSystem(t)
-	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/healthz", "/healthz", nil, "signed-healthcheck-0001"); status != http.StatusOK || code != "" {
-		t.Fatalf("signed health check failed: HTTP %d %q", status, code)
+	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/healthz", "/healthz", nil, "signed-removed-health-01"); status != http.StatusNotFound || code != "not_found" {
+		t.Fatalf("signed request to the removed health path did not return an authenticated 404: HTTP %d %q", status, code)
 	}
-	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, "signed-unknown-path-01"); status != http.StatusNotFound || code != "" {
-		t.Fatalf("unknown non-API path was not an empty 404: HTTP %d %q", status, code)
+	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, "signed-unknown-path-01"); status != http.StatusNotFound || code != "not_found" {
+		t.Fatalf("signed unknown path did not return an authenticated 404: HTTP %d %q", status, code)
 	}
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
 	body, _ := json.Marshal(e)

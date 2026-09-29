@@ -2,6 +2,9 @@ package main
 
 import (
 	"io"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -38,5 +41,34 @@ func TestConfiguredStoreRejectsPostgresqlAlias(t *testing.T) {
 	t.Setenv("INBOX_DATABASE_URL", "postgres://example.invalid/inbox")
 	if _, err := openConfiguredStore("unused.db"); err == nil || !strings.Contains(err.Error(), "unsupported storage backend") {
 		t.Fatalf("configured storage accepted the postgresql alias: %v", err)
+	}
+}
+
+func TestHealthcheckPingsConfiguredStorageAndListener(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "inbox.db")
+	store, err := inbox.OpenSQLite(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	t.Setenv("INBOX_DB_PATH", databasePath)
+	t.Setenv("INBOX_STORAGE", "sqlite")
+	t.Setenv("INBOX_LISTEN_ADDR", listener.Addr().String())
+
+	if err := runHealthcheck(nil, io.Discard, io.Discard); err != nil {
+		t.Fatalf("healthcheck did not accept a reachable database and listener: %v", err)
+	}
+	if err := os.Remove(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHealthcheck(nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("healthcheck accepted an unavailable database")
 	}
 }

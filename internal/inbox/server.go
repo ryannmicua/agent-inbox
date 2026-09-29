@@ -99,14 +99,6 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
-		s.health(w, r)
-		return
-	}
-	if !strings.HasPrefix(r.URL.Path, "/v1/") {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
 	if err != nil {
 		s.preAuth.bodyReadFailures.Add(1)
@@ -472,16 +464,6 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, auth authContext
 			flusher.Flush()
 		}
 	}
-}
-
-func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-	if err := s.store.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) RunPreAuthMetricsLog(ctx context.Context, interval time.Duration) {
