@@ -184,12 +184,14 @@ significant. Payloads and artifacts are signed as data.
 
 The server commits a new message and its accepted-send audit record before it
 publishes a doorbell. The SSE stream is in-memory and can lose events; poll is
-the delivery method. The receiver should ack only after processing. Repeated
-requests with the same message ID and same canonical content return the
-original sequence; reusing that ID for different content is a conflict. A
-result must cite the original message and match its sender, recipient, task,
-and thread. A transport failure means delivery is unknown, not that an agent is
-dead.
+the delivery method. The receiver should ack only after processing. A retry
+from the same sender with the same message ID returns the original sequence
+when the server-derived tenant and all sender-authored envelope fields match,
+except `created_at` and the resulting message signature. Reusing that ID with
+any other change is a conflict. Each retry still needs a valid message
+signature and a fresh signed-request nonce. A result must cite the original
+message and match its sender, recipient, task, and thread. A transport failure
+means delivery is unknown, not that an agent is dead.
 
 The signed JSON API is:
 
@@ -327,9 +329,8 @@ proxy when requests cross an untrusted network.
 | `authentication_failed` | The request could not be authenticated. This response intentionally does not distinguish an unknown or revoked agent, unknown key, invalid request signature, stale timestamp, invalid nonce, replay, or registry/replay-store failure. Check the periodic authentication failure counts in `docker compose logs server`; confirm the agent, key ID, signature inputs, clocks, registry, and database configuration. |
 | `invalid_message_signature` | The HTTP request was authenticated, but the message envelope signature is invalid. Check that the envelope was signed by the active key and was not changed afterward. |
 | `request_too_large` | The request exceeds the 64 KiB limit. Reduce the request body. |
-| `recipient_not_allowed` | The sender's `allowed_recipients` list does not include the explicit recipient. Review and update the registry. |
+| `recipient_not_allowed` | The recipient is absent, inactive, or not in the sender's `allowed_recipients` list. The client response intentionally hides which condition applies; review the registry and server audit records. |
 | `kind_not_allowed` | The sender is not allowed to send that kind. Check the registry's `allowed_kinds`. |
-| `unknown_recipient` | The recipient is absent, disabled, or has no active public key. Confirm its registry entry. |
 | `wrong_tenant` | Sender and recipient have different registry tenants. Do not accept a tenant from the caller; review the human-approved assignment. |
 | `secret_detected` | A payload, provenance field, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
 | `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |

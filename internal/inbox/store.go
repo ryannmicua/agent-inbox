@@ -241,7 +241,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
-	canon, err := EnvelopeSigningBytes(e)
+	canon, err := envelopeRetryBytes(e)
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
@@ -261,7 +261,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		if json.Unmarshal([]byte(existingJSON), &existing) != nil {
 			return DeliveredMessage{}, false, errors.New("stored message is invalid")
 		}
-		oldCanon, canonErr := EnvelopeSigningBytes(existing)
+		oldCanon, canonErr := envelopeRetryBytes(existing)
 		if canonErr != nil || !bytes.Equal(oldCanon, canon) {
 			return DeliveredMessage{}, false, ErrMessageConflict
 		}

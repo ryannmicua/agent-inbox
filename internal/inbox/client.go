@@ -76,8 +76,9 @@ func WriteKeyPair(privatePath, publicPath string) error {
 }
 
 func (c *Client) Do(ctx context.Context, method, requestPath string, body []byte) ([]byte, int, error) {
-	if c.HTTP == nil {
-		c.HTTP = &http.Client{Timeout: 30 * time.Second}
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	if body == nil {
 		body = []byte{}
@@ -97,7 +98,7 @@ func (c *Client) Do(ctx context.Context, method, requestPath string, body []byte
 	if method != http.MethodGet {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	response, err := c.HTTP.Do(req)
+	response, err := noRedirectClient(client).Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -119,8 +120,16 @@ func (c *Client) OpenEvents(ctx context.Context) (*http.Response, error) {
 		return nil, err
 	}
 	c.setHeaders(req, timestamp, nonce, base64.StdEncoding.EncodeToString(signature))
-	client := &http.Client{Timeout: 0}
+	client := noRedirectClient(&http.Client{Timeout: 0})
 	return client.Do(req)
+}
+
+func noRedirectClient(client *http.Client) *http.Client {
+	copy := *client
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &copy
 }
 
 func (c *Client) setHeaders(req *http.Request, timestamp, nonce, signature string) {

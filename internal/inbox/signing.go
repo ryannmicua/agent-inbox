@@ -63,6 +63,11 @@ func EnvelopeSigningBytes(e Envelope) ([]byte, error) {
 	return append([]byte("agent-inbox-envelope-v1\n"), encoded...), nil
 }
 
+func envelopeRetryBytes(e Envelope) ([]byte, error) {
+	e.CreatedAt = ""
+	return EnvelopeSigningBytes(e)
+}
+
 func SignEnvelope(e *Envelope, private ed25519.PrivateKey) error {
 	data, err := EnvelopeSigningBytes(*e)
 	if err != nil {

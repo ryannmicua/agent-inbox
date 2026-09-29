@@ -199,25 +199,25 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		s.rejectSend(w, auth.agent, err.code, err.message, messageID)
 		return
 	}
+	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
+		s.rejectRecipient(w, auth.agent, "recipient_not_allowed", messageID)
+		return
+	}
 	recipient, err := s.registry.Agent(e.RecipientID)
 	if err != nil {
 		if errors.Is(err, ErrUnknownAgent) {
-			s.rejectSend(w, auth.agent, "unknown_recipient", "recipient is unknown, disabled, or revoked", messageID)
+			s.rejectRecipient(w, auth.agent, "unknown_recipient", messageID)
 		} else {
 			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", messageID)
 		}
 		return
 	}
 	if !contains(recipient.PublicKeys, func(k RegistryKey) bool { return !k.Disabled }) {
-		s.rejectSend(w, auth.agent, "unknown_recipient", "recipient has no active signing key", messageID)
+		s.rejectRecipient(w, auth.agent, "recipient_key_unavailable", messageID)
 		return
 	}
 	if e.Kind != "instruction" && e.Kind != "result" {
 		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only", messageID)
-		return
-	}
-	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
-		s.rejectSend(w, auth.agent, "recipient_not_allowed", "sender is not allowed to address this recipient", messageID)
 		return
 	}
 	if !containsString(auth.agent.AllowedKinds, e.Kind) {
@@ -326,13 +326,21 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 }
 
 func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, message, messageID string) {
-	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code}); err != nil {
-		log.Printf("record rejected send by %s (%s): %v", agent.ID, code, err)
+	s.rejectSendWithAuditCode(w, agent, code, code, message, messageID)
+}
+
+func (s *Server) rejectRecipient(w http.ResponseWriter, agent RegistryAgent, reason, messageID string) {
+	s.rejectSendWithAuditCode(w, agent, "recipient_not_allowed", reason, "recipient is unavailable or not allowed", messageID)
+}
+
+func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAgent, code, auditCode, message, messageID string) {
+	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
+		log.Printf("record rejected send by %s (%s): %v", agent.ID, auditCode, err)
 	}
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
-	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed", "unknown_recipient", "reply_correlation_mismatch":
+	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed", "reply_correlation_mismatch":
 		status = http.StatusForbidden
 	case "message_id_conflict":
 		status = http.StatusConflict

@@ -40,7 +40,9 @@ The response includes the stable message ID, task ID, thread ID, server-assigned
 tenant, and sequence number. Save the `id`, `task_id`, and `thread_id` if a
 result should reply to this instruction. To retry a send safely, pass the same
 `--id` and the same message content; the server returns the existing message
-instead of creating another one.
+instead of creating another one. The server ignores the retry's `created_at`
+and resulting message signature, while every other envelope field must match.
+The CLI signs each retry as a new request with a fresh nonce.
 
 For larger JSON payloads, use `--payload-file`. Payloads are limited to 16 KiB.
 Reference large files with one or more `--artifact` flags, for example:

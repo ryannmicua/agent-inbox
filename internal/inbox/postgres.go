@@ -126,7 +126,7 @@ func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant st
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
-	canonical, err := EnvelopeSigningBytes(e)
+	canonical, err := envelopeRetryBytes(e)
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
@@ -194,7 +194,7 @@ func (s *PostgresStore) duplicate(ctx context.Context, tx *sql.Tx, e Envelope, t
 	if err := json.Unmarshal([]byte(existingJSON), &existing); err != nil {
 		return DeliveredMessage{}, false, errors.New("stored message is invalid")
 	}
-	oldCanonical, err := EnvelopeSigningBytes(existing)
+	oldCanonical, err := envelopeRetryBytes(existing)
 	if err != nil || string(oldCanonical) != string(canonical) {
 		return DeliveredMessage{}, false, ErrMessageConflict
 	}

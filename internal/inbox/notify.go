@@ -46,7 +46,7 @@ func (w WebhookNotifier) Notify(ctx context.Context, event Notification) error {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
-	response, err := client.Do(req)
+	response, err := noRedirectClient(client).Do(req)
 	if err != nil {
 		return err
 	}

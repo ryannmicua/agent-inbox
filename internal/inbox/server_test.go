@@ -299,6 +299,187 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	}
 }
 
+func TestLostResponseRetryIgnoresCreatedAtButRejectsChangedContent(t *testing.T) {
+	s := newTestSystem(t)
+	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"value":1}`)
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := s.clients["agent-a"]
+	client.HTTP = &http.Client{Transport: dropResponseTransport{base: http.DefaultTransport}}
+	if _, _, err := client.Do(context.Background(), http.MethodPost, "/v1/messages", body); err == nil {
+		t.Fatal("first send unexpectedly received its response")
+	}
+	client.HTTP = nil
+
+	retry := envelope
+	retry.CreatedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+	if err := SignEnvelope(&retry, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	retried, status, apiErr := s.send(t, retry, "agent-a")
+	if apiErr != nil || status != http.StatusOK || retried.Sequence != 1 || retried.CreatedAt != envelope.CreatedAt {
+		t.Fatalf("lost-response retry did not return the original message: status=%d err=%+v response=%+v", status, apiErr, retried)
+	}
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 1 || got.Messages[0].ID != envelope.ID {
+		t.Fatalf("retry created another stored message: %+v", got.Messages)
+	}
+
+	conflict := retry
+	conflict.Payload = json.RawMessage(`{"value":2}`)
+	if err := SignEnvelope(&conflict, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	if _, status, apiErr := s.send(t, conflict, "agent-a"); apiErr == nil || status != http.StatusConflict || apiErr.Error.Code != "message_id_conflict" {
+		t.Fatalf("retry with changed semantic content was not rejected: HTTP %d %+v", status, apiErr)
+	}
+}
+
+type dropResponseTransport struct{ base http.RoundTripper }
+
+func (t dropResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	response.Body.Close()
+	return nil, errors.New("simulated lost response")
+}
+
+func TestRecipientRejectionsDoNotRevealRegistryMembership(t *testing.T) {
+	s := newTestSystem(t)
+	for i := range s.registry.Agents {
+		if s.registry.Agents[i].ID == "agent-b" {
+			s.registry.Agents[i].AllowedRecipients = append(s.registry.Agents[i].AllowedRecipients, "agent-revoked")
+		}
+	}
+	writeRegistry(t, s.registryFile, s.registry)
+
+	cases := []struct {
+		name      string
+		recipient string
+		auditCode string
+	}{
+		{name: "active but not allowed", recipient: "agent-c", auditCode: "recipient_not_allowed"},
+		{name: "unknown and not allowed", recipient: "ghost", auditCode: "recipient_not_allowed"},
+		{name: "inactive but allowed", recipient: "agent-revoked", auditCode: "unknown_recipient"},
+	}
+	var wantBody string
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			envelope := s.envelope(t, "agent-b", test.recipient, "instruction", `{"value":1}`)
+			body, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages", body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != http.StatusForbidden {
+				t.Fatalf("recipient rejection returned HTTP %d: %s", status, data)
+			}
+			var apiErr ErrorResponse
+			if err := json.Unmarshal(data, &apiErr); err != nil || apiErr.Error.Code != "recipient_not_allowed" {
+				t.Fatalf("recipient rejection disclosed its reason: %s (%v)", data, err)
+			}
+			if wantBody == "" {
+				wantBody = string(data)
+			} else if string(data) != wantBody {
+				t.Fatalf("recipient rejection body differed: got %s, want %s", data, wantBody)
+			}
+		})
+	}
+
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotAuditCodes := make([]string, 0, len(cases))
+	for _, entry := range entries {
+		if entry.Action == "send" && entry.Outcome == "rejected" {
+			gotAuditCodes = append(gotAuditCodes, entry.Code)
+		}
+	}
+	if len(gotAuditCodes) != len(cases) {
+		t.Fatalf("server audit omitted recipient rejections: %+v", entries)
+	}
+	wantAuditCodes := make([]string, 0, len(cases))
+	for _, test := range cases {
+		wantAuditCodes = append(wantAuditCodes, test.auditCode)
+	}
+	for _, want := range wantAuditCodes {
+		found := false
+		for i, got := range gotAuditCodes {
+			if got == want {
+				gotAuditCodes = append(gotAuditCodes[:i], gotAuditCodes[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("server audit did not retain rejection reason %q: %+v", want, gotAuditCodes)
+		}
+	}
+}
+
+func TestRedirectsAreNotFollowedAndWebhookFailuresAreAudited(t *testing.T) {
+	forwarded := make(chan struct{}, 4)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	_, private, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Server: redirect.URL, Agent: "agent-a", KeyID: "primary", Private: private}
+	_, status, err := client.Do(context.Background(), http.MethodPost, "/v1/messages", []byte(`{"secret":"payload"}`))
+	if err != nil || status != http.StatusTemporaryRedirect {
+		t.Fatalf("signed request did not return the redirect response: HTTP %d err=%v", status, err)
+	}
+	streamResponse, err := client.OpenEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamResponse.StatusCode != http.StatusTemporaryRedirect {
+		streamResponse.Body.Close()
+		t.Fatalf("event stream followed a redirect: HTTP %d", streamResponse.StatusCode)
+	}
+	streamResponse.Body.Close()
+
+	s := newTestSystem(t)
+	s.service.notifier = WebhookNotifier{URL: redirect.URL}
+	s.service.notify(Notification{Event: "message.accepted", MessageID: "message-id", TenantID: "tenant-one"})
+	select {
+	case <-forwarded:
+		t.Fatal("request data was forwarded to a redirect target")
+	default:
+	}
+	entries, err := s.store.AuditEntries(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Action != "notification.failed" || entries[0].Detail["event"] != "message.accepted" || entries[0].Detail["message_id"] != "message-id" {
+		t.Fatalf("webhook redirect failure was not durably audited: %+v", entries)
+	}
+	if err := (WebhookNotifier{URL: redirect.URL}).Notify(context.Background(), Notification{Event: "message.accepted"}); err == nil {
+		t.Fatal("webhook notifier treated a 3xx redirect as successful delivery")
+	}
+	select {
+	case <-forwarded:
+		t.Fatal("webhook data was forwarded to a redirect target")
+	default:
+	}
+}
+
 func TestSenderSendResponsesOmitAcknowledgementMetadata(t *testing.T) {
 	s := newTestSystem(t)
 	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,5 +49,32 @@ func TestSendRejectsOversizedPayloadSources(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "payload must be 16 KiB or smaller") {
 			t.Fatalf("oversized payload was not rejected before sending: %v", err)
 		}
+	}
+}
+
+func TestRequestJSONReportsRedirectAsError(t *testing.T) {
+	forwarded := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	_, private, err := inbox.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &inbox.Client{Server: redirect.URL, Agent: "agent-a", KeyID: "primary", Private: private}
+	if err := requestJSON(context.Background(), client, http.MethodPost, "/v1/messages", []byte(`{}`), io.Discard); err == nil {
+		t.Fatal("CLI accepted a redirect response as a successful request")
+	}
+	select {
+	case <-forwarded:
+		t.Fatal("CLI forwarded signed request data to the redirect target")
+	default:
 	}
 }
