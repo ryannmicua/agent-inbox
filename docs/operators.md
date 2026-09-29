@@ -92,7 +92,8 @@ adds a `notification.failed` audit entry with the event, message ID when
 available, and error class; it does not undo a message or acknowledgement or
 change the API response. Doorbell retries remain separate from webhook
 delivery. The escalation state and audit entry are committed before its single
-webhook attempt.
+webhook attempt. Webhook failure logs include only the endpoint scheme, host,
+and path; URL userinfo and query parameters are omitted.
 
 ## Registry operations
 

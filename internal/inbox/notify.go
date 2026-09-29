@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -33,13 +35,14 @@ func (w WebhookNotifier) Notify(ctx context.Context, event Notification) error {
 	if w.URL == "" {
 		return errors.New("webhook URL is required")
 	}
+	endpoint := safeWebhookEndpoint(w.URL)
 	body, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return fmt.Errorf("create webhook request for %s failed", endpoint)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := w.Client
@@ -48,11 +51,30 @@ func (w WebhookNotifier) Notify(ctx context.Context, event Notification) error {
 	}
 	response, err := noRedirectClient(client).Do(req)
 	if err != nil {
-		return err
+		return webhookRequestError(endpoint, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return errors.New("webhook returned a non-success status")
+		return fmt.Errorf("webhook %s returned HTTP %d", endpoint, response.StatusCode)
 	}
 	return nil
+}
+
+func safeWebhookEndpoint(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "configured webhook"
+	}
+	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path}).String()
+}
+
+func webhookRequestError(endpoint string, err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("webhook request to %s: %w", endpoint, context.DeadlineExceeded)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("webhook request to %s: %w", endpoint, context.Canceled)
+	default:
+		return fmt.Errorf("webhook request to %s failed", endpoint)
+	}
 }
