@@ -349,7 +349,7 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 		unsigned := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		s.server.Config.Handler.ServeHTTP(response, unsigned)
-		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "unsigned_request") {
+		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "authentication_failed") {
 			t.Fatalf("unsigned request to %s was not rejected: %d %s", path, response.Code, response.Body.String())
 		}
 	}
@@ -368,8 +368,8 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 		t.Fatalf("unauthenticated health response was not limited to service status: %d %s", response.Code, response.Body.String())
 	}
 	cases := []struct{ name, sender, recipient, kind, payload, want string }{
-		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "unregistered_agent"},
-		{"revoked", "agent-revoked", "agent-a", "instruction", `{"x":1}`, "unregistered_agent"},
+		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "authentication_failed"},
+		{"revoked", "agent-revoked", "agent-a", "instruction", `{"x":1}`, "authentication_failed"},
 		{"cross-tenant", "agent-c", "agent-a", "instruction", `{"x":1}`, "wrong_tenant"},
 		{"recipient-not-allowed", "agent-c", "agent-b", "instruction", `{"x":1}`, "recipient_not_allowed"},
 		{"disallowed-kind", "agent-a", "agent-b", "status", `{"x":1}`, "kind_not_allowed"},
@@ -378,7 +378,7 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	}
 	expectedAudits := 0
 	for _, test := range cases {
-		if test.want != "unregistered_agent" {
+		if test.want != "authentication_failed" {
 			expectedAudits++
 		}
 		t.Run(test.name, func(t *testing.T) {
@@ -399,6 +399,54 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	_, metricsStatus, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
 	if err != nil || metricsStatus != http.StatusNotFound {
 		t.Fatalf("service-wide counters were exposed through the agent API: HTTP %d err=%v", metricsStatus, err)
+	}
+}
+
+func TestAuthenticationFailuresAreIndistinguishableToCallers(t *testing.T) {
+	s := newTestSystem(t)
+	cases := []struct {
+		name   string
+		client *Client
+	}{
+		{"unregistered agent", s.clients["ghost"]},
+		{"unknown key", &Client{Server: s.server.URL, Agent: "agent-a", KeyID: "missing", Private: s.agents["agent-a"].private}},
+		{"invalid signature", &Client{Server: s.server.URL, Agent: "agent-a", KeyID: "primary", Private: s.agents["agent-b"].private}},
+	}
+	var wantBody []byte
+	for index, test := range cases {
+		body, status, err := test.client.Do(context.Background(), http.MethodGet, "/v1/messages", nil)
+		if err != nil {
+			t.Fatalf("%s request failed: %v", test.name, err)
+		}
+		if status != http.StatusUnauthorized {
+			t.Fatalf("%s returned HTTP %d, want %d", test.name, status, http.StatusUnauthorized)
+		}
+		if index == 0 {
+			wantBody = body
+		} else if !bytes.Equal(body, wantBody) {
+			t.Fatalf("%s response differed from another authentication failure: got %s want %s", test.name, body, wantBody)
+		}
+		var response ErrorResponse
+		if err := json.Unmarshal(body, &response); err != nil || response.Error.Code != "authentication_failed" {
+			t.Fatalf("%s returned a reason-specific response: %s (%v)", test.name, body, err)
+		}
+	}
+
+	unsigned := httptest.NewRecorder()
+	s.server.Config.Handler.ServeHTTP(unsigned, httptest.NewRequest(http.MethodGet, "/v1/messages", nil))
+	if unsigned.Code != http.StatusUnauthorized || !bytes.Equal(unsigned.Body.Bytes(), wantBody) {
+		t.Fatalf("unsigned request response differed from other authentication failures: HTTP %d %s", unsigned.Code, unsigned.Body.String())
+	}
+
+	previousLogOutput := log.Writer()
+	var aggregate bytes.Buffer
+	log.SetOutput(&aggregate)
+	t.Cleanup(func() { log.SetOutput(previousLogOutput) })
+	s.service.logPreAuthMetrics()
+	for _, reason := range []string{"unregistered_agent=1", "unknown_key=1", "invalid_signature=1"} {
+		if !strings.Contains(aggregate.String(), reason) {
+			t.Fatalf("operator aggregate omitted authentication failure reason %q: %q", reason, aggregate.String())
+		}
 	}
 }
 
@@ -626,7 +674,7 @@ func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 		t.Fatalf("first signed request failed: %d %s", status1, code1)
 	}
 	status2, code2 := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", "POST", "/v1/messages", "/v1/messages", body, "replay-nonce-000001")
-	if status2 != http.StatusConflict || code2 != "replayed_request" {
+	if status2 != http.StatusUnauthorized || code2 != "authentication_failed" {
 		t.Fatalf("replayed request was not rejected: %d %s", status2, code2)
 	}
 	nonce := "path-binding-nonce-01"
@@ -645,7 +693,7 @@ func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	defer response.Body.Close()
 	var apiErr ErrorResponse
 	_ = json.NewDecoder(response.Body).Decode(&apiErr)
-	if response.StatusCode != http.StatusUnauthorized || apiErr.Error.Code != "invalid_signature" {
+	if response.StatusCode != http.StatusUnauthorized || apiErr.Error.Code != "authentication_failed" {
 		t.Fatalf("request path reordering did not invalidate signature: HTTP %d %+v", response.StatusCode, apiErr)
 	}
 }
@@ -689,7 +737,7 @@ func TestRegistryReloadAndRevocationApplyWithoutRestart(t *testing.T) {
 	}
 	var response ErrorResponse
 	_ = json.Unmarshal(data, &response)
-	if status != http.StatusForbidden || response.Error.Code != "unregistered_agent" {
+	if status != http.StatusUnauthorized || response.Error.Code != "authentication_failed" {
 		t.Fatalf("revoked registry entry remained active: HTTP %d %+v", status, response)
 	}
 }

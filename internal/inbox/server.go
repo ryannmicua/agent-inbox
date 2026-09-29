@@ -57,10 +57,19 @@ type Server struct {
 }
 
 type preAuthCounters struct {
-	unsigned          atomic.Uint64
-	oversized         atomic.Uint64
-	bodyReadFailures  atomic.Uint64
-	authenticationBad atomic.Uint64
+	unsigned                          atomic.Uint64
+	oversized                         atomic.Uint64
+	bodyReadFailures                  atomic.Uint64
+	authenticationBad                 atomic.Uint64
+	authenticationInvalidNonce        atomic.Uint64
+	authenticationStaleRequest        atomic.Uint64
+	authenticationUnregisteredAgent   atomic.Uint64
+	authenticationUnknownKey          atomic.Uint64
+	authenticationRegistryUnavailable atomic.Uint64
+	authenticationInvalidSignature    atomic.Uint64
+	authenticationReplayedRequest     atomic.Uint64
+	authenticationStorageUnavailable  atomic.Uint64
+	authenticationOther               atomic.Uint64
 }
 
 type authContext struct {
@@ -110,13 +119,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !hasRequestSignature(r) {
 		s.preAuth.unsigned.Add(1)
-		writeAPIError(w, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"})
+		writeAuthenticationFailure(w)
 		return
 	}
 	identity, apiErr := s.authenticate(r, body)
 	if apiErr != nil {
-		s.preAuth.authenticationBad.Add(1)
-		writeAPIError(w, apiErr)
+		s.recordAuthenticationFailure(apiErr.Code)
+		writeAuthenticationFailure(w)
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
@@ -472,10 +481,43 @@ func (s *Server) logPreAuthMetrics() {
 	oversized := s.preAuth.oversized.Load()
 	bodyFailures := s.preAuth.bodyReadFailures.Load()
 	authFailures := s.preAuth.authenticationBad.Load()
+	invalidNonce := s.preAuth.authenticationInvalidNonce.Load()
+	staleRequest := s.preAuth.authenticationStaleRequest.Load()
+	unregisteredAgent := s.preAuth.authenticationUnregisteredAgent.Load()
+	unknownKey := s.preAuth.authenticationUnknownKey.Load()
+	registryUnavailable := s.preAuth.authenticationRegistryUnavailable.Load()
+	invalidSignature := s.preAuth.authenticationInvalidSignature.Load()
+	replayedRequest := s.preAuth.authenticationReplayedRequest.Load()
+	storageUnavailable := s.preAuth.authenticationStorageUnavailable.Load()
+	other := s.preAuth.authenticationOther.Load()
 	if unsigned+oversized+bodyFailures+authFailures == 0 {
 		return
 	}
-	log.Printf("agent-inbox unauthenticated request totals: unsigned=%d oversized=%d body_read_failures=%d authentication_failures=%d", unsigned, oversized, bodyFailures, authFailures)
+	log.Printf("agent-inbox unauthenticated request totals: unsigned=%d oversized=%d body_read_failures=%d authentication_failures=%d invalid_nonce=%d stale_request=%d unregistered_agent=%d unknown_key=%d registry_unavailable=%d invalid_signature=%d replayed_request=%d storage_unavailable=%d other=%d", unsigned, oversized, bodyFailures, authFailures, invalidNonce, staleRequest, unregisteredAgent, unknownKey, registryUnavailable, invalidSignature, replayedRequest, storageUnavailable, other)
+}
+
+func (s *Server) recordAuthenticationFailure(reason string) {
+	s.preAuth.authenticationBad.Add(1)
+	switch reason {
+	case "invalid_nonce":
+		s.preAuth.authenticationInvalidNonce.Add(1)
+	case "stale_request":
+		s.preAuth.authenticationStaleRequest.Add(1)
+	case "unregistered_agent":
+		s.preAuth.authenticationUnregisteredAgent.Add(1)
+	case "unknown_key":
+		s.preAuth.authenticationUnknownKey.Add(1)
+	case "registry_unavailable":
+		s.preAuth.authenticationRegistryUnavailable.Add(1)
+	case "invalid_signature":
+		s.preAuth.authenticationInvalidSignature.Add(1)
+	case "replayed_request":
+		s.preAuth.authenticationReplayedRequest.Add(1)
+	case "storage_unavailable":
+		s.preAuth.authenticationStorageUnavailable.Add(1)
+	default:
+		s.preAuth.authenticationOther.Add(1)
+	}
 }
 
 func (s *Server) RunNotifications(ctx context.Context) {
@@ -584,19 +626,8 @@ func decodeStrict(body io.Reader, target any) error {
 	return nil
 }
 
-func writeAPIError(w http.ResponseWriter, err *APIError) {
-	status := http.StatusUnauthorized
-	switch err.Code {
-	case "unregistered_agent", "unknown_key":
-		status = http.StatusForbidden
-	case "replayed_request":
-		status = http.StatusConflict
-	case "registry_unavailable", "storage_unavailable":
-		status = http.StatusServiceUnavailable
-	case "invalid_nonce":
-		status = http.StatusBadRequest
-	}
-	writeError(w, status, err.Code, err.Message)
+func writeAuthenticationFailure(w http.ResponseWriter) {
+	writeError(w, http.StatusUnauthorized, "authentication_failed", "request could not be authenticated")
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

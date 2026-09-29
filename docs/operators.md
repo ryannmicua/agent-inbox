@@ -150,9 +150,10 @@ The service supports multiple active key IDs per agent to allow overlap:
 
 For a whole agent, either remove its entry or set `"disabled": true`. For a
 single key, set `"disabled": true` on that `public_keys` entry or remove it.
-Replace the file and confirm the old credentials receive `unregistered_agent`
-or `unknown_key`. Revocation affects new requests immediately; it does not
-delete already accepted messages or audit history.
+Replace the file and confirm requests signed by the old credentials receive
+`authentication_failed`. The periodic server log reports aggregate counts by
+authentication failure reason. Revocation affects new requests immediately; it
+does not delete already accepted messages or audit history.
 
 Changing an agent's tenant immediately isolates it from messages stored under
 its previous tenant. Those messages remain in the audit and storage history but
@@ -323,11 +324,9 @@ proxy when requests cross an untrusted network.
 
 | Error code | Meaning and operator action |
 | --- | --- |
-| `unsigned_request` | The CLI did not attach signed request headers. Check `--agent`, `--key`, and that requests go through the supported CLI/protocol. |
-| `invalid_signature` / `invalid_message_signature` | The key does not match the selected registry key, the body/path changed after signing, or a proxy rewrote the signed path/query. Preserve the API path and query exactly. |
-| `stale_request` | Agent or server clock differs beyond `INBOX_REQUEST_SKEW`; synchronize clocks. |
-| `replayed_request` | The same nonce was reused. Generate a fresh signed request; message retries should use the same message ID with a fresh HTTP request nonce. |
-| `unregistered_agent` / `unknown_key` | Add the reviewed public key or use an active registered key ID. A removed or disabled registry entry is revoked. |
+| `authentication_failed` | The request could not be authenticated. This response intentionally does not distinguish an unknown or revoked agent, unknown key, invalid request signature, stale timestamp, invalid nonce, replay, or registry/replay-store failure. Check the periodic authentication failure counts in `docker compose logs server`; confirm the agent, key ID, signature inputs, clocks, registry, and database configuration. |
+| `invalid_message_signature` | The HTTP request was authenticated, but the message envelope signature is invalid. Check that the envelope was signed by the active key and was not changed afterward. |
+| `request_too_large` | The request exceeds the 64 KiB limit. Reduce the request body. |
 | `recipient_not_allowed` | The sender's `allowed_recipients` list does not include the explicit recipient. Review and update the registry. |
 | `kind_not_allowed` | The sender is not allowed to send that kind. Check the registry's `allowed_kinds`. |
 | `unknown_recipient` | The recipient is absent, disabled, or has no active public key. Confirm its registry entry. |
