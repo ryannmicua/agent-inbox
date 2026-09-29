@@ -50,10 +50,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	replyTo := flags.String("reply-to", "", "message id this reply answers")
 	messageID := flags.String("id", "", "message UUID (set to retry idempotently)")
 	authority := flags.String("asserted-authority", "", "sender assertion; receiver must re-derive authority")
-	after := flags.Int64("after-seq", 0, "return messages after this server sequence")
 	limit := flags.Int("limit", 100, "maximum messages to return")
 	ackID := flags.String("message", "", "message UUID to acknowledge")
-	note := flags.String("note", "", "short processing note for the audit record")
 	var artifacts repeatedStrings
 	flags.Var(&artifacts, "artifact", "artifact reference URI|media-type|sha256|size (repeatable)")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -75,16 +73,16 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "send":
 		return runSend(ctx, client, *to, *kind, *payloadText, *payloadFile, *taskID, *threadID, *replyTo, *messageID, *authority, artifacts, stdout)
 	case "poll":
-		if *after < 0 || *limit < 1 || *limit > 100 {
-			return errors.New("--after-seq must be non-negative and --limit must be between 1 and 100")
+		if *limit < 1 || *limit > 100 {
+			return errors.New("--limit must be between 1 and 100")
 		}
-		path := fmt.Sprintf("/v1/messages?after_seq=%d&limit=%d", *after, *limit)
+		path := fmt.Sprintf("/v1/messages?limit=%d", *limit)
 		return requestJSON(ctx, client, "GET", path, nil, stdout)
 	case "ack":
 		if *ackID == "" {
 			return errors.New("--message is required")
 		}
-		body, _ := json.Marshal(inbox.AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano), Note: *note})
+		body, _ := json.Marshal(inbox.AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
 		return requestJSON(ctx, client, "POST", "/v1/messages/"+*ackID+"/ack", body, stdout)
 	case "wait":
 		for {
@@ -213,8 +211,8 @@ func usage(w io.Writer) {
 Commands:
   keygen --private-key PATH --public-key PATH
   send --server URL --agent ID --key PATH --to ID --kind instruction|result --payload-file FILE
-  poll [--after-seq N] [--limit N]
-  ack --message UUID [--note TEXT]
+	poll [--limit N]
+	ack --message UUID
   wait                                   (listen for doorbell prompts)
 
 Each API command requires --agent and --key, or INBOX_AGENT and INBOX_KEY.

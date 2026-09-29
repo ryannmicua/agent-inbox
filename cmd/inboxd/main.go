@@ -43,11 +43,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 	listen := envOr("INBOX_LISTEN_ADDR", ":8080")
 	dbPath := envOr("INBOX_DB_PATH", "/var/lib/agent-inbox/inbox.db")
 	registryPath := envOr("INBOX_REGISTRY_PATH", "/etc/agent-inbox/registry.json")
-	webhook := os.Getenv("INBOX_WEBHOOK_URL")
-	if webhook == "" {
-		return errors.New("INBOX_WEBHOOK_URL is required for human-visible notifications")
+	notifier, err := configuredNotifier()
+	if err != nil {
+		return err
 	}
-	store, err := inbox.OpenStore(envOr("INBOX_STORAGE", "sqlite"), dbPath)
+	store, err := openConfiguredStore(dbPath)
 	if err != nil {
 		return err
 	}
@@ -60,7 +60,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	config.RequestSkew = durationEnv("INBOX_REQUEST_SKEW", config.RequestSkew)
 	config.RetryInterval = durationEnv("INBOX_RETRY_INTERVAL", config.RetryInterval)
 	config.MaxDoorbellAttempts = intEnv("INBOX_MAX_DOORBELL_ATTEMPTS", config.MaxDoorbellAttempts)
-	service, err := inbox.NewServer(store, registry, inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, config)
+	service, err := inbox.NewServer(store, registry, notifier, config)
 	if err != nil {
 		return err
 	}
@@ -68,6 +68,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go service.RunNotifications(ctx)
+	go service.RunPreAuthMetricsLog(ctx, time.Minute)
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -92,10 +93,12 @@ func runAudit(args []string, stdout, stderr io.Writer) error {
 	if *limit < 1 || *limit > 1000 {
 		return errors.New("--limit must be between 1 and 1000")
 	}
-	if err := requireDatabaseFile(*dbPath); err != nil {
-		return err
+	if envOr("INBOX_STORAGE", "sqlite") == "sqlite" {
+		if err := requireDatabaseFile(*dbPath); err != nil {
+			return err
+		}
 	}
-	store, err := inbox.OpenSQLite(*dbPath)
+	store, err := openConfiguredStore(*dbPath)
 	if err != nil {
 		return err
 	}
@@ -117,6 +120,9 @@ func runBackup(args []string, stdout, stderr io.Writer) error {
 	}
 	if *destination == "" {
 		return errors.New("--out is required")
+	}
+	if envOr("INBOX_STORAGE", "sqlite") != "sqlite" {
+		return errors.New("inboxd backup supports SQLite only; use pg_dump for PostgreSQL")
 	}
 	if err := requireDatabaseFile(*dbPath); err != nil {
 		return err
@@ -151,10 +157,12 @@ func runHealthcheck(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	dbPath := envOr("INBOX_DB_PATH", "/var/lib/agent-inbox/inbox.db")
-	if err := requireDatabaseFile(dbPath); err != nil {
-		return err
+	if envOr("INBOX_STORAGE", "sqlite") == "sqlite" {
+		if err := requireDatabaseFile(dbPath); err != nil {
+			return err
+		}
 	}
-	store, err := inbox.OpenStore(envOr("INBOX_STORAGE", "sqlite"), dbPath)
+	store, err := openConfiguredStore(dbPath)
 	if err != nil {
 		return err
 	}
@@ -215,10 +223,45 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
-func usage(w io.Writer) {
-	fmt.Fprintln(w, `inboxd: standalone SQLite-backed agent inbox server
+func openConfiguredStore(sqlitePath string) (inbox.Store, error) {
+	backend := envOr("INBOX_STORAGE", "sqlite")
+	location := sqlitePath
+	if backend == "postgres" || backend == "postgresql" {
+		location = os.Getenv("INBOX_DATABASE_URL")
+	}
+	return inbox.OpenStore(backend, location)
+}
 
-Run server with environment: INBOX_LISTEN_ADDR, INBOX_DB_PATH, INBOX_REGISTRY_PATH.
+func configuredNotifier() (inbox.Notifier, error) {
+	webhook := os.Getenv("INBOX_WEBHOOK_URL")
+	disabledValue := os.Getenv("INBOX_NOTIFICATIONS_DISABLED")
+	disabled := false
+	if disabledValue != "" {
+		parsed, err := strconv.ParseBool(disabledValue)
+		if err != nil {
+			return nil, errors.New("INBOX_NOTIFICATIONS_DISABLED must be true or false")
+		}
+		disabled = parsed
+	}
+	if webhook == "" && !disabled {
+		return nil, errors.New("set INBOX_WEBHOOK_URL or explicitly set INBOX_NOTIFICATIONS_DISABLED=true")
+	}
+	if webhook != "" && disabled {
+		return nil, errors.New("choose either INBOX_WEBHOOK_URL or INBOX_NOTIFICATIONS_DISABLED=true, not both")
+	}
+	if disabled {
+		log.Printf("WARNING: human notifications are explicitly disabled; consequential inbox actions will not reach an operator")
+		return inbox.NoopNotifier{}, nil
+	}
+	return inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, nil
+}
+
+func usage(w io.Writer) {
+	fmt.Fprintln(w, `inboxd: standalone agent inbox server (SQLite or PostgreSQL)
+
+Run server with environment: INBOX_LISTEN_ADDR, INBOX_STORAGE, INBOX_DB_PATH,
+INBOX_DATABASE_URL, INBOX_REGISTRY_PATH, INBOX_WEBHOOK_URL or
+INBOX_NOTIFICATIONS_DISABLED=true.
 Operator commands:
   inboxd healthcheck
   inboxd audit --db PATH [--limit 100]

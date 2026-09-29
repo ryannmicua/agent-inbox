@@ -12,3 +12,11 @@ func TestReceiveAliasIsNotAccepted(t *testing.T) {
 		t.Fatalf("receive command returned %v", err)
 	}
 }
+
+func TestRemovedPollCursorAndAckNoteFlagsAreNotAccepted(t *testing.T) {
+	for _, args := range [][]string{{"poll", "--after-seq", "0"}, {"ack", "--note", "processed"}} {
+		if err := run(args, io.Discard, io.Discard); err == nil {
+			t.Fatalf("removed CLI flags were accepted: %v", args)
+		}
+	}
+}

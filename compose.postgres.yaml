@@ -1,14 +1,33 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agent_inbox}
+      POSTGRES_USER: ${POSTGRES_USER:-agent_inbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   server:
     image: agent-inbox:local
     build:
       context: .
       dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       INBOX_LISTEN_ADDR: ":8080"
-      INBOX_STORAGE: ${INBOX_STORAGE:-sqlite}
-      INBOX_DB_PATH: /var/lib/agent-inbox/inbox.db
-      INBOX_DATABASE_URL: ${INBOX_DATABASE_URL:-}
+      INBOX_STORAGE: postgres
+      INBOX_DATABASE_URL: ${INBOX_DATABASE_URL:-postgres://${POSTGRES_USER:-agent_inbox}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agent_inbox}?sslmode=disable}
       INBOX_REGISTRY_PATH: /etc/agent-inbox/registry.json
       INBOX_WEBHOOK_URL: ${INBOX_WEBHOOK_URL:-}
       INBOX_NOTIFICATIONS_DISABLED: ${INBOX_NOTIFICATIONS_DISABLED:-}
@@ -18,7 +37,6 @@ services:
     ports:
       - "127.0.0.1:${INBOX_HOST_PORT:-8080}:8080"
     volumes:
-      - inbox-data:/var/lib/agent-inbox
       - type: bind
         source: ${INBOX_REGISTRY_FILE:-./config/registry.json}
         target: /etc/agent-inbox/registry.json
@@ -34,10 +52,10 @@ services:
     healthcheck:
       test: ["CMD", "/usr/local/bin/inboxd", "healthcheck"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 10s
     restart: unless-stopped
 
 volumes:
-  inbox-data:
+  postgres-data:

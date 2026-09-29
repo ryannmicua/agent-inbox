@@ -53,15 +53,14 @@ type NotificationCandidate struct {
 	Escalated bool
 }
 
-// Store is the persistence boundary. A PostgreSQL implementation can replace
-// SQLiteStore without changing handlers or the CLI protocol.
+// Store is the persistence boundary shared by SQLite and PostgreSQL.
 type Store interface {
 	Ping(context.Context) error
 	RecordNonce(context.Context, string, string, time.Time) error
 	GetMessage(context.Context, string, string) (DeliveredMessage, error)
 	CreateMessage(context.Context, Envelope, string) (DeliveredMessage, bool, error)
-	ListMessages(context.Context, string, string, int64, int) ([]DeliveredMessage, error)
-	Acknowledge(context.Context, string, string, string, string) (bool, error)
+	ListMessages(context.Context, string, string, int) ([]DeliveredMessage, error)
+	Acknowledge(context.Context, string, string, string) (bool, error)
 	AppendAudit(context.Context, AuditRecord) error
 	AuditEntries(context.Context, int) ([]AuditEntry, error)
 	DueNotifications(context.Context, time.Time, time.Duration, int) ([]NotificationCandidate, error)
@@ -70,15 +69,17 @@ type Store interface {
 	Close() error
 }
 
-func OpenStore(backend, path string) (Store, error) {
+func OpenStore(backend, location string) (Store, error) {
 	if backend == "" {
 		backend = "sqlite"
 	}
 	switch backend {
 	case "sqlite":
-		return OpenSQLite(path)
+		return OpenSQLite(location)
+	case "postgres", "postgresql":
+		return OpenPostgres(location)
 	default:
-		return nil, fmt.Errorf("storage backend %q is not available in this pilot; use sqlite", backend)
+		return nil, fmt.Errorf("unsupported storage backend %q; use sqlite or postgres", backend)
 	}
 }
 
@@ -138,9 +139,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			reply_to TEXT NOT NULL,
 			envelope_json TEXT NOT NULL,
 			accepted_at TEXT NOT NULL,
-			acknowledged_at TEXT,
-			ack_by TEXT NOT NULL DEFAULT '',
-			ack_note TEXT NOT NULL DEFAULT ''
+			acknowledged_at TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS messages_recipient_sequence ON messages(recipient_id, sequence)`,
 		`CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id, sequence)`,
@@ -175,7 +174,44 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			return fmt.Errorf("initialize sqlite schema: %w", err)
 		}
 	}
+	for _, column := range []string{"ack_by", "ack_note"} {
+		if err := dropSQLiteColumn(ctx, s.db, "messages", column); err != nil {
+			return fmt.Errorf("remove obsolete acknowledgement field %s: %w", column, err)
+		}
+	}
 	return nil
+}
+
+func dropSQLiteColumn(ctx context.Context, db *sql.DB, table, column string) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notnull, primary int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notnull, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column)
+	return err
 }
 
 func (s *SQLiteStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -197,7 +233,7 @@ func (s *SQLiteStore) RecordNonce(ctx context.Context, agent, nonce string, now 
 }
 
 func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
 }
 
 func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
@@ -229,7 +265,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		if canonErr != nil || !bytes.Equal(oldCanon, canon) {
 			return DeliveredMessage{}, false, ErrMessageConflict
 		}
-		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE id = ?`, e.ID))
+		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, e.ID, tenant))
 		if scanErr != nil {
 			return DeliveredMessage{}, false, scanErr
 		}
@@ -266,8 +302,8 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	return DeliveredMessage{Envelope: e, TenantID: tenant, Sequence: sequence, AcceptedAt: now}, false, nil
 }
 
-func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string, after int64, limit int) ([]DeliveredMessage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at, ack_by, ack_note FROM messages WHERE recipient_id = ? AND tenant_id = ? AND sequence > ? AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT ?`, recipient, tenant, after, limit)
+func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string, limit int) ([]DeliveredMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE recipient_id = ? AND tenant_id = ? AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT ?`, recipient, tenant, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +319,7 @@ func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string
 	return messages, rows.Err()
 }
 
-func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant, note string) (bool, error) {
+func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -304,7 +340,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant, note s
 	duplicate := acknowledged.Valid
 	if !duplicate {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ?, ack_by = ?, ack_note = ? WHERE id = ?`, now, agent, note, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, id); err != nil {
 			return false, err
 		}
 	}
@@ -312,7 +348,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant, note s
 	if duplicate {
 		outcome, code = "duplicate", "already_acknowledged"
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: id, TenantID: tenant, Outcome: outcome, Code: code, Detail: map[string]any{"note": note}}, time.Now().UTC()); err != nil {
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: id, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -422,9 +458,9 @@ type rowScanner interface{ Scan(...any) error }
 
 func scanMessage(row rowScanner) (DeliveredMessage, error) {
 	var m DeliveredMessage
-	var raw, accepted string
-	var acked sql.NullString
-	if err := row.Scan(&raw, &m.TenantID, &m.Sequence, &accepted, &acked, &m.AckBy, &m.AckNote); err != nil {
+	var raw string
+	var accepted, acked any
+	if err := row.Scan(&raw, &m.TenantID, &m.Sequence, &accepted, &acked); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveredMessage{}, ErrMessageNotFound
 		}
@@ -434,19 +470,29 @@ func scanMessage(row rowScanner) (DeliveredMessage, error) {
 		return DeliveredMessage{}, fmt.Errorf("decode stored envelope: %w", err)
 	}
 	var err error
-	m.AcceptedAt, err = time.Parse(time.RFC3339Nano, accepted)
+	m.AcceptedAt, err = parseDatabaseTime(accepted)
 	if err != nil {
 		return DeliveredMessage{}, err
 	}
-	if acked.Valid {
-		parsed, err := time.Parse(time.RFC3339Nano, acked.String)
+	if acked != nil {
+		parsed, err := parseDatabaseTime(acked)
 		if err != nil {
 			return DeliveredMessage{}, err
 		}
 		m.AcknowledgedAt = &parsed
 	}
-	if !acked.Valid {
-		m.AckBy, m.AckNote = "", ""
-	}
 	return m, nil
+}
+
+func parseDatabaseTime(value any) (time.Time, error) {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed.UTC(), nil
+	case string:
+		return time.Parse(time.RFC3339Nano, typed)
+	case []byte:
+		return time.Parse(time.RFC3339Nano, string(typed))
+	default:
+		return time.Time{}, fmt.Errorf("unsupported database timestamp %T", value)
+	}
 }

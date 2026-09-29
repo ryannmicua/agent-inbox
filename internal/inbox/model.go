@@ -55,19 +55,15 @@ type DeliveredMessage struct {
 	Sequence       int64      `json:"sequence"`
 	AcceptedAt     time.Time  `json:"accepted_at"`
 	AcknowledgedAt *time.Time `json:"acknowledged_at,omitempty"`
-	AckBy          string     `json:"ack_by,omitempty"`
-	AckNote        string     `json:"ack_note,omitempty"`
 }
 
 type AckRequest struct {
 	Processed   bool   `json:"processed"`
 	ProcessedAt string `json:"processed_at"`
-	Note        string `json:"note,omitempty"`
 }
 
 type PollResponse struct {
-	Messages     []DeliveredMessage `json:"messages"`
-	NextAfterSeq int64              `json:"next_after_seq"`
+	Messages []DeliveredMessage `json:"messages"`
 }
 
 type DoorbellEvent struct {

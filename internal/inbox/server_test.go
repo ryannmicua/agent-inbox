@@ -2,14 +2,18 @@ package inbox
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +32,7 @@ type testSystem struct {
 	path         string
 	registryFile string
 	registry     Registry
-	store        *SQLiteStore
+	store        Store
 	server       *httptest.Server
 	service      *Server
 	notifier     *recordingNotifier
@@ -56,10 +60,7 @@ func newTestSystem(t *testing.T) *testSystem {
 		testRegistryAgent("agent-revoked", "tenant-one", agents["agent-revoked"].public, []string{"agent-a"}, []string{"instruction"}, true),
 	}}
 	writeRegistry(t, registryPath, registry)
-	store, err := OpenSQLite(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := openTestStore(t, path)
 	notifier := &recordingNotifier{store: store}
 	service, err := NewServer(store, FileRegistry{Path: registryPath}, notifier, DefaultServerConfig())
 	if err != nil {
@@ -72,6 +73,62 @@ func newTestSystem(t *testing.T) *testSystem {
 		clients[id] = &Client{Server: server.URL, Agent: id, KeyID: "primary", Private: pair.private}
 	}
 	return &testSystem{t: t, path: path, registryFile: registryPath, registry: registry, store: store, server: server, service: service, notifier: notifier, agents: agents, clients: clients}
+}
+
+func openTestStore(t *testing.T, sqlitePath string) Store {
+	t.Helper()
+	if databaseURL := os.Getenv("INBOX_TEST_POSTGRES_URL"); databaseURL != "" {
+		return openIsolatedPostgres(t, databaseURL)
+	}
+	store, err := OpenSQLite(sqlitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func openIsolatedPostgres(t *testing.T, databaseURL string) Store {
+	t.Helper()
+	admin, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
+		admin.Close()
+		t.Fatalf("PostgreSQL test URL is not reachable: %v", err)
+	}
+	suffix, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "agent_inbox_test_" + strings.ReplaceAll(suffix, "-", "")
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+		admin.Close()
+		t.Fatalf("create isolated PostgreSQL test schema: %v", err)
+	}
+	isolatedURL, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := isolatedURL.Query()
+	query.Set("search_path", schema)
+	isolatedURL.RawQuery = query.Encode()
+	store, err := OpenPostgres(isolatedURL.String())
+	if err != nil {
+		_, _ = admin.ExecContext(ctx, `DROP SCHEMA "`+schema+`" CASCADE`)
+		admin.Close()
+		t.Fatalf("open isolated PostgreSQL test store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+		if _, err := admin.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
+			t.Logf("drop PostgreSQL test schema: %v", err)
+		}
+		_ = admin.Close()
+	})
+	return store
 }
 
 func testRegistryAgent(id, tenant string, public ed25519.PublicKey, recipients, kinds []string, disabled bool) RegistryAgent {
@@ -130,9 +187,9 @@ func (s *testSystem) send(t *testing.T, e Envelope, clientID string) (DeliveredM
 	return DeliveredMessage{}, status, &apiErr
 }
 
-func (s *testSystem) poll(t *testing.T, clientID string, after int64) PollResponse {
+func (s *testSystem) poll(t *testing.T, clientID string) PollResponse {
 	t.Helper()
-	path := fmt.Sprintf("/v1/messages?after_seq=%d&limit=100", after)
+	path := "/v1/messages?limit=100"
 	data, status, err := s.clients[clientID].Do(context.Background(), http.MethodGet, path, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +233,7 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if apiErr != nil || status != http.StatusOK || duplicate.Sequence != first.Sequence {
 		t.Fatalf("duplicate was not idempotent: status=%d err=%+v duplicate=%+v", status, apiErr, duplicate)
 	}
-	inbox := s.poll(t, "agent-b", 0)
+	inbox := s.poll(t, "agent-b")
 	if len(inbox.Messages) != 1 || inbox.Messages[0].ID != instruction.ID {
 		t.Fatalf("duplicate created more than one task/message: %+v", inbox.Messages)
 	}
@@ -192,6 +249,15 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if status, code := s.ack(t, "agent-a", instruction.ID, true); status != http.StatusForbidden || code != "not_recipient" {
 		t.Fatalf("non-recipient ack should fail, got HTTP %d %q", status, code)
 	}
+	ackWithNote := []byte(fmt.Sprintf(`{"processed":true,"processed_at":%q,"note":"legacy note"}`, time.Now().UTC().Format(time.RFC3339Nano)))
+	ackData, ackStatus, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages/"+instruction.ID+"/ack", ackWithNote)
+	if err != nil || ackStatus != http.StatusBadRequest {
+		t.Fatalf("removed ack note field was not rejected: HTTP %d err=%v body=%s", ackStatus, err, ackData)
+	}
+	var ackErr ErrorResponse
+	if err := json.Unmarshal(ackData, &ackErr); err != nil || ackErr.Error.Code != "processing_required" {
+		t.Fatalf("removed ack note field returned an unclear error: %s (%v)", ackData, err)
+	}
 	result := s.envelope(t, "agent-b", "agent-a", "result", `{"text":"completed"}`)
 	result.TaskID, result.ThreadID, result.ReplyTo = instruction.TaskID, instruction.ThreadID, instruction.ID
 	if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
@@ -201,32 +267,34 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if apiErr != nil || status != http.StatusCreated || stored.Sequence != 2 {
 		t.Fatalf("correlated result failed: status=%d err=%+v", status, apiErr)
 	}
-	if got := s.poll(t, "agent-a", 0); len(got.Messages) != 1 || got.Messages[0].ID != result.ID {
+	if got := s.poll(t, "agent-a"); len(got.Messages) != 1 || got.Messages[0].ID != result.ID {
 		t.Fatalf("requester did not receive correlated result: %+v", got)
 	}
 	if status, code := s.ack(t, "agent-b", instruction.ID, true); status != http.StatusOK || code != "" {
 		t.Fatalf("recipient ack failed: HTTP %d %q", status, code)
 	}
-	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 0 {
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 0 {
 		t.Fatalf("acknowledged message remained in unacked poll: %+v", got.Messages)
 	}
-	data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodGet, "/v1/messages?after_seq=0&limit=100&include_acked=true", nil)
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("poll with an unsupported history parameter failed: HTTP %d err=%v", status, err)
+	data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodGet, "/v1/messages?after_seq=0&limit=100", nil)
+	if err != nil || status != http.StatusBadRequest {
+		t.Fatalf("removed after_seq poll parameter was not rejected: HTTP %d err=%v", status, err)
 	}
-	var history PollResponse
-	if err := json.Unmarshal(data, &history); err != nil {
-		t.Fatal(err)
-	}
-	if len(history.Messages) != 0 {
-		t.Fatalf("poll returned acknowledged history: %+v", history.Messages)
+	var queryErr ErrorResponse
+	if err := json.Unmarshal(data, &queryErr); err != nil || queryErr.Error.Code != "unsupported_query_parameter" {
+		t.Fatalf("removed after_seq parameter returned an unclear error: %s (%v)", data, err)
 	}
 	entries, err := s.store.AuditEntries(context.Background(), 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if countAudit(entries, "send", "accepted") != 2 || countAudit(entries, "send", "duplicate") != 1 || countAudit(entries, "ack", "accepted") != 1 || countAudit(entries, "ack", "rejected") < 2 {
+	if countAudit(entries, "send", "accepted") != 2 || countAudit(entries, "send", "duplicate") != 1 || countAudit(entries, "ack", "accepted") != 1 || countAudit(entries, "ack", "rejected") < 3 {
 		t.Fatalf("audit does not include accepted and duplicate sends plus ack: %+v", entries)
+	}
+	for _, entry := range entries {
+		if entry.Action == "ack" && len(entry.Detail) != 0 {
+			t.Fatalf("ack audit unexpectedly retained detail: %+v", entry)
+		}
 	}
 }
 
@@ -237,7 +305,7 @@ func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T)
 		t.Fatalf("send failed: status=%d err=%+v", status, apiErr)
 	}
 	// No SSE subscriber was connected, so the in-memory doorbell was lost.
-	first, second := s.poll(t, "agent-b", 0), s.poll(t, "agent-b", 0)
+	first, second := s.poll(t, "agent-b"), s.poll(t, "agent-b")
 	if len(first.Messages) != 1 || len(second.Messages) != 1 || first.Messages[0].ID != second.Messages[0].ID {
 		t.Fatalf("durable poll did not expose the unacknowledged message after a lost doorbell: first=%+v second=%+v", first, second)
 	}
@@ -245,13 +313,27 @@ func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T)
 
 func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *testing.T) {
 	s := newTestSystem(t)
-	for _, path := range []string{"/v1/messages", "/healthz", "/outside"} {
+	for _, path := range []string{"/v1/messages"} {
 		unsigned := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		s.server.Config.Handler.ServeHTTP(response, unsigned)
 		if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "unsigned_request") {
 			t.Fatalf("unsigned request to %s was not rejected: %d %s", path, response.Code, response.Body.String())
 		}
+	}
+	unknown := httptest.NewRecorder()
+	s.server.Config.Handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/outside", nil))
+	if unknown.Code != http.StatusNotFound || unknown.Body.Len() != 0 {
+		t.Fatalf("unknown non-API route returned status %d and body %q, want an empty 404", unknown.Code, unknown.Body.String())
+	}
+	response := httptest.NewRecorder()
+	s.server.Config.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var health map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || len(health) != 1 || health["status"] != "ok" {
+		t.Fatalf("unauthenticated health response was not limited to service status: %d %s", response.Code, response.Body.String())
 	}
 	cases := []struct{ name, sender, recipient, kind, payload, want string }{
 		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "unregistered_agent"},
@@ -282,6 +364,17 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	if countAudit(entries, "send", "rejected") != expectedAudits {
 		t.Fatalf("rejected sends were not audited: %+v", entries)
 	}
+	metricsData, metricsStatus, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
+	if err != nil || metricsStatus != http.StatusOK {
+		t.Fatalf("signed metrics request failed: HTTP %d err=%v", metricsStatus, err)
+	}
+	var metrics map[string]uint64
+	if err := json.Unmarshal(metricsData, &metrics); err != nil {
+		t.Fatal(err)
+	}
+	if metrics["unauthenticated_authentication_failures_total"] != 2 {
+		t.Fatalf("unknown and revoked agents were not counted as authentication failures: %+v", metrics)
+	}
 }
 
 func TestUnauthenticatedAndOversizedRequestsHaveNoAuditOrWebhookSideEffects(t *testing.T) {
@@ -306,6 +399,25 @@ func TestUnauthenticatedAndOversizedRequestsHaveNoAuditOrWebhookSideEffects(t *t
 	if len(entries) != 0 || s.notifier.count("message.rejected") != 0 {
 		t.Fatalf("pre-authentication requests caused durable side effects: audit=%+v rejection notifications=%d", entries, s.notifier.count("message.rejected"))
 	}
+	data, status, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("signed metrics request failed: HTTP %d err=%v", status, err)
+	}
+	var metrics map[string]uint64
+	if err := json.Unmarshal(data, &metrics); err != nil {
+		t.Fatal(err)
+	}
+	if metrics["unauthenticated_unsigned_total"] != 1 || metrics["unauthenticated_oversized_total"] != 1 {
+		t.Fatalf("unauthenticated and oversized requests were not counted: %+v", metrics)
+	}
+	var aggregate bytes.Buffer
+	previousLogOutput := log.Writer()
+	log.SetOutput(&aggregate)
+	t.Cleanup(func() { log.SetOutput(previousLogOutput) })
+	s.service.logPreAuthMetrics()
+	if !strings.Contains(aggregate.String(), "unsigned=1 oversized=1") {
+		t.Fatalf("periodic pre-auth log did not aggregate the counters: %q", aggregate.String())
+	}
 }
 
 func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
@@ -313,8 +425,8 @@ func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/healthz", "/healthz", nil, "signed-healthcheck-0001"); status != http.StatusOK || code != "" {
 		t.Fatalf("signed health check failed: HTTP %d %q", status, code)
 	}
-	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, "signed-unknown-path-01"); status != http.StatusNotFound || code != "not_found" {
-		t.Fatalf("signed unknown route did not reach route handling: HTTP %d %q", status, code)
+	if status, code := signedRawRequest(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, "signed-unknown-path-01"); status != http.StatusNotFound || code != "" {
+		t.Fatalf("unknown non-API path was not an empty 404: HTTP %d %q", status, code)
 	}
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
 	body, _ := json.Marshal(e)
@@ -328,7 +440,7 @@ func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	}
 	nonce := "path-binding-nonce-01"
 	timestamp := fmt.Sprintf("%d", time.Now().UTC().Unix())
-	sig := ed25519.Sign(s.agents["agent-a"].private, RequestSigningBytes("agent-a", "primary", "GET", "/v1/messages?after_seq=0&limit=2", timestamp, nonce, nil))
+	sig := ed25519.Sign(s.agents["agent-a"].private, RequestSigningBytes("agent-a", "primary", "GET", "/v1/messages?limit=2", timestamp, nonce, nil))
 	request, _ := http.NewRequest(http.MethodGet, s.server.URL+"/v1/messages?limit=2&after_seq=0", nil)
 	request.Header.Set(HeaderAgent, "agent-a")
 	request.Header.Set(HeaderKeyID, "primary")
@@ -393,8 +505,12 @@ func TestRegistryReloadAndRevocationApplyWithoutRestart(t *testing.T) {
 
 func TestWALOnlineBackupAndAppendOnlyAudit(t *testing.T) {
 	s := newTestSystem(t)
+	sqlite, ok := s.store.(*SQLiteStore)
+	if !ok {
+		t.Skip("SQLite-only online backup and WAL checks")
+	}
 	var journalMode string
-	if err := s.store.db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+	if err := sqlite.db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
 		t.Fatal(err)
 	}
 	if strings.ToLower(journalMode) != "wal" {
@@ -403,11 +519,11 @@ func TestWALOnlineBackupAndAppendOnlyAudit(t *testing.T) {
 	if _, status, apiErr := s.send(t, s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`), "agent-a"); apiErr != nil || status != http.StatusCreated {
 		t.Fatalf("send failed: %d %+v", status, apiErr)
 	}
-	if _, err := s.store.db.Exec(`UPDATE audit_log SET outcome = 'tampered' WHERE sequence = 1`); err == nil {
+	if _, err := sqlite.db.Exec(`UPDATE audit_log SET outcome = 'tampered' WHERE sequence = 1`); err == nil {
 		t.Fatal("audit log allowed update")
 	}
 	backup := filepath.Join(t.TempDir(), "snapshot.db")
-	if err := s.store.BackupTo(context.Background(), backup); err != nil {
+	if err := sqlite.BackupTo(context.Background(), backup); err != nil {
 		t.Fatalf("online backup failed: %v", err)
 	}
 	copyStore, err := OpenSQLite(backup)
@@ -415,9 +531,74 @@ func TestWALOnlineBackupAndAppendOnlyAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer copyStore.Close()
-	messages, err := copyStore.ListMessages(context.Background(), "agent-b", "tenant-one", 0, 10)
+	messages, err := copyStore.ListMessages(context.Background(), "agent-b", "tenant-one", 10)
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("backup did not contain committed message: len=%d err=%v", len(messages), err)
+	}
+}
+
+func TestSQLiteMigrationDropsObsoleteAcknowledgementMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE messages (
+		sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+		id TEXT NOT NULL UNIQUE,
+		sender_id TEXT NOT NULL,
+		recipient_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		task_id TEXT NOT NULL,
+		thread_id TEXT NOT NULL,
+		reply_to TEXT NOT NULL,
+		envelope_json TEXT NOT NULL,
+		accepted_at TEXT NOT NULL,
+		acknowledged_at TEXT,
+		ack_by TEXT,
+		ack_note TEXT
+	)`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO messages(id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at,ack_by,ack_note)
+		VALUES('legacy-id','agent-a','agent-b','tenant-one','instruction','task','thread','','{}','2026-01-01T00:00:00Z','2026-01-01T00:01:00Z','agent-b','old note')`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var rowCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&rowCount); err != nil || rowCount != 1 {
+		t.Fatalf("legacy message was not preserved during schema migration: rows=%d err=%v", rowCount, err)
+	}
+	rows, err := store.db.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, primary int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notnull, &defaultValue, &primary); err != nil {
+			t.Fatal(err)
+		}
+		if name == "ack_by" || name == "ack_note" {
+			t.Fatalf("obsolete acknowledgement column %q remains after migration", name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -492,7 +673,7 @@ func TestDoorbellRetriesAreBoundedAndEscalateOnceAfterPersistence(t *testing.T) 
 	if countAudit(entries, "message.unacknowledged_escalation", "notified") != 1 {
 		t.Fatalf("escalation was not recorded exactly once in audit: %+v", entries)
 	}
-	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 1 {
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 1 {
 		t.Fatalf("unacknowledged message disappeared after escalation: %+v", got.Messages)
 	}
 }
@@ -533,7 +714,7 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 		s.registry.Agents[index].TenantID = "tenant-two"
 	}
 	writeRegistry(t, s.registryFile, s.registry)
-	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 0 {
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 0 {
 		t.Fatalf("tenant reassignment exposed an old message: %+v", got.Messages)
 	}
 	if status, code := s.ack(t, "agent-b", instruction.ID, true); status != http.StatusForbidden || code != "not_recipient" {
@@ -622,7 +803,7 @@ func TestSSEDoorbellIsOnlyAPrompt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("doorbell did not notify active subscriber")
 	}
-	if got := s.poll(t, "agent-b", 0); len(got.Messages) != 1 {
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 1 {
 		t.Fatalf("doorbell was treated as proof of delivery; poll returned %+v", got.Messages)
 	}
 }

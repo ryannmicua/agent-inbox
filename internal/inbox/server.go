@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,14 @@ type Server struct {
 	config   ServerConfig
 	now      func() time.Time
 	hub      *doorbellHub
+	preAuth  preAuthCounters
+}
+
+type preAuthCounters struct {
+	unsigned          atomic.Uint64
+	oversized         atomic.Uint64
+	bodyReadFailures  atomic.Uint64
+	authenticationBad atomic.Uint64
 }
 
 type authContext struct {
@@ -80,21 +89,33 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !hasRequestSignature(r) {
-		writeAPIError(w, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"})
+	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
+		s.health(w, r)
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, "/v1/") {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
 	if err != nil {
+		s.preAuth.bodyReadFailures.Add(1)
 		writeError(w, http.StatusBadRequest, "invalid_body", "request body could not be read")
 		return
 	}
 	if len(body) > MaxRequestBytes {
+		s.preAuth.oversized.Add(1)
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 64 KiB")
+		return
+	}
+	if !hasRequestSignature(r) {
+		s.preAuth.unsigned.Add(1)
+		writeAPIError(w, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"})
 		return
 	}
 	identity, apiErr := s.authenticate(r, body)
 	if apiErr != nil {
+		s.preAuth.authenticationBad.Add(1)
 		writeAPIError(w, apiErr)
 		return
 	}
@@ -110,8 +131,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.poll(w, r, identity)
 	case r.URL.Path == "/v1/events" && r.Method == http.MethodGet:
 		s.events(w, r, identity)
-	case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
-		s.health(w, r)
+	case r.URL.Path == "/v1/metrics" && r.Method == http.MethodGet:
+		s.metrics(w)
 	case strings.HasPrefix(r.URL.Path, "/v1/messages/") && strings.HasSuffix(r.URL.Path, "/ack") && r.Method == http.MethodPost:
 		s.ack(w, r, identity)
 	default:
@@ -294,7 +315,9 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 }
 
 func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, message string) {
-	_ = s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code})
+	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code}); err != nil {
+		log.Printf("record rejected send by %s (%s): %v", agent.ID, code, err)
+	}
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
@@ -309,17 +332,20 @@ func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, me
 }
 
 func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) {
-	after := int64(0)
-	if raw := r.URL.Query().Get("after_seq"); raw != "" {
-		var err error
-		after, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || after < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_after_seq", "after_seq must be a non-negative integer")
+	limit := s.config.MaxPollLimit
+	query := r.URL.Query()
+	for key := range query {
+		if key != "limit" {
+			writeError(w, http.StatusBadRequest, "unsupported_query_parameter", "poll accepts only the limit parameter")
 			return
 		}
 	}
-	limit := s.config.MaxPollLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if values, exists := query["limit"]; exists {
+		if len(values) != 1 || values[0] == "" {
+			writeError(w, http.StatusBadRequest, "invalid_limit", fmt.Sprintf("limit must be between 1 and %d", s.config.MaxPollLimit))
+			return
+		}
+		raw := values[0]
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed < 1 || parsed > s.config.MaxPollLimit {
 			writeError(w, http.StatusBadRequest, "invalid_limit", fmt.Sprintf("limit must be between 1 and %d", s.config.MaxPollLimit))
@@ -327,16 +353,12 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		}
 		limit = parsed
 	}
-	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, auth.agent.TenantID, after, limit)
+	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, auth.agent.TenantID, limit)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
 		return
 	}
-	next := after
-	if len(messages) > 0 {
-		next = messages[len(messages)-1].Sequence
-	}
-	writeJSON(w, http.StatusOK, PollResponse{Messages: messages, NextAfterSeq: next})
+	writeJSON(w, http.StatusOK, PollResponse{Messages: messages})
 }
 
 func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
@@ -354,11 +376,7 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 		s.rejectAck(w, auth.agent, "invalid_processed_at", "processed_at must be an RFC3339 timestamp", http.StatusBadRequest)
 		return
 	}
-	if len(body.Note) > 512 || containsSecret(body.Note) {
-		s.rejectAck(w, auth.agent, "invalid_ack_note", "ack note is too long or resembles a secret", http.StatusBadRequest)
-		return
-	}
-	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID, body.Note)
+	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID)
 	if err != nil {
 		code, status, message := "ack_failed", http.StatusBadRequest, "message could not be acknowledged"
 		switch {
@@ -425,10 +443,46 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if err := s.store.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "storage": "error"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "storage": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) metrics(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]uint64{
+		"unauthenticated_unsigned_total":                s.preAuth.unsigned.Load(),
+		"unauthenticated_oversized_total":               s.preAuth.oversized.Load(),
+		"unauthenticated_body_read_failures_total":      s.preAuth.bodyReadFailures.Load(),
+		"unauthenticated_authentication_failures_total": s.preAuth.authenticationBad.Load(),
+	})
+}
+
+func (s *Server) RunPreAuthMetricsLog(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.logPreAuthMetrics()
+		}
+	}
+}
+
+func (s *Server) logPreAuthMetrics() {
+	unsigned := s.preAuth.unsigned.Load()
+	oversized := s.preAuth.oversized.Load()
+	bodyFailures := s.preAuth.bodyReadFailures.Load()
+	authFailures := s.preAuth.authenticationBad.Load()
+	if unsigned+oversized+bodyFailures+authFailures == 0 {
+		return
+	}
+	log.Printf("agent-inbox unauthenticated request totals: unsigned=%d oversized=%d body_read_failures=%d authentication_failures=%d", unsigned, oversized, bodyFailures, authFailures)
 }
 
 func (s *Server) RunNotifications(ctx context.Context) {

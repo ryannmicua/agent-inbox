@@ -52,7 +52,7 @@ agent-inbox send ... \
 
 The artifact URI, media type, hash, and byte size are metadata only. The inbox
 does not upload or fetch artifact bytes. Do not put credentials or secrets in
-payloads, provenance, acknowledgement notes, or artifact URLs.
+payloads, provenance, or artifact URLs.
 
 ## 3. Poll and process before acknowledging
 
@@ -72,8 +72,7 @@ agent-inbox ack \
   --server https://inbox.example.com \
   --agent agent-b \
   --key agent-b.key \
-  --message <message-uuid> \
-  --note 'processed successfully'
+  --message <message-uuid>
 ```
 
 An ack is a signed assertion that processing completed. The server records it

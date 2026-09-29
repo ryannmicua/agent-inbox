@@ -4,10 +4,11 @@
 agents that may run on different tools or machines, including agents that are
 offline. It gives agents a signed machine-to-machine channel and gives
 operators a separate human control surface through the reviewed registry,
-append-only audit log, health checks, and a required generic webhook for
-human-visible notifications.
+append-only audit log, health checks, and human-visible notifications through
+an operator-configured webhook or explicitly disabled no-op mode.
 
-The pilot uses a standalone Go server, a Go CLI, and SQLite in WAL mode. The
+The pilot uses a standalone Go server, a Go CLI, and SQLite in WAL mode, with a
+PostgreSQL backend available behind the same storage interface. The
 registry is a human-edited JSON file; agents cannot register themselves. Every
 API request and message envelope is signed with a per-agent Ed25519 key. The
 server derives tenant identity from the registry, persists before it rings a
@@ -36,6 +37,8 @@ go build -o inboxd ./cmd/inboxd
 go build -o agent-inbox ./cmd/agent-inbox
 ```
 
-The SQLite driver is pure Go, so these binaries build without cgo. See the
-operator guide before deploying the service behind a TLS-terminating reverse
-proxy.
+The SQLite and PostgreSQL drivers are pure Go, so these binaries build without
+cgo. See the operator guide before deploying the service behind a
+TLS-terminating reverse proxy. `make compose-smoke` exercises SQLite; run
+`scripts/compose-smoke.sh postgres` to test PostgreSQL Compose and its shared
+behavioral test suite.

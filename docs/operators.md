@@ -1,18 +1,18 @@
 # Operator guide
 
-This guide covers operating the standalone SQLite inbox. The human control
+This guide covers operating the standalone inbox. The human control
 surface is the reviewed registry plus the local audit and monitoring commands;
 agents have no registry or administrative endpoint. The service accepts signed
-machine requests and sends human-visible event notifications to a required
-generic webhook.
+machine requests and sends human-visible event notifications through either a
+generic webhook or an explicitly selected no-op notifier.
 
 ## Requirements and first start
 
 - Docker Engine with the Compose plugin.
 - A registry file readable by the service. Start from the empty
   [`config/registry.json`](../config/registry.json).
-- A reachable human notification webhook URL, configured as
-  `INBOX_WEBHOOK_URL` before starting Compose.
+- A human notification choice: configure a webhook, or explicitly set
+  `INBOX_NOTIFICATIONS_DISABLED=true` for a pilot with notifications disabled.
 - A TLS-terminating reverse proxy for use outside a trusted local test. The
   service itself listens on plain HTTP and does not manage certificates.
 
@@ -21,15 +21,20 @@ generic webhook.
    only the public key from each agent through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).
-4. Set the webhook endpoint and start the Compose service:
+4. Copy the environment example, replace its webhook placeholder with a
+   reachable endpoint or select explicit disabled mode, then start Compose:
 
    ```sh
-   export INBOX_WEBHOOK_URL="https://hooks.example.com/agent-inbox"
+   cp .env.example .env
+   # Edit .env to set INBOX_WEBHOOK_URL or INBOX_NOTIFICATIONS_DISABLED=true.
    docker compose up -d --build
    docker compose ps
    ```
 
-5. Confirm the local listener and SQLite health check, then inspect service logs:
+   To start without notifications, clear `INBOX_WEBHOOK_URL` in `.env` and set
+   `INBOX_NOTIFICATIONS_DISABLED=true`. The server logs a warning at startup.
+
+5. Confirm the local listener and selected storage health check, then inspect service logs:
 
    ```sh
    docker compose exec -T server inboxd healthcheck
@@ -53,15 +58,23 @@ its test volume.
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `INBOX_LISTEN_ADDR` | `:8080` | HTTP listener inside the container. |
-| `INBOX_STORAGE` | `sqlite` | Storage backend. Only `sqlite` ships in this pilot. |
+| `INBOX_STORAGE` | `sqlite` | Storage backend: `sqlite` or `postgres`. |
 | `INBOX_DB_PATH` | `/var/lib/agent-inbox/inbox.db` | SQLite database path. |
+| `INBOX_DATABASE_URL` | unset | PostgreSQL connection URL; required when `INBOX_STORAGE=postgres`. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
-| `INBOX_WEBHOOK_URL` | required | Generic HTTP webhook for consequential human-visible events. Compose refuses to start without it. |
+| `INBOX_WEBHOOK_URL` | unset | Generic HTTP webhook for consequential human-visible events. Choose this or explicitly set notifications disabled. |
+| `INBOX_NOTIFICATIONS_DISABLED` | `false` | Must be set to `true` to explicitly select the no-op notifier. Mutually exclusive with a webhook URL. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Total doorbell notifications, including the initial ring, before one escalation. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
+
+For PostgreSQL, use `compose.postgres.yaml` with the base file and configure
+`POSTGRES_PASSWORD`, `INBOX_HOST_PORT`, and a notification mode. The example
+PostgreSQL service is suitable for a pilot on one host; production deployments
+should use their managed or separately operated PostgreSQL service and a
+protected `INBOX_DATABASE_URL`.
 
 Each webhook event includes its event name, timestamp, message ID, agent IDs,
 tenant, kind, or rejection code as applicable. It never includes message
@@ -141,8 +154,10 @@ will not trigger further doorbells or escalations to it.
 
 ## Signing and delivery behavior
 
-Every HTTP request, including health checks and unknown routes, requires
-Ed25519 request headers. Their canonical signing bytes are the UTF-8 text:
+Every `/v1/` API request requires Ed25519 request headers. `GET /healthz` is an
+unauthenticated liveness check that returns only a single status field.
+Unknown non-API paths return an empty 404 without authentication. The signed
+request canonical bytes are the UTF-8 text:
 
 ```text
 agent-inbox-request-v1\n<agent-id>\n<key-id>\n<METHOD>\n<exact-path-and-query>\n<unix-seconds>\n<nonce>\n<lowercase-hex-sha256-of-body>
@@ -154,8 +169,8 @@ signing bytes are `agent-inbox-envelope-v1\n` followed by compact JSON of the se
 fields, in the order `type`, `id`, `task_id`, `thread_id`, optional `reply_to`,
 `sender_id`, `recipient_id`, `key_id`, `kind`, `created_at`, optional
 `asserted_authority`, `content_is_data`, `payload`, `artifacts`, and optional
-`provenance`. The `signature`, server tenant, sequence, acceptance time, and ack
-fields are excluded. Object keys in payload and provenance are sorted by
+`provenance`. The `signature`, server tenant, sequence, acceptance time, and
+acknowledgement state are excluded. Object keys in payload and provenance are sorted by
 Go's `encoding/json`; array order and JSON number representation are
 significant. Payloads and artifacts are signed as data.
 
@@ -173,14 +188,18 @@ The signed JSON API is:
 | Method and path | Behavior |
 | --- | --- |
 | `POST /v1/messages` | Submit a signed envelope to its explicit `recipient_id`. |
-| `GET /v1/messages?after_seq=N&limit=N` | Poll only the authenticated agent's unacknowledged inbox in sequence order. |
+| `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged inbox in sequence order. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
 | `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true,"processed_at":"<RFC3339>"}`. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
-| `GET /healthz` | Signed storage health check; returns no message data. |
+| `GET /v1/metrics` | Authenticated cumulative counters for unsigned, oversized, unreadable-body, and authentication-failed requests. |
+| `GET /healthz` | Unauthenticated liveness check; returns only a status field. |
 
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 `X-Request-Nonce`, and `X-Request-Signature` headers. The signature covers the
-exact path and query, so reverse proxies must preserve them.
+exact path and query, so reverse proxies must preserve them. Rejected
+pre-authentication requests do not create audit rows or webhook events. Bounded
+in-memory counters are exposed at signed `/v1/metrics` and logged once per
+minute when nonzero; the counters reset when the server restarts.
 
 The sender's `asserted_authority` is stored as an assertion only. A receiver
 must derive its own authority from its own operating context and must never
@@ -208,19 +227,24 @@ operator-supplied content, tenant identifiers, and message metadata. Keep
 enough dated copies to meet the deployment's recovery objective and verify
 restores periodically.
 
-To restore a snapshot, stop the service and use a one-off container under the
-service's non-root UID to replace the file in the named volume:
+To restore a snapshot, stop the service and use a small utility container to
+replace the file in the named volume. The server image is `scratch` and has no
+shell, so the helper uses Alpine:
 
 ```sh
 docker compose stop server
 backup="$(pwd -P)/agent-inbox-backup.db"
-docker compose run --rm --no-deps \
+container_id="$(docker compose ps -aq server)"
+volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/agent-inbox"}}{{.Name}}{{end}}{{end}}' "$container_id")"
+docker run --rm \
+  -v "$volume:/data" \
   -v "$backup:/restore.db:ro" \
-  --entrypoint sh server -c '
-    rm -f /var/lib/agent-inbox/inbox.db-wal /var/lib/agent-inbox/inbox.db-shm
-    cp /restore.db /var/lib/agent-inbox/inbox.db.restore
-    mv /var/lib/agent-inbox/inbox.db.restore /var/lib/agent-inbox/inbox.db
-    chmod 0600 /var/lib/agent-inbox/inbox.db
+  alpine:3.21 sh -ec '
+    rm -f /data/inbox.db-wal /data/inbox.db-shm
+    cp /restore.db /data/inbox.db.restore
+    chown 65532:65532 /data/inbox.db.restore
+    chmod 0600 /data/inbox.db.restore
+    mv /data/inbox.db.restore /data/inbox.db
   '
 docker compose up -d server
 docker compose exec -T server inboxd healthcheck
@@ -242,11 +266,12 @@ backup outside the database volume and never restore over a running server.
    docker compose exec -T server inboxd healthcheck
    ```
 
-The Compose named volume survives container replacement. This pilot creates
-tables idempotently and has no destructive schema migration. Keep the prior
-image available until health and audit checks pass. Rollback means stopping the
-service and running the prior image against the same compatible database
-schema; restore a backup only if the new version changed persistent data.
+The Compose named volume survives container replacement. The server initializes
+tables idempotently and applies documented compatibility migrations at startup.
+This release removes legacy acknowledgement metadata columns from SQLite; make a
+backup first and do not expect an older binary to use the migrated database.
+Keep the prior image available until health and audit checks pass. Restore a
+backup to roll back across an incompatible schema change.
 
 ## Audit, health, and monitoring
 
@@ -254,32 +279,33 @@ Read the most recent audit records from the running service:
 
 ```sh
 docker compose exec -T server inboxd audit \
-  --db /var/lib/agent-inbox/inbox.db --limit 100
+  --limit 100
 ```
 
 Output is JSON in descending audit sequence. Records include accepted and
 authenticated rejected sends, accepted and rejected acknowledgements, duplicate
 sends, and unacknowledged escalations. Unauthenticated failures are not
-persisted. Audit rows are append-only: SQLite triggers reject updates and
-deletes. Restrict access to the database volume and audit output.
+persisted. Audit rows are append-only: both backends reject updates and deletes
+with database triggers. Restrict access to the database and audit output.
 
 Monitor:
 
 - `docker compose exec -T server inboxd healthcheck` and the Compose health
-  state for listener and SQLite availability. Use a signed `agent-inbox poll` request
-  to confirm an agent can reach the HTTP API; signed `GET /healthz` reports
-  storage availability.
+  state for listener and selected storage availability. Use a signed
+  `agent-inbox poll` request to confirm an agent can reach the API.
 - `docker compose ps` health state and `docker compose logs server` for
   registry, storage, and webhook errors.
 - Database volume and filesystem free space, backup age, and backup restore
   checks.
-- Webhook delivery for accepted, rejected, acknowledged, and escalated events.
+- Webhook delivery for accepted, rejected, acknowledged, and escalated events,
+  or the startup warning if no-op notifications were explicitly selected.
 - Unacknowledged messages through the audit log and receiver poll. A
   notification or transport outage does not prove the agent is dead.
 
-The health endpoint exposes only a status and storage result. Every HTTP
-request is signed. Keep the service behind a TLS-terminating proxy when requests
-cross an untrusted network.
+Unauthenticated `GET /healthz` exposes only a liveness status. The container's
+`inboxd healthcheck` separately checks database availability and the listener.
+All `/v1/` routes, including metrics, require signatures. Keep the service
+behind a TLS-terminating proxy when requests cross an untrusted network.
 
 ## Troubleshooting common rejections
 
@@ -294,37 +320,95 @@ cross an untrusted network.
 | `kind_not_allowed` | The sender is not allowed to send that kind. Check the registry's `allowed_kinds`. |
 | `unknown_recipient` | The recipient is absent, disabled, or has no active public key. Confirm its registry entry. |
 | `wrong_tenant` | Sender and recipient have different registry tenants. Do not accept a tenant from the caller; review the human-approved assignment. |
-| `secret_detected` | A payload, provenance field, ack note, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
+| `secret_detected` | A payload, provenance field, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
+| `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |
 | `reply_to_required` / `reply_correlation_mismatch` | A result must refer to the addressed message and reuse its task and thread IDs. |
 | `message_id_conflict` | The ID already belongs to different content. Generate a new message ID; use an existing ID only for an identical retry. |
-| `storage_unavailable` | SQLite could not read or persist state. Check container health, volume permissions, disk space, and logs. |
+| `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |
 
-## Moving storage to PostgreSQL later
+## Moving storage to PostgreSQL
 
-Only SQLite ships in the pilot. The handlers depend on the `Store` interface in
-`internal/inbox/store.go`; SQLite-specific schema and SQL are isolated in
-`SQLiteStore`. A PostgreSQL implementation should preserve the same observable
-contract: transactionally assign monotonic sequence numbers, unique message
-IDs and request nonces, atomically append audit rows with accepted writes, keep
-audit append-only, and return unacknowledged messages in order.
+The server includes a PostgreSQL `Store` implementation. Both backends use the
+same handlers and delivery behavior. The application owns schema initialization
+and append-only audit protections. For an all-in-one Compose pilot, start the
+PostgreSQL profile with the base service file:
 
-The planned cutover is:
+```sh
+export POSTGRES_PASSWORD='replace-with-a-long-random-password'
+export INBOX_HOST_PORT=8080
+export INBOX_WEBHOOK_URL='https://notify.example.com/agent-inbox'
+docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
+docker compose -f compose.yaml -f compose.postgres.yaml ps
+docker compose -f compose.yaml -f compose.postgres.yaml exec -T server inboxd healthcheck
+```
 
-1. Implement and test a PostgreSQL `Store` with equivalent migrations and
-   constraints.
-2. Add connection settings and a backend selection in the store factory. The
-   deployment can then switch `INBOX_STORAGE=postgres` plus a PostgreSQL
-   connection string; this pilot deliberately rejects that setting because no
-   PostgreSQL driver ships here.
-3. Take a consistent SQLite snapshot with `inboxd backup`, import messages,
-   tenant assignments, sequence values, ack state, nonces still inside the
-   replay window, notification state, and the full audit log.
-4. Stop sends for cutover, compare counts and high-water sequences, switch the
-   backend configuration, then verify polls, ack, and audit before reopening
-   traffic.
-5. Keep the SQLite snapshot for rollback until the PostgreSQL service has
-   passed restore and operational checks.
+For production, use a separately managed PostgreSQL service and set
+`INBOX_STORAGE=postgres` and `INBOX_DATABASE_URL` on the server. Keep the URL
+out of source control and shell history. The Compose example disables TLS on
+the private Compose network; configure TLS for remote PostgreSQL connections.
+`inboxd backup` is SQLite-only. Back up PostgreSQL with `pg_dump`. Restore only
+after stopping the inbox server; `--clean` replaces existing database objects:
 
-Do not run SQLite and PostgreSQL as competing active inboxes during cutover;
-that would break message ID, sequence, nonce, and audit guarantees.
+```sh
+docker compose -f compose.yaml -f compose.postgres.yaml exec -T postgres \
+  sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > agent-inbox.dump
+docker compose -f compose.yaml -f compose.postgres.yaml stop server
+docker compose -f compose.yaml -f compose.postgres.yaml exec -T postgres \
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
+  < agent-inbox.dump
+docker compose -f compose.yaml -f compose.postgres.yaml up -d server
+docker compose -f compose.yaml -f compose.postgres.yaml exec -T server inboxd healthcheck
+```
+
+### SQLite to PostgreSQL cutover
+
+Use a maintenance window so both stores never accept writes at the same time.
+Set the reverse proxy to reject new requests, wait for active sends and
+acknowledgements to finish, then take an online SQLite snapshot with the
+`inboxd backup` command above. Leave the SQLite server stopped while importing
+and verifying the snapshot. Start the PostgreSQL Compose profile once to create
+its empty schema, then stop its server before import. Use `sqlite3` and `psql`
+clients on the operator machine; `INBOX_DATABASE_URL` must be reachable from
+that machine. Export/import the four data tables in dependency order:
+
+```sh
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT sequence,id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at FROM messages ORDER BY sequence' > messages.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT agent_id,nonce,created_at FROM request_nonces' > request_nonces.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json FROM audit_log ORDER BY sequence' > audit_log.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT message_id,attempts,last_notified_at,escalated_at FROM notification_state' > notification_state.csv
+```
+
+Set `INBOX_DATABASE_URL` to the PostgreSQL target, then import with `psql` in
+the same directory. For the Compose example, the host-side URL uses its
+loopback-published port, for example:
+
+```sh
+export INBOX_DATABASE_URL='postgres://agent_inbox:replace-with-a-long-random-password@127.0.0.1:15432/agent_inbox?sslmode=disable'
+```
+
+Use the password configured for that Compose project and URL-encode reserved
+characters in it. Then import:
+
+```sh
+psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+\copy messages(sequence,id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at) FROM 'messages.csv' CSV HEADER
+\copy request_nonces(agent_id,nonce,created_at) FROM 'request_nonces.csv' CSV HEADER
+\copy audit_log(sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json) FROM 'audit_log.csv' CSV HEADER
+\copy notification_state(message_id,attempts,last_notified_at,escalated_at) FROM 'notification_state.csv' CSV HEADER
+SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
+SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
+SQL
+```
+
+Compare row counts and maximum message/audit sequence values between the
+snapshot and PostgreSQL. Run `inboxd audit --limit 100`, verify known agent
+polls and acknowledgements, and inspect notification state before allowing the
+proxy to reopen traffic. Keep the SQLite snapshot intact until PostgreSQL
+backup and restore have been verified. Never operate both databases as active
+inboxes during or after cutover; that would split ordering, replay protection,
+deduplication, and audit history.
