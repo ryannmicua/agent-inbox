@@ -4,15 +4,17 @@ This guide covers operating the standalone inbox. The human control
 surface is the reviewed registry plus the local audit and monitoring commands;
 agents have no registry or administrative endpoint. The service accepts signed
 machine requests and sends human-visible event notifications through a generic
-webhook. Disabling notifications is available for local testing only.
+webhook. Local Compose uses a bundled sink that logs notification events;
+production must configure a human-operated webhook.
 
 ## Requirements and first start
 
 - Docker Engine with the Compose plugin.
 - A registry file readable by the service. Start from the empty
   [`config/registry.json`](../config/registry.json).
-- A webhook URL for human-visible notifications. Disabling notifications is
-  for local testing only; production must configure `INBOX_WEBHOOK_URL`.
+- A reachable webhook URL for human-visible notifications. The local Compose
+  default is the bundled notification sink; production must set
+  `INBOX_WEBHOOK_URL` to a human-operated endpoint.
 - A TLS-terminating reverse proxy for use outside a trusted local test. The
   service itself listens on plain HTTP and does not manage certificates.
 
@@ -21,19 +23,19 @@ webhook. Disabling notifications is available for local testing only.
    only the public key from each agent through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).
-4. Copy the environment example and set its webhook placeholder to a reachable
-   endpoint, then start Compose:
+4. Copy the environment example, replace the local sink URL with a reachable
+   human-operated webhook for production, then start Compose:
 
    ```sh
    cp .env.example .env
-   # Edit .env to set INBOX_WEBHOOK_URL.
+   # For production, edit .env to set INBOX_WEBHOOK_URL.
    docker compose up -d --build
    docker compose ps
    ```
 
-   For local testing only, clear `INBOX_WEBHOOK_URL` and set
-   `INBOX_NOTIFICATIONS_DISABLED=true`. The server logs a prominent warning;
-   production must set `INBOX_WEBHOOK_URL`.
+   The local sink accepts webhook events and writes them to the
+   `notification-sink` service log. It is intended for local testing; production
+   must use a human-operated webhook endpoint.
 
 5. Confirm the local listener and selected storage health check, then inspect service logs:
 
@@ -63,8 +65,7 @@ its test volume.
 | `INBOX_DB_PATH` | `/var/lib/agent-inbox/inbox.db` | SQLite database path. |
 | `INBOX_DATABASE_URL` | unset | PostgreSQL connection URL; required when `INBOX_STORAGE=postgres`. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
-| `INBOX_WEBHOOK_URL` | unset | Generic HTTP webhook for consequential human-visible events. Required in production. |
-| `INBOX_NOTIFICATIONS_DISABLED` | `false` | Set to `true` only for local testing to explicitly disable notifications. Mutually exclusive with a webhook URL. |
+| `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Generic HTTP webhook for consequential human-visible events. Required at startup; use a human-operated endpoint in production. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Total doorbell notifications, including the initial ring, before one escalation. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
@@ -72,10 +73,11 @@ its test volume.
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
 
 For PostgreSQL, use `compose.postgres.yaml` with the base file and configure
-`POSTGRES_PASSWORD`, `INBOX_HOST_PORT`, and a notification mode. The example
-PostgreSQL service is suitable for a pilot on one host; production deployments
-should use their managed or separately operated PostgreSQL service and a
-protected `INBOX_DATABASE_URL`.
+`POSTGRES_PASSWORD`, `INBOX_HOST_PORT`, and `INBOX_WEBHOOK_URL` when using a
+production webhook. The local Compose configuration connects to the bundled
+notification sink. The example PostgreSQL service is suitable for a pilot on
+one host; production deployments should use their managed or separately
+operated PostgreSQL service and a protected `INBOX_DATABASE_URL`.
 
 Each webhook event includes its event name, timestamp, message ID, agent IDs,
 tenant, kind, or rejection code as applicable. It never includes message
@@ -306,9 +308,9 @@ Monitor:
   registry, storage, and webhook errors.
 - Database volume and filesystem free space, backup age, and backup restore
   checks.
-- Webhook delivery and `notification.failed` audit entries for accepted,
-  rejected, acknowledged, and escalated events. Notifications may be disabled
-  only for local testing; production must configure a webhook.
+- Webhook delivery, the local `notification-sink` log, and `notification.failed`
+  audit entries for accepted, rejected, acknowledged, and escalated events.
+  Production must configure a human-operated webhook.
 - Unacknowledged messages through the audit log and receiver poll. A
   notification or transport outage does not prove the agent is dead.
 

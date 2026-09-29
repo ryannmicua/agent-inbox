@@ -57,6 +57,13 @@ type DeliveredMessage struct {
 	AcknowledgedAt *time.Time `json:"acknowledged_at,omitempty"`
 }
 
+type SendResponse struct {
+	Envelope
+	TenantID   string    `json:"tenant_id"`
+	Sequence   int64     `json:"sequence"`
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
 type AckRequest struct {
 	Processed   bool   `json:"processed"`
 	ProcessedAt string `json:"processed_at"`

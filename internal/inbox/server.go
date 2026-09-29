@@ -251,7 +251,10 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 	if duplicate {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, message)
+	writeJSON(w, status, SendResponse{
+		Envelope: message.Envelope, TenantID: message.TenantID,
+		Sequence: message.Sequence, AcceptedAt: message.AcceptedAt,
+	})
 }
 
 type validationError struct{ code, message string }

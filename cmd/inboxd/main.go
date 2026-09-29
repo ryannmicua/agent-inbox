@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -234,24 +235,12 @@ func openConfiguredStore(sqlitePath string) (inbox.Store, error) {
 
 func configuredNotifier() (inbox.Notifier, error) {
 	webhook := os.Getenv("INBOX_WEBHOOK_URL")
-	disabledValue := os.Getenv("INBOX_NOTIFICATIONS_DISABLED")
-	disabled := false
-	if disabledValue != "" {
-		parsed, err := strconv.ParseBool(disabledValue)
-		if err != nil {
-			return nil, errors.New("INBOX_NOTIFICATIONS_DISABLED must be true or false")
-		}
-		disabled = parsed
+	if webhook == "" {
+		return nil, errors.New("INBOX_WEBHOOK_URL is required")
 	}
-	if webhook == "" && !disabled {
-		return nil, errors.New("set INBOX_WEBHOOK_URL or explicitly set INBOX_NOTIFICATIONS_DISABLED=true")
-	}
-	if webhook != "" && disabled {
-		return nil, errors.New("choose either INBOX_WEBHOOK_URL or INBOX_NOTIFICATIONS_DISABLED=true, not both")
-	}
-	if disabled {
-		log.Printf("WARNING: notifications are disabled for local testing only; production must set INBOX_WEBHOOK_URL, and consequential inbox actions will not reach an operator")
-		return inbox.NoopNotifier{}, nil
+	parsed, err := url.Parse(webhook)
+	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, errors.New("INBOX_WEBHOOK_URL must be an absolute HTTP or HTTPS URL")
 	}
 	return inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, nil
 }
@@ -260,8 +249,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `inboxd: standalone agent inbox server (SQLite or PostgreSQL)
 
 Run server with environment: INBOX_LISTEN_ADDR, INBOX_STORAGE, INBOX_DB_PATH,
-INBOX_DATABASE_URL, INBOX_REGISTRY_PATH, INBOX_WEBHOOK_URL or
-INBOX_NOTIFICATIONS_DISABLED=true.
+INBOX_DATABASE_URL, INBOX_REGISTRY_PATH, INBOX_WEBHOOK_URL.
 Operator commands:
   inboxd healthcheck
   inboxd audit --db PATH [--limit 100]

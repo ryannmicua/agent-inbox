@@ -299,6 +299,37 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	}
 }
 
+func TestSenderSendResponsesOmitAcknowledgementMetadata(t *testing.T) {
+	s := newTestSystem(t)
+	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResponseOmitsAcknowledgement := func(label string, wantStatus int) {
+		t.Helper()
+		data, status, err := s.clients["agent-a"].Do(context.Background(), http.MethodPost, "/v1/messages", body)
+		if err != nil || status != wantStatus {
+			t.Fatalf("%s returned HTTP %d err=%v body=%s", label, status, err, data)
+		}
+		var response map[string]json.RawMessage
+		if err := json.Unmarshal(data, &response); err != nil {
+			t.Fatalf("%s returned invalid JSON: %s (%v)", label, data, err)
+		}
+		for _, field := range []string{"acknowledged_at", "ack_by", "ack_note"} {
+			if _, ok := response[field]; ok {
+				t.Errorf("%s exposed recipient field %q: %s", label, field, data)
+			}
+		}
+	}
+
+	assertResponseOmitsAcknowledgement("new send", http.StatusCreated)
+	if status, code := s.ack(t, "agent-b", envelope.ID, true); status != http.StatusOK || code != "" {
+		t.Fatalf("recipient acknowledgement failed: HTTP %d %q", status, code)
+	}
+	assertResponseOmitsAcknowledgement("idempotent resend after acknowledgement", http.StatusOK)
+}
+
 func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T) {
 	s := newTestSystem(t)
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"check this"}`)

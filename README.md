@@ -5,7 +5,8 @@ agents that may run on different tools or machines, including agents that are
 offline. It gives agents a signed machine-to-machine channel and gives
 operators a separate human control surface through the reviewed registry,
 append-only audit log, health checks, and human-visible notifications through
-an operator-configured webhook or explicitly disabled no-op mode.
+an operator-configured webhook. The local Compose setup uses a bundled sink
+that logs notification events; production must configure a human-operated webhook.
 
 The pilot uses a standalone Go server, a Go CLI, and SQLite in WAL mode, with a
 PostgreSQL backend available behind the same storage interface. The

@@ -19,8 +19,7 @@ chmod 0755 "$tmp_dir"
 project="agent-inbox-smoke-$$"
 export INBOX_HOST_PORT="${INBOX_HOST_PORT:-18080}"
 export INBOX_REGISTRY_FILE="$tmp_dir/registry.json"
-export INBOX_WEBHOOK_URL=""
-export INBOX_NOTIFICATIONS_DISABLED=true
+export INBOX_WEBHOOK_URL="http://notification-sink:8081/notifications"
 
 compose=(docker compose --project-name "$project" -f compose.yaml)
 if [[ "$mode" == postgres ]]; then
@@ -84,5 +83,14 @@ result_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<
 returned="$("$cli" poll --server "$server" --agent agent-a --key "$tmp_dir/agent-a.key")"
 python3 -c 'import json,sys; p=json.load(sys.stdin); assert len(p["messages"]) == 1; m=p["messages"][0]; assert m["id"] == sys.argv[1]; assert m["reply_to"] == sys.argv[2]; assert m["kind"] == "result"' "$result_id" "$message_id" <<< "$returned"
 "$cli" ack --server "$server" --agent agent-a --key "$tmp_dir/agent-a.key" --message "$result_id" >/dev/null
+
+sink_logs="$("${compose[@]}" logs --no-color notification-sink)"
+python3 -c 'import json,sys; events=[]
+for line in sys.stdin:
+    if " | " not in line: continue
+    try: events.append(json.loads(line.split(" | ",1)[1]))
+    except json.JSONDecodeError: pass
+names={event.get("event") for event in events}
+assert {"message.accepted","message.acknowledged"} <= names, events' <<< "$sink_logs"
 
 echo "Compose $mode end-to-end exchange passed: instruction $message_id -> result $result_id"

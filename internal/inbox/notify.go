@@ -24,12 +24,6 @@ type Notifier interface {
 	Notify(context.Context, Notification) error
 }
 
-// NoopNotifier is available only when the operator explicitly disables
-// notifications at startup. NewServer never selects it as a fallback.
-type NoopNotifier struct{}
-
-func (NoopNotifier) Notify(context.Context, Notification) error { return nil }
-
 type WebhookNotifier struct {
 	URL    string
 	Client *http.Client
