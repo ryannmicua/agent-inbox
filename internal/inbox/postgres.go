@@ -339,31 +339,34 @@ func (s *PostgresStore) MarkNotified(ctx context.Context, id string, now time.Ti
 	return err
 }
 
-func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.Time) error {
+func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	var tenant string
 	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM messages WHERE id = $1`, id).Scan(&tenant); err != nil {
-		return err
+		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = $1 WHERE message_id = $2 AND escalated_at IS NULL`, now.UTC(), id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if updated == 0 {
-		return tx.Commit()
+		return false, tx.Commit()
 	}
-	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "notified"}, now); err != nil {
-		return err
+	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted"}, now); err != nil {
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type postgresStateError interface {

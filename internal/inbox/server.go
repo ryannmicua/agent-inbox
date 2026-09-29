@@ -131,8 +131,6 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.poll(w, r, identity)
 	case r.URL.Path == "/v1/events" && r.Method == http.MethodGet:
 		s.events(w, r, identity)
-	case r.URL.Path == "/v1/metrics" && r.Method == http.MethodGet:
-		s.metrics(w)
 	case strings.HasPrefix(r.URL.Path, "/v1/messages/") && strings.HasSuffix(r.URL.Path, "/ack") && r.Method == http.MethodPost:
 		s.ack(w, r, identity)
 	default:
@@ -180,67 +178,68 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) {
 	var e Envelope
 	if err := decodeStrict(r.Body, &e); err != nil {
-		s.rejectSend(w, auth.agent, "invalid_json", "request must be a valid message envelope")
+		s.rejectSend(w, auth.agent, "invalid_json", "request must be a valid message envelope", "")
 		return
 	}
 	if !VerifyEnvelope(e, auth.key) {
-		s.rejectSend(w, auth.agent, "invalid_message_signature", "message envelope signature is invalid")
+		s.rejectSend(w, auth.agent, "invalid_message_signature", "message envelope signature is invalid", "")
 		return
 	}
+	messageID := e.ID
 	if err := validateEnvelope(e, auth); err != nil {
-		s.rejectSend(w, auth.agent, err.code, err.message)
+		s.rejectSend(w, auth.agent, err.code, err.message, messageID)
 		return
 	}
 	recipient, err := s.registry.Agent(e.RecipientID)
 	if err != nil {
 		if errors.Is(err, ErrUnknownAgent) {
-			s.rejectSend(w, auth.agent, "unknown_recipient", "recipient is unknown, disabled, or revoked")
+			s.rejectSend(w, auth.agent, "unknown_recipient", "recipient is unknown, disabled, or revoked", messageID)
 		} else {
-			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded")
+			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", messageID)
 		}
 		return
 	}
 	if !contains(recipient.PublicKeys, func(k RegistryKey) bool { return !k.Disabled }) {
-		s.rejectSend(w, auth.agent, "unknown_recipient", "recipient has no active signing key")
+		s.rejectSend(w, auth.agent, "unknown_recipient", "recipient has no active signing key", messageID)
 		return
 	}
 	if e.Kind != "instruction" && e.Kind != "result" {
-		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only")
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only", messageID)
 		return
 	}
 	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
-		s.rejectSend(w, auth.agent, "recipient_not_allowed", "sender is not allowed to address this recipient")
+		s.rejectSend(w, auth.agent, "recipient_not_allowed", "sender is not allowed to address this recipient", messageID)
 		return
 	}
 	if !containsString(auth.agent.AllowedKinds, e.Kind) {
-		s.rejectSend(w, auth.agent, "kind_not_allowed", "sender is not allowed to send this message kind")
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "sender is not allowed to send this message kind", messageID)
 		return
 	}
 	if recipient.TenantID != auth.agent.TenantID {
-		s.rejectSend(w, auth.agent, "wrong_tenant", "sender and recipient must belong to the same server-assigned tenant")
+		s.rejectSend(w, auth.agent, "wrong_tenant", "sender and recipient must belong to the same server-assigned tenant", messageID)
 		return
 	}
 	if e.ReplyTo != "" {
 		original, err := s.store.GetMessage(r.Context(), e.ReplyTo, auth.agent.TenantID)
 		if err != nil {
-			s.rejectSend(w, auth.agent, "reply_not_found", "reply_to must reference a stored message")
+			s.rejectSend(w, auth.agent, "reply_not_found", "reply_to must reference a stored message", messageID)
 			return
 		}
 		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
-			s.rejectSend(w, auth.agent, "reply_correlation_mismatch", "reply_to must correlate to the addressed message and task")
+			s.rejectSend(w, auth.agent, "reply_correlation_mismatch", "reply_to must correlate to the addressed message and task", messageID)
 			return
 		}
 	} else if e.Kind == "result" {
-		s.rejectSend(w, auth.agent, "reply_to_required", "result messages must reference the instruction they answer")
+		s.rejectSend(w, auth.agent, "reply_to_required", "result messages must reference the instruction they answer", messageID)
 		return
 	}
 	message, duplicate, err := s.store.CreateMessage(r.Context(), e, auth.agent.TenantID)
 	if err != nil {
 		if errors.Is(err, ErrMessageConflict) {
-			s.rejectSend(w, auth.agent, "message_id_conflict", "message id already exists with different signed content")
+			s.rejectSend(w, auth.agent, "message_id_conflict", "message id already exists with different signed content", messageID)
 		} else {
 			log.Printf("persist message %s: %v", e.ID, err)
-			s.rejectSend(w, auth.agent, "storage_unavailable", "message could not be persisted")
+			s.rejectSend(w, auth.agent, "storage_unavailable", "message could not be persisted", messageID)
 		}
 		return
 	}
@@ -314,11 +313,11 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 	return nil
 }
 
-func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, message string) {
+func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, message, messageID string) {
 	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code}); err != nil {
 		log.Printf("record rejected send by %s (%s): %v", agent.ID, code, err)
 	}
-	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
+	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
 	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed", "unknown_recipient", "reply_correlation_mismatch":
@@ -449,15 +448,6 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) metrics(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, map[string]uint64{
-		"unauthenticated_unsigned_total":                s.preAuth.unsigned.Load(),
-		"unauthenticated_oversized_total":               s.preAuth.oversized.Load(),
-		"unauthenticated_body_read_failures_total":      s.preAuth.bodyReadFailures.Load(),
-		"unauthenticated_authentication_failures_total": s.preAuth.authenticationBad.Load(),
-	})
-}
-
 func (s *Server) RunPreAuthMetricsLog(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute
@@ -518,12 +508,13 @@ func (s *Server) dispatchDue(ctx context.Context) {
 		if c.Escalated {
 			continue
 		}
-		if err := s.notifier.Notify(ctx, Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID}); err != nil {
-			log.Printf("escalate unacknowledged message %s: %v", c.MessageID, err)
+		marked, err := s.store.MarkEscalated(ctx, c.MessageID, s.now())
+		if err != nil {
+			log.Printf("record escalation for %s: %v", c.MessageID, err)
 			continue
 		}
-		if err := s.store.MarkEscalated(ctx, c.MessageID, s.now()); err != nil {
-			log.Printf("record escalation for %s: %v", c.MessageID, err)
+		if marked {
+			s.notify(Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID})
 		}
 	}
 }
@@ -546,6 +537,26 @@ func (s *Server) assignedToTenant(agentID, tenantID string) bool {
 func (s *Server) notify(event Notification) {
 	if err := s.notifier.Notify(context.Background(), event); err != nil {
 		log.Printf("human notification %s failed: %v", event.Event, err)
+		actor := event.SenderID
+		if actor == "" {
+			actor = event.RecipientID
+		}
+		if actor == "" {
+			actor = "system"
+		}
+		class := "delivery_error"
+		if errors.Is(err, context.DeadlineExceeded) {
+			class = "timeout"
+		} else if errors.Is(err, context.Canceled) {
+			class = "canceled"
+		}
+		if auditErr := s.store.AppendAudit(context.Background(), AuditRecord{
+			Action: "notification.failed", ActorID: actor, SubjectID: event.MessageID,
+			TenantID: event.TenantID, Outcome: "failed", Code: class,
+			Detail: map[string]any{"event": event.Event, "message_id": event.MessageID, "error_class": class},
+		}); auditErr != nil {
+			log.Printf("record notification failure for %s: %v", event.Event, auditErr)
+		}
 	}
 }
 

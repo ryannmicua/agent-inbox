@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -364,16 +365,9 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	if countAudit(entries, "send", "rejected") != expectedAudits {
 		t.Fatalf("rejected sends were not audited: %+v", entries)
 	}
-	metricsData, metricsStatus, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
-	if err != nil || metricsStatus != http.StatusOK {
-		t.Fatalf("signed metrics request failed: HTTP %d err=%v", metricsStatus, err)
-	}
-	var metrics map[string]uint64
-	if err := json.Unmarshal(metricsData, &metrics); err != nil {
-		t.Fatal(err)
-	}
-	if metrics["unauthenticated_authentication_failures_total"] != 2 {
-		t.Fatalf("unknown and revoked agents were not counted as authentication failures: %+v", metrics)
+	_, metricsStatus, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
+	if err != nil || metricsStatus != http.StatusNotFound {
+		t.Fatalf("service-wide counters were exposed through the agent API: HTTP %d err=%v", metricsStatus, err)
 	}
 }
 
@@ -399,16 +393,9 @@ func TestUnauthenticatedAndOversizedRequestsHaveNoAuditOrWebhookSideEffects(t *t
 	if len(entries) != 0 || s.notifier.count("message.rejected") != 0 {
 		t.Fatalf("pre-authentication requests caused durable side effects: audit=%+v rejection notifications=%d", entries, s.notifier.count("message.rejected"))
 	}
-	data, status, err := s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("signed metrics request failed: HTTP %d err=%v", status, err)
-	}
-	var metrics map[string]uint64
-	if err := json.Unmarshal(data, &metrics); err != nil {
-		t.Fatal(err)
-	}
-	if metrics["unauthenticated_unsigned_total"] != 1 || metrics["unauthenticated_oversized_total"] != 1 {
-		t.Fatalf("unauthenticated and oversized requests were not counted: %+v", metrics)
+	_, status, err = s.clients["agent-a"].Do(context.Background(), http.MethodGet, "/v1/metrics", nil)
+	if err != nil || status != http.StatusNotFound {
+		t.Fatalf("service-wide counters were exposed through the agent API: HTTP %d err=%v", status, err)
 	}
 	var aggregate bytes.Buffer
 	previousLogOutput := log.Writer()
@@ -417,6 +404,115 @@ func TestUnauthenticatedAndOversizedRequestsHaveNoAuditOrWebhookSideEffects(t *t
 	s.service.logPreAuthMetrics()
 	if !strings.Contains(aggregate.String(), "unsigned=1 oversized=1") {
 		t.Fatalf("periodic pre-auth log did not aggregate the counters: %q", aggregate.String())
+	}
+}
+
+func TestNotificationFailuresAreAuditedWithoutChangingResponses(t *testing.T) {
+	s := newTestSystem(t)
+	notifier := &failingNotifier{err: errors.New("temporary transport failure")}
+	s.service.notifier = notifier
+
+	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	message, status, apiErr := s.send(t, envelope, "agent-a")
+	if apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("notification failure changed successful send response: HTTP %d err=%+v", status, apiErr)
+	}
+
+	ack, err := json.Marshal(AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, status, err = s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages/"+message.ID+"/ack", ack)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("notification failure changed successful acknowledgement response: HTTP %d err=%v", status, err)
+	}
+
+	rejected := s.envelope(t, "agent-a", "agent-c", "instruction", `{"x":2}`)
+	_, status, apiErr = s.send(t, rejected, "agent-a")
+	if apiErr == nil || apiErr.Error.Code != "wrong_tenant" || status != http.StatusForbidden {
+		t.Fatalf("notification failure changed rejected send response: HTTP %d err=%+v", status, apiErr)
+	}
+
+	if len(notifier.events) != 3 {
+		t.Fatalf("expected one delivery attempt for each event, got %+v", notifier.events)
+	}
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failures := make([]AuditEntry, 0, 3)
+	for _, entry := range entries {
+		if entry.Action == "notification.failed" {
+			failures = append(failures, entry)
+		}
+	}
+	if len(failures) != 3 {
+		t.Fatalf("notification failures were not recorded: %+v", entries)
+	}
+	want := map[string]string{
+		"message.accepted":     message.ID,
+		"message.acknowledged": message.ID,
+		"message.rejected":     rejected.ID,
+	}
+	for _, failure := range failures {
+		event, ok := failure.Detail["event"].(string)
+		if !ok || failure.Detail["message_id"] != want[event] || failure.Detail["error_class"] != "delivery_error" || failure.Code != "delivery_error" {
+			t.Fatalf("notification failure audit omitted its event, message ID, or error class: %+v", failure)
+		}
+		delete(want, event)
+	}
+	if len(want) != 0 {
+		t.Fatalf("notification failure audit omitted event(s): %+v", want)
+	}
+}
+
+func TestFailedEscalationIsAuditedAndAttemptedOnce(t *testing.T) {
+	s := newTestSystem(t)
+	base := time.Now().UTC()
+	s.service.now = func() time.Time { return base }
+	s.service.config.RetryInterval = time.Second
+	s.service.config.MaxDoorbellAttempts = 1
+	notifier := &failingNotifier{err: errors.New("temporary transport failure")}
+	s.service.notifier = notifier
+
+	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	if _, status, apiErr := s.send(t, envelope, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("notification failure changed successful send response: HTTP %d err=%+v", status, apiErr)
+	}
+	base = base.Add(2 * time.Second)
+	s.service.dispatchDue(context.Background())
+	s.service.dispatchDue(context.Background())
+
+	escalationAttempts := 0
+	for _, event := range notifier.events {
+		if event.Event == "message.unacknowledged_escalation" {
+			escalationAttempts++
+		}
+	}
+	if escalationAttempts != 1 {
+		t.Fatalf("failed escalation was not attempted exactly once: %+v", notifier.events)
+	}
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countAudit(entries, "message.unacknowledged_escalation", "attempted") != 1 {
+		t.Fatalf("escalation attempt was not audited before notification: %+v", entries)
+	}
+	failureFound := false
+	for _, entry := range entries {
+		if entry.Action == "notification.failed" && entry.Detail["event"] == "message.unacknowledged_escalation" && entry.Detail["message_id"] == envelope.ID {
+			failureFound = true
+		}
+	}
+	if !failureFound {
+		t.Fatalf("failed escalation notification was not recorded: %+v", entries)
+	}
+}
+
+func TestOpenStoreRejectsPostgresqlAlias(t *testing.T) {
+	if _, err := OpenStore("postgresql", ""); err == nil || !strings.Contains(err.Error(), "unsupported storage backend") {
+		t.Fatalf("storage factory accepted the postgresql alias: %v", err)
 	}
 }
 
@@ -609,6 +705,16 @@ type recordingNotifier struct {
 	persistedFirst bool
 }
 
+type failingNotifier struct {
+	err    error
+	events []Notification
+}
+
+func (n *failingNotifier) Notify(_ context.Context, event Notification) error {
+	n.events = append(n.events, event)
+	return n.err
+}
+
 func (n *recordingNotifier) Notify(ctx context.Context, event Notification) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -670,7 +776,7 @@ func TestDoorbellRetriesAreBoundedAndEscalateOnceAfterPersistence(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if countAudit(entries, "message.unacknowledged_escalation", "notified") != 1 {
+	if countAudit(entries, "message.unacknowledged_escalation", "attempted") != 1 {
 		t.Fatalf("escalation was not recorded exactly once in audit: %+v", entries)
 	}
 	if got := s.poll(t, "agent-b"); len(got.Messages) != 1 {

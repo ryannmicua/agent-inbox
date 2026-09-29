@@ -3,16 +3,16 @@
 This guide covers operating the standalone inbox. The human control
 surface is the reviewed registry plus the local audit and monitoring commands;
 agents have no registry or administrative endpoint. The service accepts signed
-machine requests and sends human-visible event notifications through either a
-generic webhook or an explicitly selected no-op notifier.
+machine requests and sends human-visible event notifications through a generic
+webhook. Disabling notifications is available for local testing only.
 
 ## Requirements and first start
 
 - Docker Engine with the Compose plugin.
 - A registry file readable by the service. Start from the empty
   [`config/registry.json`](../config/registry.json).
-- A human notification choice: configure a webhook, or explicitly set
-  `INBOX_NOTIFICATIONS_DISABLED=true` for a pilot with notifications disabled.
+- A webhook URL for human-visible notifications. Disabling notifications is
+  for local testing only; production must configure `INBOX_WEBHOOK_URL`.
 - A TLS-terminating reverse proxy for use outside a trusted local test. The
   service itself listens on plain HTTP and does not manage certificates.
 
@@ -21,18 +21,19 @@ generic webhook or an explicitly selected no-op notifier.
    only the public key from each agent through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).
-4. Copy the environment example, replace its webhook placeholder with a
-   reachable endpoint or select explicit disabled mode, then start Compose:
+4. Copy the environment example and set its webhook placeholder to a reachable
+   endpoint, then start Compose:
 
    ```sh
    cp .env.example .env
-   # Edit .env to set INBOX_WEBHOOK_URL or INBOX_NOTIFICATIONS_DISABLED=true.
+   # Edit .env to set INBOX_WEBHOOK_URL.
    docker compose up -d --build
    docker compose ps
    ```
 
-   To start without notifications, clear `INBOX_WEBHOOK_URL` in `.env` and set
-   `INBOX_NOTIFICATIONS_DISABLED=true`. The server logs a warning at startup.
+   For local testing only, clear `INBOX_WEBHOOK_URL` and set
+   `INBOX_NOTIFICATIONS_DISABLED=true`. The server logs a prominent warning;
+   production must set `INBOX_WEBHOOK_URL`.
 
 5. Confirm the local listener and selected storage health check, then inspect service logs:
 
@@ -62,8 +63,8 @@ its test volume.
 | `INBOX_DB_PATH` | `/var/lib/agent-inbox/inbox.db` | SQLite database path. |
 | `INBOX_DATABASE_URL` | unset | PostgreSQL connection URL; required when `INBOX_STORAGE=postgres`. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
-| `INBOX_WEBHOOK_URL` | unset | Generic HTTP webhook for consequential human-visible events. Choose this or explicitly set notifications disabled. |
-| `INBOX_NOTIFICATIONS_DISABLED` | `false` | Must be set to `true` to explicitly select the no-op notifier. Mutually exclusive with a webhook URL. |
+| `INBOX_WEBHOOK_URL` | unset | Generic HTTP webhook for consequential human-visible events. Required in production. |
+| `INBOX_NOTIFICATIONS_DISABLED` | `false` | Set to `true` only for local testing to explicitly disable notifications. Mutually exclusive with a webhook URL. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Total doorbell notifications, including the initial ring, before one escalation. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
@@ -80,9 +81,13 @@ Each webhook event includes its event name, timestamp, message ID, agent IDs,
 tenant, kind, or rejection code as applicable. It never includes message
 payloads or key material. Events include `message.accepted`,
 `message.acknowledged`, `message.rejected`, and
-`message.unacknowledged_escalation`. Webhook failure is logged and does not
-undo an already persisted message or ack. Escalation is retried by the
-notification loop until the webhook accepts it.
+`message.unacknowledged_escalation`. Webhook delivery is best-effort and each
+event is attempted once after its consequence is persisted. A delivery failure
+adds a `notification.failed` audit entry with the event, message ID when
+available, and error class; it does not undo a message or acknowledgement or
+change the API response. Doorbell retries remain separate from webhook
+delivery. The escalation state and audit entry are committed before its single
+webhook attempt.
 
 ## Registry operations
 
@@ -191,14 +196,13 @@ The signed JSON API is:
 | `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged inbox in sequence order. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
 | `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true,"processed_at":"<RFC3339>"}`. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
-| `GET /v1/metrics` | Authenticated cumulative counters for unsigned, oversized, unreadable-body, and authentication-failed requests. |
 | `GET /healthz` | Unauthenticated liveness check; returns only a status field. |
 
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 `X-Request-Nonce`, and `X-Request-Signature` headers. The signature covers the
 exact path and query, so reverse proxies must preserve them. Rejected
 pre-authentication requests do not create audit rows or webhook events. Bounded
-in-memory counters are exposed at signed `/v1/metrics` and logged once per
+in-memory counters are available only in the periodic operator log, once per
 minute when nonzero; the counters reset when the server restarts.
 
 The sender's `asserted_authority` is stored as an assertion only. A receiver
@@ -284,9 +288,10 @@ docker compose exec -T server inboxd audit \
 
 Output is JSON in descending audit sequence. Records include accepted and
 authenticated rejected sends, accepted and rejected acknowledgements, duplicate
-sends, and unacknowledged escalations. Unauthenticated failures are not
-persisted. Audit rows are append-only: both backends reject updates and deletes
-with database triggers. Restrict access to the database and audit output.
+sends, unacknowledged escalation attempts, and failed webhook deliveries.
+Unauthenticated failures are not persisted. Audit rows are append-only: both
+backends reject updates and deletes with database triggers. Restrict access to
+the database and audit output.
 
 Monitor:
 
@@ -297,15 +302,16 @@ Monitor:
   registry, storage, and webhook errors.
 - Database volume and filesystem free space, backup age, and backup restore
   checks.
-- Webhook delivery for accepted, rejected, acknowledged, and escalated events,
-  or the startup warning if no-op notifications were explicitly selected.
+- Webhook delivery and `notification.failed` audit entries for accepted,
+  rejected, acknowledged, and escalated events. Notifications may be disabled
+  only for local testing; production must configure a webhook.
 - Unacknowledged messages through the audit log and receiver poll. A
   notification or transport outage does not prove the agent is dead.
 
 Unauthenticated `GET /healthz` exposes only a liveness status. The container's
 `inboxd healthcheck` separately checks database availability and the listener.
-All `/v1/` routes, including metrics, require signatures. Keep the service
-behind a TLS-terminating proxy when requests cross an untrusted network.
+All `/v1/` routes require signatures. Keep the service behind a TLS-terminating
+proxy when requests cross an untrusted network.
 
 ## Troubleshooting common rejections
 

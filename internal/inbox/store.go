@@ -65,7 +65,7 @@ type Store interface {
 	AuditEntries(context.Context, int) ([]AuditEntry, error)
 	DueNotifications(context.Context, time.Time, time.Duration, int) ([]NotificationCandidate, error)
 	MarkNotified(context.Context, string, time.Time) error
-	MarkEscalated(context.Context, string, time.Time) error
+	MarkEscalated(context.Context, string, time.Time) (bool, error)
 	Close() error
 }
 
@@ -76,7 +76,7 @@ func OpenStore(backend, location string) (Store, error) {
 	switch backend {
 	case "sqlite":
 		return OpenSQLite(location)
-	case "postgres", "postgresql":
+	case "postgres":
 		return OpenPostgres(location)
 	default:
 		return nil, fmt.Errorf("unsupported storage backend %q; use sqlite or postgres", backend)
@@ -427,31 +427,34 @@ func (s *SQLiteStore) MarkNotified(ctx context.Context, id string, now time.Time
 	return err
 }
 
-func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Time) error {
+func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	var tenant string
 	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM messages WHERE id = ?`, id).Scan(&tenant); err != nil {
-		return err
+		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ? WHERE message_id = ? AND escalated_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if updated == 0 {
-		return tx.Commit()
+		return false, tx.Commit()
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "notified"}, now); err != nil {
-		return err
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted"}, now); err != nil {
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type rowScanner interface{ Scan(...any) error }

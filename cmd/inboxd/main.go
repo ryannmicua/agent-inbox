@@ -226,7 +226,7 @@ func envOr(name, fallback string) string {
 func openConfiguredStore(sqlitePath string) (inbox.Store, error) {
 	backend := envOr("INBOX_STORAGE", "sqlite")
 	location := sqlitePath
-	if backend == "postgres" || backend == "postgresql" {
+	if backend == "postgres" {
 		location = os.Getenv("INBOX_DATABASE_URL")
 	}
 	return inbox.OpenStore(backend, location)
@@ -250,7 +250,7 @@ func configuredNotifier() (inbox.Notifier, error) {
 		return nil, errors.New("choose either INBOX_WEBHOOK_URL or INBOX_NOTIFICATIONS_DISABLED=true, not both")
 	}
 	if disabled {
-		log.Printf("WARNING: human notifications are explicitly disabled; consequential inbox actions will not reach an operator")
+		log.Printf("WARNING: notifications are disabled for local testing only; production must set INBOX_WEBHOOK_URL, and consequential inbox actions will not reach an operator")
 		return inbox.NoopNotifier{}, nil
 	}
 	return inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, nil
