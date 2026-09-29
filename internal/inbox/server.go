@@ -1,0 +1,619 @@
+package inbox
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	HeaderAgent     = "X-Agent-ID"
+	HeaderKeyID     = "X-Key-ID"
+	HeaderTimestamp = "X-Request-Timestamp"
+	HeaderNonce     = "X-Request-Nonce"
+	HeaderSignature = "X-Request-Signature"
+)
+
+var (
+	uuidPattern  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	noncePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	shaPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+type ServerConfig struct {
+	RequestSkew         time.Duration
+	RetryInterval       time.Duration
+	MaxDoorbellAttempts int
+	MaxPollLimit        int
+}
+
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{RequestSkew: 5 * time.Minute, RetryInterval: 30 * time.Second, MaxDoorbellAttempts: 3, MaxPollLimit: 100}
+}
+
+type Server struct {
+	store    Store
+	registry RegistrySource
+	notifier Notifier
+	config   ServerConfig
+	now      func() time.Time
+	hub      *doorbellHub
+}
+
+type authContext struct {
+	agent RegistryAgent
+	keyID string
+	key   ed25519.PublicKey
+}
+
+func NewServer(store Store, registry RegistrySource, notifier Notifier, config ServerConfig) *Server {
+	if notifier == nil {
+		notifier = NoopNotifier{}
+	}
+	if config.RequestSkew <= 0 {
+		config.RequestSkew = 5 * time.Minute
+	}
+	if config.RetryInterval <= 0 {
+		config.RetryInterval = 30 * time.Second
+	}
+	if config.MaxDoorbellAttempts <= 0 {
+		config.MaxDoorbellAttempts = 3
+	}
+	if config.MaxPollLimit <= 0 {
+		config.MaxPollLimit = 100
+	}
+	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub()}
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
+		s.health(w, r)
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, "/v1/") {
+		writeError(w, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "request body could not be read")
+		return
+	}
+	if len(body) > MaxRequestBytes {
+		identity := r.Header.Get(HeaderAgent)
+		s.recordRejected(r, identity, "request_too_large", "request body exceeds the configured limit")
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 64 KiB")
+		return
+	}
+	identity, apiErr := s.authenticate(r, body)
+	if apiErr != nil {
+		s.recordRejected(r, r.Header.Get(HeaderAgent), apiErr.Code, apiErr.Message)
+		writeAPIError(w, apiErr)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	s.route(w, r, identity)
+}
+
+func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authContext) {
+	switch {
+	case r.URL.Path == "/v1/messages" && r.Method == http.MethodPost:
+		s.send(w, r, identity)
+	case r.URL.Path == "/v1/messages" && r.Method == http.MethodGet:
+		s.poll(w, r, identity)
+	case r.URL.Path == "/v1/events" && r.Method == http.MethodGet:
+		s.events(w, r, identity)
+	case strings.HasPrefix(r.URL.Path, "/v1/messages/") && strings.HasSuffix(r.URL.Path, "/ack") && r.Method == http.MethodPost:
+		s.ack(w, r, identity)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "route not found")
+	}
+}
+
+func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIError) {
+	agentID := r.Header.Get(HeaderAgent)
+	keyID := r.Header.Get(HeaderKeyID)
+	timestamp := r.Header.Get(HeaderTimestamp)
+	nonce := r.Header.Get(HeaderNonce)
+	signature := r.Header.Get(HeaderSignature)
+	if agentID == "" || keyID == "" || timestamp == "" || nonce == "" || signature == "" {
+		return authContext{}, &APIError{Code: "unsigned_request", Message: "all API requests must include a valid request signature"}
+	}
+	if !noncePattern.MatchString(nonce) {
+		return authContext{}, &APIError{Code: "invalid_nonce", Message: "request nonce must be 16 to 128 URL-safe characters"}
+	}
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || absDuration(s.now().Sub(time.Unix(seconds, 0))) > s.config.RequestSkew {
+		return authContext{}, &APIError{Code: "stale_request", Message: "request timestamp is outside the accepted clock window"}
+	}
+	agent, public, err := s.registry.Key(agentID, keyID)
+	if err != nil {
+		if errors.Is(err, ErrUnknownAgent) {
+			return authContext{}, &APIError{Code: "unregistered_agent", Message: "agent is unknown, disabled, or revoked"}
+		}
+		if errors.Is(err, ErrUnknownKey) {
+			return authContext{}, &APIError{Code: "unknown_key", Message: "signing key is unknown, disabled, or revoked"}
+		}
+		return authContext{}, &APIError{Code: "registry_unavailable", Message: "agent registry could not be loaded"}
+	}
+	sig, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil || len(sig) != ed25519.SignatureSize || !ed25519.Verify(public, RequestSigningBytes(agentID, keyID, r.Method, r.URL.RequestURI(), timestamp, nonce, body), sig) {
+		return authContext{}, &APIError{Code: "invalid_signature", Message: "request signature is invalid"}
+	}
+	err = s.store.RecordNonce(r.Context(), agentID, nonce, s.now())
+	if err != nil {
+		if errors.Is(err, ErrReplay) {
+			return authContext{}, &APIError{Code: "replayed_request", Message: "request nonce has already been used"}
+		}
+		return authContext{}, &APIError{Code: "storage_unavailable", Message: "request replay state could not be saved"}
+	}
+	return authContext{agent: agent, keyID: keyID, key: public}, nil
+}
+
+func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) {
+	var e Envelope
+	if err := decodeStrict(r.Body, &e); err != nil {
+		s.rejectSend(w, auth.agent, "invalid_json", "request must be a valid message envelope")
+		return
+	}
+	if !VerifyEnvelope(e, auth.key) {
+		s.rejectSend(w, auth.agent, "invalid_message_signature", "message envelope signature is invalid")
+		return
+	}
+	if err := validateEnvelope(e, auth); err != nil {
+		s.rejectSend(w, auth.agent, err.code, err.message)
+		return
+	}
+	recipient, err := s.registry.Agent(e.RecipientID)
+	if err != nil {
+		if errors.Is(err, ErrUnknownAgent) {
+			s.rejectSend(w, auth.agent, "unknown_recipient", "recipient is unknown, disabled, or revoked")
+		} else {
+			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded")
+		}
+		return
+	}
+	if !contains(recipient.PublicKeys, func(k RegistryKey) bool { return !k.Disabled }) {
+		s.rejectSend(w, auth.agent, "unknown_recipient", "recipient has no active signing key")
+		return
+	}
+	if e.Kind != "instruction" && e.Kind != "result" {
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only")
+		return
+	}
+	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
+		s.rejectSend(w, auth.agent, "recipient_not_allowed", "sender is not allowed to address this recipient")
+		return
+	}
+	if !containsString(auth.agent.AllowedKinds, e.Kind) {
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "sender is not allowed to send this message kind")
+		return
+	}
+	if recipient.TenantID != auth.agent.TenantID {
+		s.rejectSend(w, auth.agent, "wrong_tenant", "sender and recipient must belong to the same server-assigned tenant")
+		return
+	}
+	if e.ReplyTo != "" {
+		original, err := s.store.GetMessage(r.Context(), e.ReplyTo)
+		if err != nil {
+			s.rejectSend(w, auth.agent, "reply_not_found", "reply_to must reference a stored message")
+			return
+		}
+		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
+			s.rejectSend(w, auth.agent, "reply_correlation_mismatch", "reply_to must correlate to the addressed message and task")
+			return
+		}
+	} else if e.Kind == "result" {
+		s.rejectSend(w, auth.agent, "reply_to_required", "result messages must reference the instruction they answer")
+		return
+	}
+	message, duplicate, err := s.store.CreateMessage(r.Context(), e, auth.agent.TenantID)
+	if err != nil {
+		if errors.Is(err, ErrMessageConflict) {
+			s.rejectSend(w, auth.agent, "message_id_conflict", "message id already exists with different signed content")
+		} else {
+			log.Printf("persist message %s: %v", e.ID, err)
+			s.rejectSend(w, auth.agent, "storage_unavailable", "message could not be persisted")
+		}
+		return
+	}
+	if !duplicate {
+		s.ring(message)
+		s.notify(Notification{Event: "message.accepted", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: e.ID, SenderID: e.SenderID, RecipientID: e.RecipientID, TenantID: auth.agent.TenantID, Kind: e.Kind})
+	}
+	status := http.StatusCreated
+	if duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, message)
+}
+
+type validationError struct{ code, message string }
+
+func (e *validationError) Error() string { return e.message }
+
+func validateEnvelope(e Envelope, auth authContext) *validationError {
+	if e.Type != EnvelopeType {
+		return &validationError{"invalid_type", "type must be message"}
+	}
+	for label, value := range map[string]string{"id": e.ID, "task_id": e.TaskID, "thread_id": e.ThreadID} {
+		if !uuidPattern.MatchString(value) {
+			return &validationError{"invalid_" + label, label + " must be a UUID"}
+		}
+	}
+	if e.ReplyTo != "" && !uuidPattern.MatchString(e.ReplyTo) {
+		return &validationError{"invalid_reply_to", "reply_to must be a UUID"}
+	}
+	if e.SenderID != auth.agent.ID {
+		return &validationError{"sender_mismatch", "sender_id must match the authenticated agent"}
+	}
+	if e.KeyID != auth.keyID {
+		return &validationError{"key_mismatch", "message key_id must match the authenticated signing key"}
+	}
+	if e.RecipientID == "" {
+		return &validationError{"recipient_required", "recipient_id must be explicitly addressed"}
+	}
+	if !KindAllowed(e.Kind) {
+		return &validationError{"invalid_kind", "kind must be instruction, result, finding, status, or ack"}
+	}
+	if _, err := time.Parse(time.RFC3339Nano, e.CreatedAt); err != nil {
+		return &validationError{"invalid_created_at", "created_at must be an RFC3339 timestamp"}
+	}
+	if len(e.Payload) > MaxPayloadBytes {
+		return &validationError{"payload_too_large", "payload must be 16 KiB or smaller; use artifact references for larger files"}
+	}
+	if !json.Valid(e.Payload) {
+		return &validationError{"invalid_payload", "payload must be valid JSON"}
+	}
+	if !e.ContentIsData {
+		return &validationError{"content_marker_required", "content_is_data must be true; message content is data, not authority"}
+	}
+	if len(e.Artifacts) > 8 {
+		return &validationError{"too_many_artifacts", "a message may reference at most 8 artifacts"}
+	}
+	for _, artifact := range e.Artifacts {
+		u, err := url.Parse(artifact.URI)
+		if err != nil || u.Scheme == "" || u.User != nil || strings.EqualFold(u.Scheme, "data") || strings.EqualFold(u.Scheme, "javascript") || len(artifact.URI) > 2048 {
+			return &validationError{"invalid_artifact_uri", "artifact uri must be a safe absolute reference"}
+		}
+		if artifact.MediaType == "" || len(artifact.MediaType) > 128 || artifact.Size < 0 || !shaPattern.MatchString(artifact.SHA256) {
+			return &validationError{"invalid_artifact", "artifact needs media_type, non-negative size, and lowercase sha256"}
+		}
+	}
+	canonical, _ := EnvelopeSigningBytes(e)
+	if containsSecret(string(canonical)) {
+		return &validationError{"secret_detected", "payload, provenance, or artifact reference resembles a secret and was rejected"}
+	}
+	return nil
+}
+
+func (s *Server) rejectSend(w http.ResponseWriter, agent RegistryAgent, code, message string) {
+	_ = s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code})
+	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
+	status := http.StatusBadRequest
+	switch code {
+	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed", "unknown_recipient", "reply_correlation_mismatch":
+		status = http.StatusForbidden
+	case "message_id_conflict":
+		status = http.StatusConflict
+	case "registry_unavailable", "storage_unavailable":
+		status = http.StatusServiceUnavailable
+	}
+	writeError(w, status, code, message)
+}
+
+func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) {
+	after := int64(0)
+	if raw := r.URL.Query().Get("after_seq"); raw != "" {
+		var err error
+		after, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || after < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_after_seq", "after_seq must be a non-negative integer")
+			return
+		}
+	}
+	limit := s.config.MaxPollLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > s.config.MaxPollLimit {
+			writeError(w, http.StatusBadRequest, "invalid_limit", fmt.Sprintf("limit must be between 1 and %d", s.config.MaxPollLimit))
+			return
+		}
+		limit = parsed
+	}
+	includeAcked := r.URL.Query().Get("include_acked") == "true"
+	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, after, limit, includeAcked)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
+		return
+	}
+	next := after
+	if len(messages) > 0 {
+		next = messages[len(messages)-1].Sequence
+	}
+	writeJSON(w, http.StatusOK, PollResponse{Messages: messages, NextAfterSeq: next})
+}
+
+func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "messages" || parts[3] != "ack" || !uuidPattern.MatchString(parts[2]) {
+		s.rejectAck(w, auth.agent, "not_found", "acknowledgement route not found", http.StatusNotFound)
+		return
+	}
+	var body AckRequest
+	if err := decodeStrict(r.Body, &body); err != nil || !body.Processed {
+		s.rejectAck(w, auth.agent, "processing_required", "acknowledgement must assert processed=true", http.StatusBadRequest)
+		return
+	}
+	if _, err := time.Parse(time.RFC3339Nano, body.ProcessedAt); err != nil {
+		s.rejectAck(w, auth.agent, "invalid_processed_at", "processed_at must be an RFC3339 timestamp", http.StatusBadRequest)
+		return
+	}
+	if len(body.Note) > 512 || containsSecret(body.Note) {
+		s.rejectAck(w, auth.agent, "invalid_ack_note", "ack note is too long or resembles a secret", http.StatusBadRequest)
+		return
+	}
+	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID, body.Note)
+	if err != nil {
+		code, status, message := "ack_failed", http.StatusBadRequest, "message could not be acknowledged"
+		switch {
+		case errors.Is(err, ErrMessageNotFound):
+			code, status, message = "message_not_found", http.StatusNotFound, "message was not found"
+		case errors.Is(err, ErrNotRecipient):
+			code, status, message = "not_recipient", http.StatusForbidden, "only the addressed recipient may acknowledge a message"
+		default:
+			status = http.StatusServiceUnavailable
+		}
+		s.rejectAck(w, auth.agent, code, message, status)
+		return
+	}
+	if !duplicate {
+		s.notify(Notification{Event: "message.acknowledged", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: parts[2], RecipientID: auth.agent.ID, TenantID: auth.agent.TenantID})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"message_id": parts[2], "acknowledged": true, "duplicate": duplicate})
+}
+
+func (s *Server) rejectAck(w http.ResponseWriter, agent RegistryAgent, code, message string, status int) {
+	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "ack", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code}); err != nil {
+		log.Printf("record rejected acknowledgement: %v", err)
+	}
+	writeError(w, status, code, message)
+}
+
+func (s *Server) events(w http.ResponseWriter, r *http.Request, auth authContext) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "stream_unavailable", "server does not support event streaming")
+		return
+	}
+	ch, remove := s.hub.subscribe(auth.agent.ID)
+	defer remove()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-ch:
+			encoded, _ := json.Marshal(event)
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: doorbell\ndata: %s\n\n", event.Sequence, encoded)
+			flusher.Flush()
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(w, ": heartbeat\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "storage": "error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "storage": "ok"})
+}
+
+func (s *Server) RunNotifications(ctx context.Context) {
+	ticker := time.NewTicker(min(s.config.RetryInterval/2, 10*time.Second))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.dispatchDue(ctx)
+		}
+	}
+}
+
+func (s *Server) dispatchDue(ctx context.Context) {
+	candidates, err := s.store.DueNotifications(ctx, s.now(), s.config.RetryInterval, s.config.MaxDoorbellAttempts)
+	if err != nil {
+		log.Printf("load due notifications: %v", err)
+		return
+	}
+	for _, c := range candidates {
+		if c.Attempts < s.config.MaxDoorbellAttempts {
+			s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
+			if err := s.store.MarkNotified(ctx, c.MessageID, s.now()); err != nil {
+				log.Printf("record doorbell for %s: %v", c.MessageID, err)
+			}
+			continue
+		}
+		if c.Escalated {
+			continue
+		}
+		if err := s.notifier.Notify(ctx, Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient}); err != nil {
+			log.Printf("escalate unacknowledged message %s: %v", c.MessageID, err)
+			continue
+		}
+		if err := s.store.MarkEscalated(ctx, c.MessageID, s.now()); err != nil {
+			log.Printf("record escalation for %s: %v", c.MessageID, err)
+		}
+	}
+}
+
+func (s *Server) ring(message DeliveredMessage) {
+	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
+	if err := s.store.MarkNotified(context.Background(), message.ID, s.now()); err != nil {
+		log.Printf("record initial doorbell for %s: %v", message.ID, err)
+	}
+}
+
+func (s *Server) notify(event Notification) {
+	if err := s.notifier.Notify(context.Background(), event); err != nil {
+		log.Printf("human notification %s failed: %v", event.Event, err)
+	}
+}
+
+func (s *Server) recordRejected(r *http.Request, agentID, code, message string) {
+	action := "api.request"
+	if r.URL.Path == "/v1/messages" && r.Method == http.MethodPost {
+		action = "send"
+	} else if strings.HasSuffix(r.URL.Path, "/ack") {
+		action = "ack"
+	}
+	entry := AuditRecord{Action: action, ActorID: agentID, Outcome: "rejected", Code: code}
+	if agent, err := s.registry.Agent(agentID); err == nil {
+		entry.TenantID = agent.TenantID
+	}
+	if len(r.URL.Path) < 2048 {
+		entry.Detail = map[string]any{"method": r.Method, "path": r.URL.Path, "reason": message}
+	}
+	if err := s.store.AppendAudit(context.Background(), entry); err != nil {
+		log.Printf("record rejected request: %v", err)
+	}
+	if action == "send" {
+		s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), SenderID: agentID, TenantID: entry.TenantID, Code: code})
+	}
+}
+
+func decodeStrict(body io.Reader, target any) error {
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain exactly one JSON value")
+	}
+	return nil
+}
+
+func writeAPIError(w http.ResponseWriter, err *APIError) {
+	status := http.StatusUnauthorized
+	switch err.Code {
+	case "unregistered_agent", "unknown_key":
+		status = http.StatusForbidden
+	case "replayed_request":
+		status = http.StatusConflict
+	case "registry_unavailable", "storage_unavailable":
+		status = http.StatusServiceUnavailable
+	case "invalid_nonce":
+		status = http.StatusBadRequest
+	}
+	writeError(w, status, err.Code, err.Message)
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, ErrorResponse{Error: APIError{Code: code, Message: message}})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func contains[T any](values []T, match func(T) bool) bool {
+	for _, value := range values {
+		if match(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+type doorbellHub struct {
+	mu          sync.Mutex
+	subscribers map[string]map[chan DoorbellEvent]struct{}
+}
+
+func newDoorbellHub() *doorbellHub {
+	return &doorbellHub{subscribers: make(map[string]map[chan DoorbellEvent]struct{})}
+}
+
+func (h *doorbellHub) subscribe(agentID string) (<-chan DoorbellEvent, func()) {
+	ch := make(chan DoorbellEvent, 16)
+	h.mu.Lock()
+	if h.subscribers[agentID] == nil {
+		h.subscribers[agentID] = make(map[chan DoorbellEvent]struct{})
+	}
+	h.subscribers[agentID][ch] = struct{}{}
+	h.mu.Unlock()
+	return ch, func() {
+		h.mu.Lock()
+		delete(h.subscribers[agentID], ch)
+		if len(h.subscribers[agentID]) == 0 {
+			delete(h.subscribers, agentID)
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *doorbellHub) publish(agentID string, event DoorbellEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subscribers[agentID] {
+		select {
+		case ch <- event:
+		default: // A full or disconnected doorbell never affects durable delivery.
+		}
+	}
+}
+
+func NewNonce() (string, error) {
+	var value [24]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(value[:]), nil
+}

@@ -1,0 +1,11 @@
+.git
+.gitignore
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.pub
+agent-inbox
+inboxd
+data/
+backups/
