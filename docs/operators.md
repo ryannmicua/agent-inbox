@@ -190,16 +190,17 @@ publishes a doorbell. The SSE stream is in-memory and can lose events; poll is
 the delivery method. The receiver should ack only after processing. A retry
 from the same sender with the same message ID returns the original sequence
 when the server-derived tenant and all sender-authored envelope fields match,
-except `created_at` and the resulting message signature. Reusing that ID with
-any other change is a conflict. Each retry still needs a valid message
-signature and a fresh signed-request nonce. A result must cite the original
-message and match its sender, recipient, task, and thread. A transport failure
-means delivery is unknown, not that an agent is dead.
+except `created_at`, `key_id`, and the resulting message signature. Reusing
+that ID with any other change is a conflict. Each retry still needs a valid
+message signature and a fresh signed-request nonce. A result must cite the
+original message and match its sender, recipient, task, and thread. A transport
+failure means delivery is unknown, not that an agent is dead.
 
-Message IDs must be UUID v4, UUID v7, or ULID. Treat them as capability-like
-references and share them only with authorized participants. A send using an
-occupied ID can reveal that it is already in use, so only submit IDs an
-operator or agent generated or otherwise already knows. Acknowledgement
+New message IDs must be UUID v4, UUID v7, or ULID. Previously stored UUID IDs
+remain usable for retries, replies, and acknowledgements. Treat message IDs as
+capability-like references and share them only with authorized participants. A
+send using an occupied ID can reveal that it is already in use, so only submit
+IDs an operator or agent generated or otherwise already knows. Acknowledgement
 requests for missing, inaccessible, or wrong-tenant messages all return the
 same `message_not_found` response; the audit record keeps the internal reason.
 

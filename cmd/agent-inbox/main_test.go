@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -119,23 +120,41 @@ func TestSendWithoutIDGeneratesUUIDv4(t *testing.T) {
 
 func TestSendWithULIDDefaultsTaskAndThreadToMessageID(t *testing.T) {
 	const ulid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-	receivedEnvelope := make(chan inbox.Envelope, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var received inbox.Envelope
-		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
-			http.Error(w, "invalid envelope", http.StatusBadRequest)
-			return
-		}
-		receivedEnvelope <- received
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = io.WriteString(w, `{}`)
-	}))
+	store, err := inbox.OpenSQLite(filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	publicA, privateA, err := inbox.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicB, _, err := inbox.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := inbox.Registry{Version: 1, Agents: []inbox.RegistryAgent{
+		{ID: "agent-a", TenantID: "tenant-one", PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: base64.StdEncoding.EncodeToString(publicA)}}, AllowedRecipients: []string{"agent-b"}, AllowedKinds: []string{"instruction"}},
+		{ID: "agent-b", TenantID: "tenant-one", PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: base64.StdEncoding.EncodeToString(publicB)}}, AllowedRecipients: []string{"agent-a"}, AllowedKinds: []string{"instruction", "result"}},
+	}}
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	registryData, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, registryData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := inbox.NewServer(store, inbox.FileRegistry{Path: registryPath}, notifierFunc(func(context.Context, inbox.Notification) error { return nil }), inbox.DefaultServerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(service)
 	defer server.Close()
 
 	privateKey := filepath.Join(t.TempDir(), "agent.key")
-	publicKey := filepath.Join(t.TempDir(), "agent.pub")
-	if err := inbox.WriteKeyPair(privateKey, publicKey); err != nil {
+	if err := os.WriteFile(privateKey, []byte(base64.StdEncoding.EncodeToString(privateA)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := run([]string{
@@ -144,10 +163,19 @@ func TestSendWithULIDDefaultsTaskAndThreadToMessageID(t *testing.T) {
 	}, io.Discard, io.Discard); err != nil {
 		t.Fatalf("send with ULID and omitted task/thread failed: %v", err)
 	}
-	got := <-receivedEnvelope
-	if got.ID != ulid || got.TaskID != ulid || got.ThreadID != ulid {
-		t.Fatalf("ULID defaults were not applied to message, task, and thread IDs: %+v", got)
+	messages, err := store.ListMessages(context.Background(), "agent-b", "tenant-one", 10)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(messages) != 1 || messages[0].ID != ulid || messages[0].TaskID != ulid || messages[0].ThreadID != ulid {
+		t.Fatalf("inbox did not accept the CLI's ULID defaults: %+v", messages)
+	}
+}
+
+type notifierFunc func(context.Context, inbox.Notification) error
+
+func (f notifierFunc) Notify(ctx context.Context, notification inbox.Notification) error {
+	return f(ctx, notification)
 }
 
 func TestAckCommandSendsOnlyProcessedAssertion(t *testing.T) {

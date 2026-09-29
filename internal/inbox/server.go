@@ -30,9 +30,10 @@ const (
 )
 
 var (
-	messageIDPattern = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
-	noncePattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
-	shaPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	messageIDPattern   = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
+	referenceIDPattern = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
+	noncePattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	shaPattern         = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 type ServerConfig struct {
@@ -149,7 +150,9 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 		return authContext{}, &APIError{Code: "invalid_nonce", Message: "request nonce must be 16 to 128 URL-safe characters"}
 	}
 	seconds, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil || absDuration(s.now().Sub(time.Unix(seconds, 0))) > s.config.RequestSkew {
+	requestTime := time.Unix(seconds, 0)
+	now := s.now()
+	if err != nil || requestTime.Before(now.Add(-s.config.RequestSkew)) || requestTime.After(now.Add(s.config.RequestSkew)) {
 		return authContext{}, &APIError{Code: "stale_request", Message: "request timestamp is outside the accepted clock window"}
 	}
 	agent, public, err := s.registry.Key(agentID, keyID)
@@ -191,6 +194,31 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		s.rejectSend(w, auth.agent, err.code, err.message, messageID)
 		return
 	}
+	existing, err := s.store.GetMessage(r.Context(), e.ID, auth.agent.TenantID)
+	switch {
+	case err == nil:
+		storedBytes, storedErr := envelopeRetryBytes(existing.Envelope)
+		retryBytes, retryErr := envelopeRetryBytes(e)
+		if existing.SenderID != auth.agent.ID || storedErr != nil || retryErr != nil || !bytes.Equal(storedBytes, retryBytes) {
+			s.rejectSend(w, auth.agent, "message_id_conflict", "message id already exists with different signed content", messageID)
+			return
+		}
+		if err := s.store.AppendAudit(r.Context(), AuditRecord{Action: "send", ActorID: e.SenderID, SubjectID: e.ID, TenantID: auth.agent.TenantID, Outcome: "duplicate", Code: "duplicate_message"}); err != nil {
+			log.Printf("record duplicate send %s: %v", e.ID, err)
+			writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "message retry could not be recorded")
+			return
+		}
+		writeJSON(w, http.StatusOK, SendResponse{Envelope: existing.Envelope, TenantID: existing.TenantID, Sequence: existing.Sequence, AcceptedAt: existing.AcceptedAt})
+		return
+	case !errors.Is(err, ErrMessageNotFound):
+		log.Printf("check message retry %s: %v", e.ID, err)
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "message retry could not be checked")
+		return
+	}
+	if !messageIDPattern.MatchString(e.ID) {
+		s.rejectSend(w, auth.agent, "invalid_id", "new message id must be a UUID v4, UUID v7, or ULID", messageID)
+		return
+	}
 	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
 		s.rejectRecipient(w, auth.agent, "recipient_not_allowed", messageID)
 		return
@@ -223,11 +251,12 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 	if e.ReplyTo != "" {
 		original, err := s.store.GetReplyTarget(r.Context(), e.ReplyTo, auth.agent.TenantID, auth.agent.ID)
 		if err != nil {
-			reason := "reply_not_found"
-			if !errors.Is(err, ErrMessageNotFound) {
-				reason = "reply_lookup_failed"
+			if errors.Is(err, ErrMessageNotFound) {
+				s.rejectReply(w, auth.agent, "reply_not_found", messageID)
+			} else {
+				log.Printf("lookup reply target %s: %v", e.ReplyTo, err)
+				writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "reply target could not be read")
 			}
-			s.rejectReply(w, auth.agent, reason, messageID)
 			return
 		}
 		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
@@ -270,16 +299,16 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 	if e.Type != EnvelopeType {
 		return &validationError{"invalid_type", "type must be message"}
 	}
-	if !messageIDPattern.MatchString(e.ID) {
-		return &validationError{"invalid_id", "id must be a UUID v4, UUID v7, or ULID"}
+	if !referenceIDPattern.MatchString(e.ID) {
+		return &validationError{"invalid_id", "id must be a UUID or ULID"}
 	}
 	for label, value := range map[string]string{"task_id": e.TaskID, "thread_id": e.ThreadID} {
-		if !messageIDPattern.MatchString(value) {
-			return &validationError{"invalid_" + label, label + " must be a UUID v4, UUID v7, or ULID"}
+		if !referenceIDPattern.MatchString(value) {
+			return &validationError{"invalid_" + label, label + " must be a UUID or ULID"}
 		}
 	}
-	if e.ReplyTo != "" && !messageIDPattern.MatchString(e.ReplyTo) {
-		return &validationError{"invalid_reply_to", "reply_to must be a UUID v4, UUID v7, or ULID"}
+	if e.ReplyTo != "" && !referenceIDPattern.MatchString(e.ReplyTo) {
+		return &validationError{"invalid_reply_to", "reply_to must be a UUID or ULID"}
 	}
 	if e.SenderID != auth.agent.ID {
 		return &validationError{"sender_mismatch", "sender_id must match the authenticated agent"}
@@ -385,7 +414,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 
 func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "messages" || parts[3] != "ack" || !messageIDPattern.MatchString(parts[2]) {
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "messages" || parts[3] != "ack" || !referenceIDPattern.MatchString(parts[2]) {
 		s.rejectAck(w, auth.agent, "not_found", "acknowledgement route not found", http.StatusNotFound)
 		return
 	}
@@ -620,16 +649,11 @@ func hasRequestSignature(r *http.Request) bool {
 }
 
 func decodeStrict(body io.Reader, target any) error {
-	decoder := json.NewDecoder(body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	data, err := io.ReadAll(body)
+	if err != nil {
 		return err
 	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("request must contain exactly one JSON value")
-	}
-	return nil
+	return decodeStrictJSON(data, target)
 }
 
 func writeAuthenticationFailure(w http.ResponseWriter) {
@@ -662,13 +686,6 @@ func contains[T any](values []T, match func(T) bool) bool {
 		}
 	}
 	return false
-}
-
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
 
 type doorbellHub struct {

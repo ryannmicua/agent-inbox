@@ -2,7 +2,6 @@ package inbox
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -54,13 +53,14 @@ func (f FileRegistry) load() (map[string]RegistryAgent, error) {
 		return nil, fmt.Errorf("read registry: %w", err)
 	}
 	var r Registry
-	if err := json.Unmarshal(data, &r); err != nil {
+	if err := decodeStrictJSON(data, &r); err != nil {
 		return nil, fmt.Errorf("parse registry JSON: %w", err)
 	}
 	if r.Version != 1 {
 		return nil, fmt.Errorf("registry version must be 1")
 	}
 	out := make(map[string]RegistryAgent, len(r.Agents))
+	seenPublicKeys := map[string]string{}
 	for _, a := range r.Agents {
 		if !registryIDPattern.MatchString(a.ID) || !registryIDPattern.MatchString(a.TenantID) {
 			return nil, errors.New("each registry agent needs a valid id and tenant_id")
@@ -78,6 +78,10 @@ func (f FileRegistry) load() (map[string]RegistryAgent, error) {
 			if err != nil || len(pub) != ed25519.PublicKeySize {
 				return nil, fmt.Errorf("agent %q key %q must be a base64 Ed25519 public key", a.ID, k.ID)
 			}
+			if owner, exists := seenPublicKeys[string(pub)]; exists && owner != a.ID {
+				return nil, fmt.Errorf("agents %q and %q reuse the same public key", owner, a.ID)
+			}
+			seenPublicKeys[string(pub)] = a.ID
 		}
 		for _, kind := range a.AllowedKinds {
 			if !KindAllowed(kind) {

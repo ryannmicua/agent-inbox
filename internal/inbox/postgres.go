@@ -18,6 +18,14 @@ import (
 type PostgresStore struct{ db *sql.DB }
 
 func OpenPostgres(databaseURL string) (*PostgresStore, error) {
+	return openPostgres(databaseURL, true)
+}
+
+func OpenPostgresWithoutMigration(databaseURL string) (*PostgresStore, error) {
+	return openPostgres(databaseURL, false)
+}
+
+func openPostgres(databaseURL string, migrate bool) (*PostgresStore, error) {
 	if strings.TrimSpace(databaseURL) == "" {
 		return nil, errors.New("PostgreSQL database URL is required")
 	}
@@ -34,9 +42,11 @@ func OpenPostgres(databaseURL string) (*PostgresStore, error) {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 	store := &PostgresStore{db: db}
-	if err := store.migrate(ctx); err != nil {
-		db.Close()
-		return nil, err
+	if migrate {
+		if err := store.migrate(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }

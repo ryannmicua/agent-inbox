@@ -336,6 +336,78 @@ func TestLostResponseRetryIgnoresCreatedAtButRejectsChangedContent(t *testing.T)
 	}
 }
 
+func TestLostResponseRetryPrecedesCurrentEligibilityChecks(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*testSystem, *Envelope, *Client)
+	}{
+		{
+			name: "recipient removed from allowlist",
+			edit: func(s *testSystem, _ *Envelope, _ *Client) {
+				s.registry.Agents[0].AllowedRecipients = nil
+			},
+		},
+		{
+			name: "recipient disabled",
+			edit: func(s *testSystem, _ *Envelope, _ *Client) {
+				s.registry.Agents[1].Disabled = true
+			},
+		},
+		{
+			name: "recipient key disabled",
+			edit: func(s *testSystem, _ *Envelope, _ *Client) {
+				s.registry.Agents[1].PublicKeys[0].Disabled = true
+			},
+		},
+		{
+			name: "sender kind removed",
+			edit: func(s *testSystem, _ *Envelope, _ *Client) {
+				s.registry.Agents[0].AllowedKinds = []string{"result"}
+			},
+		},
+		{
+			name: "recipient removed and key rotated",
+			edit: func(s *testSystem, retry *Envelope, client *Client) {
+				public, private, err := GenerateKeyPair()
+				if err != nil {
+					s.t.Fatal(err)
+				}
+				s.registry.Agents[0].AllowedRecipients = nil
+				s.registry.Agents[0].PublicKeys = append(s.registry.Agents[0].PublicKeys, RegistryKey{ID: "rotated", PublicKey: base64.StdEncoding.EncodeToString(public)})
+				retry.KeyID = "rotated"
+				*client = Client{Server: s.server.URL, Agent: "agent-a", KeyID: "rotated", Private: private}
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestSystem(t)
+			envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"value":1}`)
+			first, status, apiErr := s.send(t, envelope, "agent-a")
+			if apiErr != nil || status != http.StatusCreated {
+				t.Fatalf("initial send failed: HTTP %d %+v", status, apiErr)
+			}
+			retry := envelope
+			retry.CreatedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+			client := *s.clients["agent-a"]
+			test.edit(s, &retry, &client)
+			writeRegistry(t, s.registryFile, s.registry)
+			if err := SignEnvelope(&retry, client.Private); err != nil {
+				t.Fatal(err)
+			}
+			s.clients["agent-a"] = &client
+			got, status, apiErr := s.send(t, retry, "agent-a")
+			if apiErr != nil || status != http.StatusOK || got.Sequence != first.Sequence {
+				t.Fatalf("retry was rejected after eligibility changed: HTTP %d %+v message=%+v", status, apiErr, got)
+			}
+			messages, err := s.store.ListMessages(context.Background(), "agent-b", "tenant-one", 100)
+			if err != nil || len(messages) != 1 || messages[0].ID != envelope.ID {
+				t.Fatalf("retry created another message: %+v", messages)
+			}
+		})
+	}
+}
+
 type dropResponseTransport struct{ base http.RoundTripper }
 
 func (t dropResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -633,6 +705,7 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 		{"disallowed-kind", "agent-a", "agent-b", "status", `{"x":1}`, "kind_not_allowed"},
 		{"secret", "agent-a", "agent-b", "instruction", `{"token":"github_pat_123456789012345678901234567890"}`, "secret_detected"},
 		{"escaped-secret", "agent-a", "agent-b", "instruction", `{"token":"\u0067ithub_pat_123456789012345678901234567890"}`, "secret_detected"},
+		{"generated-private-key", "agent-a", "agent-b", "instruction", fmt.Sprintf(`{"private_key":%q}`, base64.StdEncoding.EncodeToString(s.agents["agent-a"].private)), "secret_detected"},
 	}
 	expectedAudits := 0
 	for _, test := range cases {
@@ -956,6 +1029,17 @@ func TestRequestReplayProtectionAndRequestSignatureBinding(t *testing.T) {
 	}
 }
 
+func TestAuthenticationRejectsExtremeTimestamps(t *testing.T) {
+	s := newTestSystem(t)
+	for index, timestamp := range []string{"9223372036854775807", "-9223372036854775808"} {
+		nonce := fmt.Sprintf("extreme-time-nonce-%02d", index)
+		status, code := signedRawRequestAt(t, s.server.URL, s.agents["agent-a"].private, "agent-a", "primary", http.MethodGet, "/outside", "/outside", nil, timestamp, nonce)
+		if status != http.StatusUnauthorized || code != "authentication_failed" {
+			t.Fatalf("extreme timestamp %s was accepted: HTTP %d %q", timestamp, status, code)
+		}
+	}
+}
+
 func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 	s := newTestSystem(t)
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
@@ -979,6 +1063,58 @@ func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 	_, status, apiErr = s.send(t, result, "agent-b")
 	if apiErr == nil || apiErr.Error.Code != "invalid_reply_to" || status < 400 {
 		t.Fatalf("mis-correlated result was accepted: status=%d err=%+v", status, apiErr)
+	}
+}
+
+type replyTargetErrorStore struct {
+	Store
+	err error
+}
+
+func (s replyTargetErrorStore) GetReplyTarget(context.Context, string, string, string) (DeliveredMessage, error) {
+	return DeliveredMessage{}, s.err
+}
+
+func TestReplyLookupFailureReturnsServiceUnavailable(t *testing.T) {
+	s := newTestSystem(t)
+	reply := s.envelope(t, "agent-b", "agent-a", "result", `{"result":"done"}`)
+	reply.ReplyTo = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+	if err := SignEnvelope(&reply, s.agents["agent-b"].private); err != nil {
+		t.Fatal(err)
+	}
+	s.service.store = replyTargetErrorStore{Store: s.store, err: errors.New("database unavailable")}
+	rejectedBefore := s.notifier.count("message.rejected")
+	_, status, apiErr := s.send(t, reply, "agent-b")
+	if apiErr == nil || status != http.StatusServiceUnavailable || apiErr.Error.Code != "storage_unavailable" {
+		t.Fatalf("reply lookup outage was reported as a client rejection: HTTP %d %+v", status, apiErr)
+	}
+	if rejected := s.notifier.count("message.rejected"); rejected != rejectedBefore {
+		t.Fatalf("reply lookup outage emitted a rejected-send notification: before=%d after=%d", rejectedBefore, rejected)
+	}
+}
+
+func TestSendRejectsDuplicatePayloadMembers(t *testing.T) {
+	s := newTestSystem(t)
+	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{}`)
+	e.Payload = json.RawMessage(`{"mode":"read","mode":"delete"}`)
+	if err := SignEnvelope(&e, s.agents["agent-a"].private); err == nil {
+		t.Fatal("message signer accepted duplicate payload object members")
+	}
+	e.Signature = "invalid"
+	body, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, status, err := s.clients["agent-a"].Do(context.Background(), http.MethodPost, "/v1/messages", body)
+	if err != nil || status != http.StatusBadRequest {
+		t.Fatalf("server accepted duplicate payload members: HTTP %d err=%v body=%s", status, err, data)
+	}
+	var apiErr ErrorResponse
+	if err := json.Unmarshal(data, &apiErr); err != nil || apiErr.Error.Code != "invalid_json" {
+		t.Fatalf("duplicate payload members returned the wrong error: %s (%v)", data, err)
+	}
+	if messages := s.poll(t, "agent-b").Messages; len(messages) != 0 {
+		t.Fatalf("duplicate payload members were persisted: %+v", messages)
 	}
 }
 
@@ -1035,6 +1171,47 @@ func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 		if _, status, apiErr := s.send(t, envelope, "agent-a"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_id" {
 			t.Fatalf("unsupported message ID %q was accepted: HTTP %d %+v", id, status, apiErr)
 		}
+	}
+}
+
+func TestLegacyStoredMessageRemainsRetryableAckableAndReplyable(t *testing.T) {
+	s := newTestSystem(t)
+	legacyID := "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+	instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"legacy"}`)
+	instruction.ID = legacyID
+	instruction.TaskID = legacyID
+	instruction.ThreadID = legacyID
+	if err := SignEnvelope(&instruction, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	stored, duplicate, err := s.store.CreateMessage(context.Background(), instruction, "tenant-one")
+	if err != nil || duplicate {
+		t.Fatalf("could not create legacy stored-message fixture: duplicate=%t err=%v", duplicate, err)
+	}
+	if messages := s.poll(t, "agent-b").Messages; len(messages) != 1 || messages[0].ID != legacyID {
+		t.Fatalf("legacy stored message was not visible to its recipient: %+v", messages)
+	}
+
+	retry := instruction
+	retry.CreatedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+	if err := SignEnvelope(&retry, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	got, status, apiErr := s.send(t, retry, "agent-a")
+	if apiErr != nil || status != http.StatusOK || got.Sequence != stored.Sequence {
+		t.Fatalf("legacy message retry failed: HTTP %d %+v message=%+v", status, apiErr, got)
+	}
+	if status, code := s.ack(t, "agent-b", legacyID, true); status != http.StatusOK || code != "" {
+		t.Fatalf("legacy message acknowledgement failed: HTTP %d %q", status, code)
+	}
+
+	result := s.envelope(t, "agent-b", "agent-a", "result", `{"result":"complete"}`)
+	result.TaskID, result.ThreadID, result.ReplyTo = instruction.TaskID, instruction.ThreadID, legacyID
+	if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+		t.Fatal(err)
+	}
+	if _, status, apiErr := s.send(t, result, "agent-b"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("reply to legacy message failed: HTTP %d %+v", status, apiErr)
 	}
 }
 
@@ -1524,8 +1701,12 @@ func TestSSEDoorbellIsOnlyAPrompt(t *testing.T) {
 }
 
 func signedRawRequest(t *testing.T, baseURL string, private ed25519.PrivateKey, agent, key, method, signingPath, actualPath string, body []byte, nonce string) (int, string) {
-	t.Helper()
 	timestamp := fmt.Sprintf("%d", time.Now().UTC().Unix())
+	return signedRawRequestAt(t, baseURL, private, agent, key, method, signingPath, actualPath, body, timestamp, nonce)
+}
+
+func signedRawRequestAt(t *testing.T, baseURL string, private ed25519.PrivateKey, agent, key, method, signingPath, actualPath string, body []byte, timestamp, nonce string) (int, string) {
+	t.Helper()
 	signature := ed25519.Sign(private, RequestSigningBytes(agent, key, method, signingPath, timestamp, nonce, body))
 	request, err := http.NewRequest(method, baseURL+actualPath, strings.NewReader(string(body)))
 	if err != nil {

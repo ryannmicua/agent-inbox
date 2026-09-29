@@ -4,6 +4,7 @@ import "regexp"
 
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)private[_-]?key"?\s*:\s*"?[A-Za-z0-9+/]{86}==`),
 	regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`),
 	regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`),
 	regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`),

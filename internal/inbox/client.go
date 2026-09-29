@@ -26,6 +26,8 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+const maxResponseBytes = 100*(MaxRequestBytes*6+1024) + 1024
+
 func LoadPrivateKey(path string) (ed25519.PrivateKey, error) {
 	encoded, err := os.ReadFile(path)
 	if err != nil {
@@ -103,8 +105,14 @@ func (c *Client) Do(ctx context.Context, method, requestPath string, body []byte
 		return nil, 0, err
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, MaxRequestBytes+1))
-	return data, response.StatusCode, err
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, response.StatusCode, err
+	}
+	if len(data) > maxResponseBytes {
+		return nil, response.StatusCode, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+	return data, response.StatusCode, nil
 }
 
 func (c *Client) OpenEvents(ctx context.Context) (*http.Response, error) {

@@ -99,7 +99,7 @@ func runAudit(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	store, err := openConfiguredStore(*dbPath)
+	store, err := openConfiguredStoreWithoutMigration(*dbPath)
 	if err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func runHealthcheck(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	store, err := openConfiguredStore(dbPath)
+	store, err := openConfiguredStoreWithoutMigration(dbPath)
 	if err != nil {
 		return err
 	}
@@ -231,6 +231,13 @@ func openConfiguredStore(sqlitePath string) (inbox.Store, error) {
 		location = os.Getenv("INBOX_DATABASE_URL")
 	}
 	return inbox.OpenStore(backend, location)
+}
+
+func openConfiguredStoreWithoutMigration(sqlitePath string) (inbox.Store, error) {
+	if envOr("INBOX_STORAGE", "sqlite") == "postgres" {
+		return inbox.OpenPostgresWithoutMigration(os.Getenv("INBOX_DATABASE_URL"))
+	}
+	return openConfiguredStore(sqlitePath)
 }
 
 func configuredNotifier() (inbox.Notifier, error) {

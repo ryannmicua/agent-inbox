@@ -35,6 +35,9 @@ func EnvelopeSigningBytes(e Envelope) ([]byte, error) {
 	if len(e.Payload) == 0 {
 		payload = map[string]any{}
 	} else {
+		if err := validateJSONMembers(e.Payload); err != nil {
+			return nil, fmt.Errorf("payload must contain unique object members: %w", err)
+		}
 		dec := json.NewDecoder(bytes.NewReader(e.Payload))
 		dec.UseNumber()
 		if err := dec.Decode(&payload); err != nil {
@@ -65,6 +68,7 @@ func EnvelopeSigningBytes(e Envelope) ([]byte, error) {
 
 func envelopeRetryBytes(e Envelope) ([]byte, error) {
 	e.CreatedAt = ""
+	e.KeyID = ""
 	return EnvelopeSigningBytes(e)
 }
 
