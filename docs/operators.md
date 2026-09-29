@@ -194,6 +194,13 @@ signature and a fresh signed-request nonce. A result must cite the original
 message and match its sender, recipient, task, and thread. A transport failure
 means delivery is unknown, not that an agent is dead.
 
+Message IDs must be UUID v4, UUID v7, or ULID. Treat them as capability-like
+references and share them only with authorized participants. A send using an
+occupied ID can reveal that it is already in use, so only submit IDs an
+operator or agent generated or otherwise already knows. Acknowledgement
+requests for missing, inaccessible, or wrong-tenant messages all return the
+same `message_not_found` response; the audit record keeps the internal reason.
+
 The signed JSON API is:
 
 | Method and path | Behavior |
@@ -337,6 +344,7 @@ proxy when requests cross an untrusted network.
 | `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |
 | `reply_to_required` / `invalid_reply_to` | A result must refer to a message addressed to its sender and reuse its task and thread IDs. The client response does not reveal whether a reference is missing, inaccessible, or mis-correlated; inspect the audit record for the internal reason. |
 | `message_id_conflict` | The ID already belongs to different content. Generate a new message ID; use an existing ID only for an identical retry. |
+| `message_not_found` | The acknowledgement target is missing or not accessible to this agent. The client response hides which condition applies; inspect the audit record for the internal reason. |
 | `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |
 

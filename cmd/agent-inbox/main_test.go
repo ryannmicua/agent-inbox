@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,5 +77,42 @@ func TestRequestJSONReportsRedirectAsError(t *testing.T) {
 	case <-forwarded:
 		t.Fatal("CLI forwarded signed request data to the redirect target")
 	default:
+	}
+}
+
+func TestSendWithoutIDGeneratesUUIDv4(t *testing.T) {
+	receivedEnvelope := make(chan inbox.Envelope, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		var received inbox.Envelope
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			http.Error(w, "invalid envelope", http.StatusBadRequest)
+			return
+		}
+		receivedEnvelope <- received
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	publicKey := filepath.Join(t.TempDir(), "agent.pub")
+	if err := inbox.WriteKeyPair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{
+		"send", "--server", server.URL, "--agent", "agent-a", "--key", privateKey,
+		"--to", "agent-b", "--kind", "instruction", "--payload", `{"task":"check"}`,
+	}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("send without explicit ID failed: %v", err)
+	}
+	received := <-receivedEnvelope
+	if len(received.ID) != 36 || received.ID[14] != '4' || !strings.ContainsRune("89ab", rune(received.ID[19])) {
+		t.Fatalf("omitted --id did not produce a UUID v4: %q", received.ID)
 	}
 }

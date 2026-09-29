@@ -30,9 +30,10 @@ const (
 )
 
 var (
-	uuidPattern  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	noncePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
-	shaPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	uuidPattern      = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	messageIDPattern = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
+	noncePattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	shaPattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 type ServerConfig struct {
@@ -278,13 +279,16 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 	if e.Type != EnvelopeType {
 		return &validationError{"invalid_type", "type must be message"}
 	}
-	for label, value := range map[string]string{"id": e.ID, "task_id": e.TaskID, "thread_id": e.ThreadID} {
+	if !messageIDPattern.MatchString(e.ID) {
+		return &validationError{"invalid_id", "id must be a UUID v4, UUID v7, or ULID"}
+	}
+	for label, value := range map[string]string{"task_id": e.TaskID, "thread_id": e.ThreadID} {
 		if !uuidPattern.MatchString(value) {
 			return &validationError{"invalid_" + label, label + " must be a UUID"}
 		}
 	}
-	if e.ReplyTo != "" && !uuidPattern.MatchString(e.ReplyTo) {
-		return &validationError{"invalid_reply_to", "reply_to must be a UUID"}
+	if e.ReplyTo != "" && !messageIDPattern.MatchString(e.ReplyTo) {
+		return &validationError{"invalid_reply_to", "reply_to must be a UUID v4, UUID v7, or ULID"}
 	}
 	if e.SenderID != auth.agent.ID {
 		return &validationError{"sender_mismatch", "sender_id must match the authenticated agent"}
@@ -390,7 +394,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 
 func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "messages" || parts[3] != "ack" || !uuidPattern.MatchString(parts[2]) {
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "messages" || parts[3] != "ack" || !messageIDPattern.MatchString(parts[2]) {
 		s.rejectAck(w, auth.agent, "not_found", "acknowledgement route not found", http.StatusNotFound)
 		return
 	}
@@ -405,16 +409,16 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 	}
 	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID)
 	if err != nil {
-		code, status, message := "ack_failed", http.StatusBadRequest, "message could not be acknowledged"
 		switch {
 		case errors.Is(err, ErrMessageNotFound):
-			code, status, message = "message_not_found", http.StatusNotFound, "message was not found"
+			s.rejectAckWithAuditCode(w, auth.agent, "message_not_found", "message_not_found", "message was not found", http.StatusNotFound)
 		case errors.Is(err, ErrNotRecipient):
-			code, status, message = "not_recipient", http.StatusForbidden, "only the addressed recipient may acknowledge a message"
+			s.rejectAckWithAuditCode(w, auth.agent, "message_not_found", "not_recipient", "message was not found", http.StatusNotFound)
+		case errors.Is(err, ErrWrongTenant):
+			s.rejectAckWithAuditCode(w, auth.agent, "message_not_found", "wrong_tenant", "message was not found", http.StatusNotFound)
 		default:
-			status = http.StatusServiceUnavailable
+			s.rejectAck(w, auth.agent, "ack_failed", "message could not be acknowledged", http.StatusServiceUnavailable)
 		}
-		s.rejectAck(w, auth.agent, code, message, status)
 		return
 	}
 	if !duplicate {
@@ -424,7 +428,11 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 }
 
 func (s *Server) rejectAck(w http.ResponseWriter, agent RegistryAgent, code, message string, status int) {
-	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "ack", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: code}); err != nil {
+	s.rejectAckWithAuditCode(w, agent, code, code, message, status)
+}
+
+func (s *Server) rejectAckWithAuditCode(w http.ResponseWriter, agent RegistryAgent, code, auditCode, message string, status int) {
+	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "ack", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
 		log.Printf("record rejected acknowledgement: %v", err)
 	}
 	writeError(w, status, code, message)

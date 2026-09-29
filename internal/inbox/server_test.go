@@ -247,8 +247,8 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	if status, code := s.ack(t, "agent-b", instruction.ID, false); status != http.StatusBadRequest || code != "processing_required" {
 		t.Fatalf("ack before processing should fail, got HTTP %d %q", status, code)
 	}
-	if status, code := s.ack(t, "agent-a", instruction.ID, true); status != http.StatusForbidden || code != "not_recipient" {
-		t.Fatalf("non-recipient ack should fail, got HTTP %d %q", status, code)
+	if status, code := s.ack(t, "agent-a", instruction.ID, true); status != http.StatusNotFound || code != "message_not_found" {
+		t.Fatalf("non-recipient ack should use the generic missing-message response, got HTTP %d %q", status, code)
 	}
 	ackWithNote := []byte(fmt.Sprintf(`{"processed":true,"processed_at":%q,"note":"legacy note"}`, time.Now().UTC().Format(time.RFC3339Nano)))
 	ackData, ackStatus, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages/"+instruction.ID+"/ack", ackWithNote)
@@ -509,6 +509,91 @@ func TestSenderSendResponsesOmitAcknowledgementMetadata(t *testing.T) {
 		t.Fatalf("recipient acknowledgement failed: HTTP %d %q", status, code)
 	}
 	assertResponseOmitsAcknowledgement("idempotent resend after acknowledgement", http.StatusOK)
+}
+
+func TestAckRejectionsDoNotRevealMessageExistence(t *testing.T) {
+	s := newTestSystem(t)
+	sameTenant := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"same tenant"}`)
+	if _, status, apiErr := s.send(t, sameTenant, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("same-tenant message failed: HTTP %d %+v", status, apiErr)
+	}
+	for i := range s.registry.Agents {
+		if s.registry.Agents[i].ID == "agent-a" {
+			s.registry.Agents[i].TenantID = "tenant-two"
+		}
+	}
+	writeRegistry(t, s.registryFile, s.registry)
+	anotherTenant := s.envelope(t, "agent-c", "agent-a", "instruction", `{"task":"other tenant"}`)
+	if _, status, apiErr := s.send(t, anotherTenant, "agent-c"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("cross-tenant fixture message failed: HTTP %d %+v", status, apiErr)
+	}
+	for i := range s.registry.Agents {
+		if s.registry.Agents[i].ID == "agent-a" {
+			s.registry.Agents[i].TenantID = "tenant-one"
+		}
+	}
+	writeRegistry(t, s.registryFile, s.registry)
+	missingID, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name      string
+		messageID string
+		auditCode string
+	}{
+		{name: "missing", messageID: missingID, auditCode: "message_not_found"},
+		{name: "another recipient", messageID: sameTenant.ID, auditCode: "not_recipient"},
+		{name: "another tenant", messageID: anotherTenant.ID, auditCode: "wrong_tenant"},
+	}
+	ackBody, err := json.Marshal(AckRequest{Processed: true, ProcessedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantBody string
+	var wantStatus int
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			data, status, err := s.clients["agent-a"].Do(context.Background(), http.MethodPost, "/v1/messages/"+test.messageID+"/ack", ackBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var apiErr ErrorResponse
+			if err := json.Unmarshal(data, &apiErr); err != nil || status != http.StatusNotFound || apiErr.Error.Code != "message_not_found" {
+				t.Fatalf("ack rejection disclosed message existence: HTTP %d %s (%v)", status, data, err)
+			}
+			if wantBody == "" {
+				wantBody, wantStatus = string(data), status
+			} else if string(data) != wantBody || status != wantStatus {
+				t.Fatalf("ack rejection differed: got HTTP %d %s, want HTTP %d %s", status, data, wantStatus, wantBody)
+			}
+		})
+	}
+
+	entries, err := s.store.AuditEntries(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotAuditCodes := make([]string, 0, len(cases))
+	for _, entry := range entries {
+		if entry.Action == "ack" && entry.Outcome == "rejected" {
+			gotAuditCodes = append(gotAuditCodes, entry.Code)
+		}
+	}
+	for _, test := range cases {
+		found := false
+		for i, got := range gotAuditCodes {
+			if got == test.auditCode {
+				gotAuditCodes = append(gotAuditCodes[:i], gotAuditCodes[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("ack audit omitted private reason %q: %+v", test.auditCode, entries)
+		}
+	}
 }
 
 func TestLostDoorbellDoesNotLoseMessageAndMissingAckKeepsItVisible(t *testing.T) {
@@ -905,6 +990,60 @@ func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 	}
 }
 
+func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
+	s := newTestSystem(t)
+	uuid4, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validIDs := []struct {
+		name string
+		id   string
+	}{
+		{name: "uuid v4", id: uuid4},
+		{name: "uuid v7", id: "01890f3e-7b12-7abc-8def-0123456789ab"},
+		{name: "ulid", id: "01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+	}
+	var ulidEnvelope Envelope
+	for _, test := range validIDs {
+		t.Run(test.name, func(t *testing.T) {
+			envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"id_type":"supported"}`)
+			envelope.ID = test.id
+			if err := SignEnvelope(&envelope, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			if _, status, apiErr := s.send(t, envelope, "agent-a"); apiErr != nil || status != http.StatusCreated {
+				t.Fatalf("supported message ID was rejected: HTTP %d %+v", status, apiErr)
+			}
+			if status, code := s.ack(t, "agent-b", envelope.ID, true); status != http.StatusOK || code != "" {
+				t.Fatalf("supported message ID was rejected by the ack route: HTTP %d %q", status, code)
+			}
+			if test.name == "ulid" {
+				ulidEnvelope = envelope
+			}
+		})
+	}
+	result := s.envelope(t, "agent-b", "agent-a", "result", `{"result":"done"}`)
+	result.TaskID, result.ThreadID, result.ReplyTo = ulidEnvelope.TaskID, ulidEnvelope.ThreadID, ulidEnvelope.ID
+	if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+		t.Fatal(err)
+	}
+	if _, status, apiErr := s.send(t, result, "agent-b"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("ULID reply_to was rejected: HTTP %d %+v", status, apiErr)
+	}
+
+	for _, id := range []string{"f81d4fae-7dec-11d0-a765-00a0c91e6bf6", "01ARZ3NDEKTSV4RRFFQ69G5FAI"} {
+		envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"id_type":"unsupported"}`)
+		envelope.ID = id
+		if err := SignEnvelope(&envelope, s.agents["agent-a"].private); err != nil {
+			t.Fatal(err)
+		}
+		if _, status, apiErr := s.send(t, envelope, "agent-a"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_id" {
+			t.Fatalf("unsupported message ID %q was accepted: HTTP %d %+v", id, status, apiErr)
+		}
+	}
+}
+
 func TestReplyTargetPrivacyUsesOneClientRejection(t *testing.T) {
 	s := newTestSystem(t)
 	for i := range s.registry.Agents {
@@ -1245,8 +1384,8 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 	if got := s.poll(t, "agent-b"); len(got.Messages) != 0 {
 		t.Fatalf("tenant reassignment exposed an old message: %+v", got.Messages)
 	}
-	if status, code := s.ack(t, "agent-b", instruction.ID, true); status != http.StatusForbidden || code != "not_recipient" {
-		t.Fatalf("tenant reassignment allowed acknowledgement: HTTP %d %q", status, code)
+	if status, code := s.ack(t, "agent-b", instruction.ID, true); status != http.StatusNotFound || code != "message_not_found" {
+		t.Fatalf("tenant reassignment did not use the generic missing-message response: HTTP %d %q", status, code)
 	}
 	if _, err := s.store.GetMessage(context.Background(), instruction.ID, "tenant-two"); err != ErrMessageNotFound {
 		t.Fatalf("tenant-scoped reply lookup returned old message: %v", err)

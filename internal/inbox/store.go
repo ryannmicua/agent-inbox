@@ -18,6 +18,7 @@ import (
 var (
 	ErrMessageNotFound = errors.New("message not found")
 	ErrNotRecipient    = errors.New("agent is not the message recipient")
+	ErrWrongTenant     = errors.New("message belongs to another tenant")
 	ErrMessageConflict = errors.New("message id already exists with different content")
 	ErrReplay          = errors.New("request nonce already used")
 )
@@ -339,7 +340,10 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	if err != nil {
 		return false, err
 	}
-	if recipient != agent || messageTenant != tenant {
+	if messageTenant != tenant {
+		return false, ErrWrongTenant
+	}
+	if recipient != agent {
 		return false, ErrNotRecipient
 	}
 	duplicate := acknowledged.Valid

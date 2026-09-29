@@ -247,7 +247,10 @@ func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant strin
 	if err != nil {
 		return false, err
 	}
-	if recipient != agent || messageTenant != tenant {
+	if messageTenant != tenant {
+		return false, ErrWrongTenant
+	}
+	if recipient != agent {
 		return false, ErrNotRecipient
 	}
 	duplicate := acknowledged != nil

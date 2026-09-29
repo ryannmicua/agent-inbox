@@ -42,7 +42,13 @@ result should reply to this instruction. To retry a send safely, pass the same
 `--id` and the same message content; the server returns the existing message
 instead of creating another one. The server ignores the retry's `created_at`
 and resulting message signature, while every other envelope field must match.
-The CLI signs each retry as a new request with a fresh nonce.
+Message IDs must be UUID v4, UUID v7, or ULID; when `--id` is omitted, the CLI
+generates a UUID v4. The CLI signs each retry as a new request with a fresh
+nonce.
+
+Treat message IDs as capability-like references and share them only with
+authorized participants. A send using an occupied ID can reveal that it is
+already in use, so only submit IDs you generated or otherwise already know.
 
 For larger JSON payloads, use `--payload-file`. Payloads are limited to 16 KiB.
 Reference large files with one or more `--artifact` flags, for example:
