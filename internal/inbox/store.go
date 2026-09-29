@@ -434,10 +434,16 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 	}
 	defer tx.Rollback()
 	var tenant string
-	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM messages WHERE id = ?`, id).Scan(&tenant); err != nil {
+	var acknowledged sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ? WHERE message_id = ? AND escalated_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id)
+	if acknowledged.Valid {
+		return false, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ?
+		WHERE message_id = ? AND escalated_at IS NULL
+		AND EXISTS (SELECT 1 FROM messages WHERE id = ? AND acknowledged_at IS NULL)`, now.UTC().Format(time.RFC3339Nano), id, id)
 	if err != nil {
 		return false, err
 	}

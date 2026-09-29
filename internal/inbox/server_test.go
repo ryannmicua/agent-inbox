@@ -510,6 +510,70 @@ func TestFailedEscalationIsAuditedAndAttemptedOnce(t *testing.T) {
 	}
 }
 
+func TestEscalatedMessageDoesNotResumeDoorbellsAfterLimitChanges(t *testing.T) {
+	s := newTestSystem(t)
+	base := time.Now().UTC()
+	s.service.now = func() time.Time { return base }
+	s.service.config.RetryInterval = time.Second
+	s.service.config.MaxDoorbellAttempts = 1
+	notifier := &recordingNotifier{store: s.store}
+	s.service.notifier = notifier
+	bell, remove := s.service.hub.subscribe("agent-b")
+	defer remove()
+
+	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	if _, status, apiErr := s.send(t, e, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("send failed: %d %+v", status, apiErr)
+	}
+	<-bell
+	base = base.Add(2 * time.Second)
+	s.service.dispatchDue(context.Background())
+	if notifier.count("message.unacknowledged_escalation") != 1 {
+		t.Fatalf("message was not escalated at the configured attempt limit: %d", notifier.count("message.unacknowledged_escalation"))
+	}
+
+	s.service.config.MaxDoorbellAttempts = 5
+	base = base.Add(2 * time.Second)
+	s.service.dispatchDue(context.Background())
+	select {
+	case event := <-bell:
+		t.Fatalf("escalated message resumed doorbell retries after config changed: %+v", event)
+	default:
+	}
+	if notifier.count("message.unacknowledged_escalation") != 1 {
+		t.Fatalf("escalated message emitted another escalation: %d", notifier.count("message.unacknowledged_escalation"))
+	}
+}
+
+func TestEscalationTransitionSkipsMessageAcknowledgedAfterCandidateRead(t *testing.T) {
+	s := newTestSystem(t)
+	ctx := context.Background()
+	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	if _, status, apiErr := s.send(t, e, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("send failed: %d %+v", status, apiErr)
+	}
+
+	dueAt := time.Now().UTC().Add(2 * time.Second)
+	candidates, err := s.store.DueNotifications(ctx, dueAt, time.Second, 1)
+	if err != nil || len(candidates) != 1 || candidates[0].MessageID != e.ID {
+		t.Fatalf("dispatcher did not load an escalation candidate before ack: %+v err=%v", candidates, err)
+	}
+	if duplicate, err := s.store.Acknowledge(ctx, e.ID, "agent-b", "tenant-one"); err != nil || duplicate {
+		t.Fatalf("recipient acknowledgement failed: duplicate=%t err=%v", duplicate, err)
+	}
+	marked, err := s.store.MarkEscalated(ctx, e.ID, dueAt)
+	if err != nil || marked {
+		t.Fatalf("escalation transition accepted an acknowledged message: marked=%t err=%v", marked, err)
+	}
+	entries, err := s.store.AuditEntries(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countAudit(entries, "message.unacknowledged_escalation", "attempted") != 0 {
+		t.Fatalf("acknowledged message received an escalation audit: %+v", entries)
+	}
+}
+
 func TestOpenStoreRejectsPostgresqlAlias(t *testing.T) {
 	if _, err := OpenStore("postgresql", ""); err == nil || !strings.Contains(err.Error(), "unsupported storage backend") {
 		t.Fatalf("storage factory accepted the postgresql alias: %v", err)

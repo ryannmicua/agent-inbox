@@ -221,10 +221,14 @@ the service remains up:
 ```sh
 docker compose exec -T server inboxd backup \
   --db /var/lib/agent-inbox/inbox.db \
-  --out /tmp/agent-inbox-backup.db
+  --out /var/lib/agent-inbox/agent-inbox-backup.db
 container_id="$(docker compose ps -q server)"
-docker cp "$container_id:/tmp/agent-inbox-backup.db" ./agent-inbox-backup.db
+docker cp "$container_id:/var/lib/agent-inbox/agent-inbox-backup.db" ./agent-inbox-backup.db
 ```
+
+The snapshot is written to the persistent database volume, not the container's
+16 MiB `/tmp` filesystem. Confirm the volume has room for a database-sized
+snapshot before starting the backup.
 
 Store backups encrypted and access-controlled. The database may contain
 operator-supplied content, tenant identifiers, and message metadata. Keep

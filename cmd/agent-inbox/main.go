@@ -133,11 +133,18 @@ func runSend(ctx context.Context, client *inbox.Client, recipient, kind, payload
 	if payloadText != "" {
 		payload = []byte(payloadText)
 	} else if payloadFile != "" {
-		var err error
-		payload, err = os.ReadFile(payloadFile)
+		file, err := os.Open(payloadFile)
 		if err != nil {
 			return err
 		}
+		defer file.Close()
+		payload, err = io.ReadAll(io.LimitReader(file, inbox.MaxPayloadBytes+1))
+		if err != nil {
+			return err
+		}
+	}
+	if len(payload) > inbox.MaxPayloadBytes {
+		return errors.New("payload must be 16 KiB or smaller")
 	}
 	if !json.Valid(payload) {
 		return errors.New("payload must be valid JSON")

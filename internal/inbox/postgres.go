@@ -346,10 +346,16 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 	}
 	defer tx.Rollback()
 	var tenant string
-	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM messages WHERE id = $1`, id).Scan(&tenant); err != nil {
+	var acknowledged any
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = $1 WHERE message_id = $2 AND escalated_at IS NULL`, now.UTC(), id)
+	if acknowledged != nil {
+		return false, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = $1
+		WHERE message_id = $2 AND escalated_at IS NULL
+		AND EXISTS (SELECT 1 FROM messages WHERE id = $2 AND acknowledged_at IS NULL)`, now.UTC(), id)
 	if err != nil {
 		return false, err
 	}
