@@ -259,7 +259,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 			}
 			return
 		}
-		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
+		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
 			s.rejectReply(w, auth.agent, "reply_correlation_mismatch", messageID)
 			return
 		}
@@ -574,11 +574,12 @@ func (s *Server) dispatchDue(ctx context.Context) {
 			continue
 		}
 		if c.Attempts < s.config.MaxDoorbellAttempts {
-			if s.assignedToTenant(c.Recipient, c.TenantID) {
-				s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
-			}
 			if err := s.store.MarkNotified(ctx, c.MessageID, s.now()); err != nil {
 				log.Printf("record notification attempt for %s: %v", c.MessageID, err)
+				continue
+			}
+			if s.assignedToTenant(c.Recipient, c.TenantID) {
+				s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
 			}
 			continue
 		}
@@ -597,10 +598,11 @@ func (s *Server) ring(message DeliveredMessage) {
 	if !s.assignedToTenant(message.RecipientID, message.TenantID) {
 		return
 	}
-	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
 	if err := s.store.MarkNotified(context.Background(), message.ID, s.now()); err != nil {
 		log.Printf("record initial doorbell for %s: %v", message.ID, err)
+		return
 	}
+	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
 }
 
 func (s *Server) assignedToTenant(agentID, tenantID string) bool {

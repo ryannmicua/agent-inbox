@@ -299,6 +299,34 @@ func TestInstructionResultExchangeDeduplicatesAndCorrelates(t *testing.T) {
 	}
 }
 
+func TestResultReplyMustTargetInstruction(t *testing.T) {
+	s := newTestSystem(t)
+	instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	if _, status, apiErr := s.send(t, instruction, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("instruction failed: HTTP %d %+v", status, apiErr)
+	}
+	result := s.envelope(t, "agent-b", "agent-a", "result", `{"x":2}`)
+	result.TaskID, result.ThreadID, result.ReplyTo = instruction.TaskID, instruction.ThreadID, instruction.ID
+	if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+		t.Fatal(err)
+	}
+	stored, status, apiErr := s.send(t, result, "agent-b")
+	if apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("result to instruction failed: HTTP %d %+v", status, apiErr)
+	}
+	invalid := s.envelope(t, "agent-a", "agent-b", "result", `{"x":3}`)
+	invalid.TaskID, invalid.ThreadID, invalid.ReplyTo = stored.TaskID, stored.ThreadID, stored.ID
+	if err := SignEnvelope(&invalid, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	if _, status, apiErr := s.send(t, invalid, "agent-a"); status != http.StatusBadRequest || apiErr == nil || apiErr.Error.Code != "invalid_reply_to" {
+		t.Fatalf("result-to-result reply was accepted: HTTP %d %+v", status, apiErr)
+	}
+	if got := s.poll(t, "agent-b"); len(got.Messages) != 1 || got.Messages[0].ID != instruction.ID {
+		t.Fatalf("invalid result reply was persisted: %+v", got.Messages)
+	}
+}
+
 func TestLostResponseRetryIgnoresCreatedAtButRejectsChangedContent(t *testing.T) {
 	s := newTestSystem(t)
 	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"value":1}`)
@@ -1069,6 +1097,39 @@ func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 type replyTargetErrorStore struct {
 	Store
 	err error
+}
+
+type markNotifiedErrorStore struct {
+	Store
+	err error
+}
+
+func (s markNotifiedErrorStore) MarkNotified(context.Context, string, time.Time) error {
+	return s.err
+}
+
+func TestDoorbellsWaitForPersistedAttempt(t *testing.T) {
+	s := newTestSystem(t)
+	s.service.config.RetryInterval = time.Second
+	s.service.config.MaxDoorbellAttempts = 2
+	bell, remove := s.service.hub.subscribe("agent-b")
+	defer remove()
+	s.service.store = markNotifiedErrorStore{Store: s.store, err: errors.New("mark failed")}
+	instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	if _, status, apiErr := s.send(t, instruction, "agent-a"); apiErr != nil || status != http.StatusCreated {
+		t.Fatalf("send failed: HTTP %d %+v", status, apiErr)
+	}
+	select {
+	case event := <-bell:
+		t.Fatalf("initial doorbell published without recording attempt: %+v", event)
+	default:
+	}
+	s.service.dispatchDue(context.Background())
+	select {
+	case event := <-bell:
+		t.Fatalf("retry doorbell published without recording attempt: %+v", event)
+	default:
+	}
 }
 
 func (s replyTargetErrorStore) GetReplyTarget(context.Context, string, string, string) (DeliveredMessage, error) {

@@ -1,11 +1,14 @@
 package inbox
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"crypto/ed25519"
 )
@@ -52,6 +55,9 @@ func (f FileRegistry) load() (map[string]RegistryAgent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read registry: %w", err)
 	}
+	if err := validateRegistryFieldNames(data); err != nil {
+		return nil, fmt.Errorf("parse registry JSON: %w", err)
+	}
 	var r Registry
 	if err := decodeStrictJSON(data, &r); err != nil {
 		return nil, fmt.Errorf("parse registry JSON: %w", err)
@@ -96,6 +102,80 @@ func (f FileRegistry) load() (map[string]RegistryAgent, error) {
 		out[a.ID] = a
 	}
 	return out, nil
+}
+
+func validateRegistryFieldNames(data []byte) error {
+	if err := validateJSONMembers(data); err != nil {
+		return err
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	if err := rejectRegistryAliases(root, "version", "agents"); err != nil {
+		return err
+	}
+	var agents []json.RawMessage
+	if raw, ok := root["agents"]; ok {
+		if err := json.Unmarshal(raw, &agents); err != nil {
+			return err
+		}
+	}
+	for _, rawAgent := range agents {
+		var agent map[string]json.RawMessage
+		if err := json.Unmarshal(rawAgent, &agent); err != nil {
+			return err
+		}
+		if agent == nil {
+			continue
+		}
+		if err := rejectRegistryAliases(agent, "id", "tenant_id", "disabled", "public_keys", "allowed_recipients", "allowed_kinds"); err != nil {
+			return err
+		}
+		if err := rejectNullDisabled(agent); err != nil {
+			return err
+		}
+		var keys []json.RawMessage
+		if raw, ok := agent["public_keys"]; ok {
+			if err := json.Unmarshal(raw, &keys); err != nil {
+				return err
+			}
+		}
+		for _, rawKey := range keys {
+			var key map[string]json.RawMessage
+			if err := json.Unmarshal(rawKey, &key); err != nil {
+				return err
+			}
+			if key == nil {
+				continue
+			}
+			if err := rejectRegistryAliases(key, "id", "public_key", "disabled"); err != nil {
+				return err
+			}
+			if err := rejectNullDisabled(key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func rejectRegistryAliases(fields map[string]json.RawMessage, canonical ...string) error {
+	for name := range fields {
+		for _, expected := range canonical {
+			if name != expected && strings.EqualFold(name, expected) {
+				return fmt.Errorf("registry field %q must use canonical spelling %q", name, expected)
+			}
+		}
+	}
+	return nil
+}
+
+func rejectNullDisabled(fields map[string]json.RawMessage) error {
+	if raw, ok := fields["disabled"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("registry disabled fields must be booleans")
+	}
+	return nil
 }
 
 func (f FileRegistry) Agent(id string) (RegistryAgent, error) {
