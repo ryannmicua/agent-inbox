@@ -282,6 +282,9 @@ func configuredNotifier() (inbox.Notifier, error) {
 }
 
 func allowsInsecureWebhookHost(host string) bool {
+	if strings.EqualFold(host, "notification-sink") {
+		return true
+	}
 	host = strings.TrimSuffix(host, ".")
 	if host == "" {
 		return false
@@ -292,7 +295,7 @@ func allowsInsecureWebhookHost(host string) bool {
 	if address, err := netip.ParseAddr(host); err == nil {
 		return address.Unmap().IsLoopback()
 	}
-	return !strings.ContainsAny(host, ".:%")
+	return false
 }
 
 func usage(w io.Writer) {

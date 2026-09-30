@@ -512,6 +512,11 @@ func scanMessage(row rowScanner) (DeliveredMessage, error) {
 	if err := json.Unmarshal([]byte(raw), &m.Envelope); err != nil {
 		return DeliveredMessage{}, fmt.Errorf("decode stored envelope: %w", err)
 	}
+	if len(m.Envelope.Payload) > 0 {
+		if err := validateJSONMembers(m.Envelope.Payload); err != nil {
+			return DeliveredMessage{}, fmt.Errorf("decode stored envelope payload: %w", err)
+		}
+	}
 	var err error
 	m.AcceptedAt, err = parseDatabaseTime(accepted)
 	if err != nil {

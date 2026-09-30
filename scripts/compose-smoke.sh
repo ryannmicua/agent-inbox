@@ -23,8 +23,12 @@ export INBOX_WEBHOOK_URL="http://notification-sink:8081/notifications"
 
 compose=(docker compose --project-name "$project" -f compose.yaml)
 if [[ "$mode" == postgres ]]; then
-  export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-agent-inbox-smoke-${RANDOM}-$$}"
+  export POSTGRES_USER="agent_inbox"
+  export POSTGRES_DB="agent_inbox"
+  export POSTGRES_PASSWORD="agent-inbox-smoke/${RANDOM}?#%-$$"
   export POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-15432}"
+  url_password="$(POSTGRES_PASSWORD="$POSTGRES_PASSWORD" python3 -c 'import os; from urllib.parse import quote; print(quote(os.environ["POSTGRES_PASSWORD"], safe=""))')"
+  export INBOX_DATABASE_URL="postgres://${POSTGRES_USER}:${url_password}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
   compose+=(-f compose.postgres.yaml)
 fi
 
@@ -67,7 +71,7 @@ if [[ "$healthy" != 1 ]]; then
 fi
 
 if [[ "$mode" == postgres ]]; then
-  test_url="postgres://agent_inbox:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT}/agent_inbox?sslmode=disable"
+  test_url="postgres://${POSTGRES_USER}:${url_password}@127.0.0.1:${POSTGRES_HOST_PORT}/${POSTGRES_DB}?sslmode=disable"
   INBOX_TEST_POSTGRES_URL="$test_url" go test ./...
 fi
 

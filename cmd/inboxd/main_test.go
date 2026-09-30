@@ -41,6 +41,7 @@ func TestConfiguredNotifierEnforcesWebhookTransportPolicy(t *testing.T) {
 	for _, webhook := range []string{
 		"", "not-a-url", "ftp://notify.example.com/hook",
 		"http://hooks.example.com/events", "http://192.0.2.1/events", "http://[2001:4860:4860::8888]/events",
+		"http://internal-api:8081/events", "http://notification-sink.example.com/events", "http://notification-sink.:8081/events",
 	} {
 		t.Setenv("INBOX_WEBHOOK_URL", webhook)
 		if _, err := configuredNotifier(); err == nil {

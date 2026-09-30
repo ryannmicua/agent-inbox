@@ -1273,6 +1273,42 @@ func TestSendRejectsDuplicatePayloadMembers(t *testing.T) {
 	}
 }
 
+func TestStoredDuplicatePayloadMembersAreRejectedOnRead(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	envelope := Envelope{
+		Type:        EnvelopeType,
+		ID:          "legacy-duplicate-payload",
+		TaskID:      "legacy-duplicate-payload",
+		ThreadID:    "legacy-duplicate-payload",
+		SenderID:    "agent-a",
+		RecipientID: "agent-b",
+		Kind:        "instruction",
+		Payload:     json.RawMessage(`{"mode":"read","mode":"delete"}`),
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = store.db.Exec(`INSERT INTO messages(id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, envelope.ID, envelope.SenderID, envelope.RecipientID, "tenant-one", envelope.Kind, envelope.TaskID, envelope.ThreadID, "", string(raw), acceptedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.ListMessages(context.Background(), envelope.RecipientID, "tenant-one", 10); err == nil || !strings.Contains(err.Error(), `duplicate JSON object member "mode"`) {
+		t.Fatalf("message polling accepted an ambiguous legacy payload: %v", err)
+	}
+	if _, err := store.GetMessage(context.Background(), envelope.ID, "tenant-one"); err == nil || !strings.Contains(err.Error(), `duplicate JSON object member "mode"`) {
+		t.Fatalf("message lookup accepted an ambiguous legacy payload: %v", err)
+	}
+}
+
 func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 	s := newTestSystem(t)
 	uuid4, err := NewUUID()
