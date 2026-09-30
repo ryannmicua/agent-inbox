@@ -1,4 +1,5 @@
 .git
+.env
 .gitignore
 *.db
 *.db-shm

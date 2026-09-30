@@ -47,6 +47,9 @@ omitted, the CLI generates a UUID v4. Previously stored UUID IDs remain usable
 for retries, replies, and acknowledgements. The CLI signs each retry as a new
 request with a fresh nonce.
 
+Use lowercase UUIDs and uppercase ULIDs, and preserve the returned ID spelling
+when copying identifiers between commands.
+
 Treat message IDs as capability-like references and share them only with
 authorized participants. A send using an occupied ID can reveal that it is
 already in use, so only submit IDs you generated or otherwise already know.

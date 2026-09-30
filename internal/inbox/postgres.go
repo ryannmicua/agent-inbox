@@ -122,18 +122,18 @@ func (s *PostgresStore) RecordNonce(ctx context.Context, agent, nonce string, no
 	if err != nil {
 		return err
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM request_nonces WHERE created_at < $1`, now.UTC().Add(-24*time.Hour))
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM request_nonces WHERE created_at < $1`, now.UTC().Add(-requestNonceRetention))
 	return nil
 }
 
 func (s *PostgresStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
 	return scanMessage(s.db.QueryRowContext(ctx,
-		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2`, id, tenant))
+		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower($1) AND tenant_id = $2`, id, tenant))
 }
 
 func (s *PostgresStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
 	return scanMessage(s.db.QueryRowContext(ctx,
-		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2 AND recipient_id = $3`, id, tenant, recipient))
+		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower($1) AND tenant_id = $2 AND recipient_id = $3`, id, tenant, recipient))
 }
 
 func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
@@ -195,7 +195,7 @@ func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant st
 
 func (s *PostgresStore) duplicate(ctx context.Context, tx *sql.Tx, e Envelope, tenant string, canonical []byte, now time.Time) (DeliveredMessage, bool, error) {
 	var existingJSON, existingTenant string
-	err := tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE id = $1`, e.ID).Scan(&existingJSON, &existingTenant)
+	err := tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE lower(id) = lower($1)`, e.ID).Scan(&existingJSON, &existingTenant)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DeliveredMessage{}, false, nil
 	}
@@ -214,7 +214,7 @@ func (s *PostgresStore) duplicate(ctx context.Context, tx *sql.Tx, e Envelope, t
 		return DeliveredMessage{}, false, ErrMessageConflict
 	}
 	message, err := scanMessage(tx.QueryRowContext(ctx,
-		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2`, e.ID, tenant))
+		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower($1) AND tenant_id = $2`, e.ID, tenant))
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
@@ -248,9 +248,9 @@ func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant strin
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, messageTenant string
+	var storedID, recipient, messageTenant string
 	var acknowledged any
-	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&recipient, &messageTenant, &acknowledged)
+	err = tx.QueryRowContext(ctx, `SELECT id, recipient_id, tenant_id, acknowledged_at FROM messages WHERE lower(id) = lower($1) FOR UPDATE`, id).Scan(&storedID, &recipient, &messageTenant, &acknowledged)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
@@ -265,7 +265,7 @@ func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant strin
 	}
 	duplicate := acknowledged != nil
 	if !duplicate {
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = $1 WHERE id = $2`, time.Now().UTC(), storedID); err != nil {
 			return false, err
 		}
 	}
@@ -273,7 +273,7 @@ func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant strin
 	if duplicate {
 		outcome, code = "duplicate", "already_acknowledged"
 	}
-	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: id, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
+	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: storedID, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

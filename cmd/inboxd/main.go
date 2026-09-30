@@ -65,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Addr: listen, Handler: service, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	server := &http.Server{Addr: listen, Handler: service, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go service.RunNotifications(ctx)
@@ -128,7 +128,7 @@ func runBackup(args []string, stdout, stderr io.Writer) error {
 	if err := requireDatabaseFile(*dbPath); err != nil {
 		return err
 	}
-	store, err := inbox.OpenSQLite(*dbPath)
+	store, err := inbox.OpenSQLiteWithoutMigration(*dbPath)
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func openConfiguredStoreWithoutMigration(sqlitePath string) (inbox.Store, error)
 	if envOr("INBOX_STORAGE", "sqlite") == "postgres" {
 		return inbox.OpenPostgresWithoutMigration(os.Getenv("INBOX_DATABASE_URL"))
 	}
-	return openConfiguredStore(sqlitePath)
+	return inbox.OpenSQLiteWithoutMigration(sqlitePath)
 }
 
 func configuredNotifier() (inbox.Notifier, error) {

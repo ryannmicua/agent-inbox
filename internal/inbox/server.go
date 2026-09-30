@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	messageIDPattern   = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
+	messageIDPattern   = regexp.MustCompile(`^([0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9A-HJKMNP-TV-Z]{25})$`)
 	referenceIDPattern = regexp.MustCompile(`(?i)^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-7][0-9a-hjkmnp-tv-z]{25})$`)
 	noncePattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 	shaPattern         = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -86,6 +86,9 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 	if config.RequestSkew <= 0 {
 		config.RequestSkew = 5 * time.Minute
 	}
+	if config.RequestSkew > requestNonceRetention/2 {
+		return nil, errors.New("request skew cannot exceed half the replay nonce retention window")
+	}
 	if config.RetryInterval <= 0 {
 		config.RetryInterval = 30 * time.Second
 	}
@@ -99,6 +102,11 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !hasRequestSignature(r) {
+		s.preAuth.unsigned.Add(1)
+		writeAuthenticationFailure(w)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBytes+1))
 	if err != nil {
 		s.preAuth.bodyReadFailures.Add(1)
@@ -108,11 +116,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(body) > MaxRequestBytes {
 		s.preAuth.oversized.Add(1)
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 64 KiB")
-		return
-	}
-	if !hasRequestSignature(r) {
-		s.preAuth.unsigned.Add(1)
-		writeAuthenticationFailure(w)
 		return
 	}
 	identity, apiErr := s.authenticate(r, body)
@@ -259,7 +262,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 			}
 			return
 		}
-		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
+		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || !strings.EqualFold(original.ThreadID, e.ThreadID) || !strings.EqualFold(original.TaskID, e.TaskID) {
 			s.rejectReply(w, auth.agent, "reply_correlation_mismatch", messageID)
 			return
 		}
@@ -551,7 +554,8 @@ func (s *Server) recordAuthenticationFailure(reason string) {
 }
 
 func (s *Server) RunNotifications(ctx context.Context) {
-	ticker := time.NewTicker(min(s.config.RetryInterval/2, 10*time.Second))
+	tickerInterval := min(max(s.config.RetryInterval/2, time.Nanosecond), 10*time.Second)
+	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 	for {
 		select {

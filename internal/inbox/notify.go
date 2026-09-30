@@ -65,7 +65,7 @@ func safeWebhookEndpoint(raw string) string {
 	if err != nil {
 		return "configured webhook"
 	}
-	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path}).String()
+	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host}).String()
 }
 
 func webhookRequestError(endpoint string, err error) error {

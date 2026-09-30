@@ -71,7 +71,7 @@ its test volume.
 | `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Generic HTTP webhook for consequential human-visible events. Required at startup; use a human-operated endpoint in production. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. Tenant reassignment suppresses rings but does not cancel the schedule. |
-| `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time. Accepts Go duration syntax. |
+| `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time; maximum `12h` to match nonce retention. Accepts Go duration syntax. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
 
@@ -92,8 +92,8 @@ adds a `notification.failed` audit entry with the event, message ID when
 available, and error class; it does not undo a message or acknowledgement or
 change the API response. Doorbell retries remain separate from webhook
 delivery. The escalation state and audit entry are committed before its single
-webhook attempt. Webhook failure logs include only the endpoint scheme, host,
-and path; URL userinfo and query parameters are omitted.
+webhook attempt. Webhook failure logs include only the endpoint scheme and
+host; URL userinfo, path, and query parameters are omitted.
 
 ## Registry operations
 

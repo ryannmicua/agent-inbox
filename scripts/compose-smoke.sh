@@ -49,6 +49,7 @@ cat > "$INBOX_REGISTRY_FILE" <<EOF
   ]
 }
 EOF
+chmod 0644 "$INBOX_REGISTRY_FILE"
 
 "${compose[@]}" up --build -d
 healthy=0

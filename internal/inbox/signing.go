@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 type canonicalEnvelope struct {
@@ -67,6 +68,10 @@ func EnvelopeSigningBytes(e Envelope) ([]byte, error) {
 }
 
 func envelopeRetryBytes(e Envelope) ([]byte, error) {
+	e.ID = strings.ToLower(e.ID)
+	e.TaskID = strings.ToLower(e.TaskID)
+	e.ThreadID = strings.ToLower(e.ThreadID)
+	e.ReplyTo = strings.ToLower(e.ReplyTo)
 	e.CreatedAt = ""
 	e.KeyID = ""
 	return EnvelopeSigningBytes(e)

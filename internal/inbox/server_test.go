@@ -1068,6 +1068,51 @@ func TestAuthenticationRejectsExtremeTimestamps(t *testing.T) {
 	}
 }
 
+func TestRequestSkewCannotOutliveNonceRetention(t *testing.T) {
+	s := newTestSystem(t)
+	config := DefaultServerConfig()
+	config.RequestSkew = 13 * time.Hour
+	if _, err := NewServer(s.store, FileRegistry{Path: s.registryFile}, s.notifier, config); err == nil {
+		t.Fatal("server accepted request skew longer than nonce retention allows")
+	}
+	config.RequestSkew = 12 * time.Hour
+	if _, err := NewServer(s.store, FileRegistry{Path: s.registryFile}, s.notifier, config); err != nil {
+		t.Fatalf("server rejected the maximum safe request skew: %v", err)
+	}
+}
+
+type trackedRequestBody struct{ read bool }
+
+func (b *trackedRequestBody) Read([]byte) (int, error) {
+	b.read = true
+	return 0, errors.New("unexpected body read")
+}
+
+func (b *trackedRequestBody) Close() error { return nil }
+
+func TestUnsignedRequestRejectedBeforeBodyRead(t *testing.T) {
+	s := newTestSystem(t)
+	body := &trackedRequestBody{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	request.Body = body
+	response := httptest.NewRecorder()
+	s.service.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned request returned HTTP %d", response.Code)
+	}
+	if body.read {
+		t.Fatal("server read an unsigned request body")
+	}
+}
+
+func TestRunNotificationsAcceptsNanosecondRetryInterval(t *testing.T) {
+	s := newTestSystem(t)
+	s.service.config.RetryInterval = time.Nanosecond
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.service.RunNotifications(ctx)
+}
+
 func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
 	s := newTestSystem(t)
 	e := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
@@ -1233,6 +1278,76 @@ func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 			t.Fatalf("unsupported message ID %q was accepted: HTTP %d %+v", id, status, apiErr)
 		}
 	}
+}
+
+func TestMessageIdentifierCaseIsConsistentAcrossOperations(t *testing.T) {
+	ids := []string{"01890f3e-7b12-7abc-8def-0123456789ab", "01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+	for _, id := range ids {
+		t.Run(id, func(t *testing.T) {
+			s := newTestSystem(t)
+			instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"case":"stable"}`)
+			instruction.ID, instruction.TaskID, instruction.ThreadID = id, id, id
+			if err := SignEnvelope(&instruction, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			stored, status, apiErr := s.send(t, instruction, "agent-a")
+			if apiErr != nil || status != http.StatusCreated {
+				t.Fatalf("canonical identifier was rejected: HTTP %d %+v", status, apiErr)
+			}
+
+			retry := instruction
+			retry.ID = toggleIdentifierCase(retry.ID)
+			retry.TaskID = toggleIdentifierCase(retry.TaskID)
+			retry.ThreadID = toggleIdentifierCase(retry.ThreadID)
+			retry.CreatedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+			if err := SignEnvelope(&retry, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			duplicate, status, apiErr := s.send(t, retry, "agent-a")
+			if apiErr != nil || status != http.StatusOK || duplicate.Sequence != stored.Sequence {
+				t.Fatalf("case-changed retry did not return original message: HTTP %d %+v %+v", status, apiErr, duplicate)
+			}
+
+			result := s.envelope(t, "agent-b", "agent-a", "result", `{"case":"reply"}`)
+			result.TaskID, result.ThreadID, result.ReplyTo = toggleIdentifierCase(id), toggleIdentifierCase(id), toggleIdentifierCase(id)
+			if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+				t.Fatal(err)
+			}
+			if _, status, apiErr := s.send(t, result, "agent-b"); apiErr != nil || status != http.StatusCreated {
+				t.Fatalf("case-changed reply reference was rejected: HTTP %d %+v", status, apiErr)
+			}
+			if status, code := s.ack(t, "agent-b", toggleIdentifierCase(id), true); status != http.StatusOK || code != "" {
+				t.Fatalf("case-changed ack reference was rejected: HTTP %d %q", status, code)
+			}
+			if got := s.poll(t, "agent-b"); len(got.Messages) != 0 {
+				t.Fatalf("acknowledged message remained visible: %+v", got.Messages)
+			}
+			if got := s.poll(t, "agent-a"); len(got.Messages) != 1 || got.Messages[0].ID != result.ID {
+				t.Fatalf("case-changed identifiers created inconsistent delivery: %+v", got.Messages)
+			}
+		})
+	}
+
+	s := newTestSystem(t)
+	upperUUID, err := NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noncanonical := s.envelope(t, "agent-a", "agent-b", "instruction", `{"case":"invalid"}`)
+	noncanonical.ID = strings.ToUpper(upperUUID)
+	if err := SignEnvelope(&noncanonical, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	if _, status, apiErr := s.send(t, noncanonical, "agent-a"); status != http.StatusBadRequest || apiErr == nil || apiErr.Error.Code != "invalid_id" {
+		t.Fatalf("noncanonical new UUID spelling was accepted: HTTP %d %+v", status, apiErr)
+	}
+}
+
+func toggleIdentifierCase(id string) string {
+	if strings.ToLower(id) == id {
+		return strings.ToUpper(id)
+	}
+	return strings.ToLower(id)
 }
 
 func TestLegacyStoredMessageRemainsRetryableAckableAndReplyable(t *testing.T) {

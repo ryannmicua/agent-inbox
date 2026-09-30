@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,8 @@ var (
 	ErrMessageConflict = errors.New("message id already exists with different content")
 	ErrReplay          = errors.New("request nonce already used")
 )
+
+const requestNonceRetention = 24 * time.Hour
 
 type AuditRecord struct {
 	Action    string
@@ -88,22 +91,44 @@ func OpenStore(backend, location string) (Store, error) {
 type SQLiteStore struct{ db *sql.DB }
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
+	return openSQLite(path, true)
+}
+
+func OpenSQLiteWithoutMigration(path string) (*SQLiteStore, error) {
+	return openSQLite(path, false)
+}
+
+func openSQLite(path string, migrate bool) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, errors.New("database path is required")
 	}
-	if path != ":memory:" {
+	if migrate && path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			return nil, fmt.Errorf("create database directory: %w", err)
 		}
 	}
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	if !migrate {
+		fileURL := url.URL{Scheme: "file", Path: path}
+		query := fileURL.Query()
+		query.Set("mode", "rw")
+		query.Add("_pragma", "busy_timeout(5000)")
+		query.Add("_pragma", "foreign_keys(1)")
+		fileURL.RawQuery = query.Encode()
+		dsn = fileURL.String()
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // One service owns the file; serialize writes for the pilot.
 	s := &SQLiteStore{db: db}
-	if err := s.migrate(context.Background()); err != nil {
+	if migrate {
+		err = s.migrate(context.Background())
+	} else {
+		err = db.PingContext(context.Background())
+	}
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -230,16 +255,16 @@ func (s *SQLiteStore) RecordNonce(ctx context.Context, agent, nonce string, now 
 	}
 	// Request timestamps are accepted only within a short skew window, so old
 	// nonce rows can be pruned after one day without weakening replay defense.
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM request_nonces WHERE created_at < ?`, now.UTC().Add(-24*time.Hour).Format(time.RFC3339Nano))
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM request_nonces WHERE created_at < ?`, now.UTC().Add(-requestNonceRetention).Format(time.RFC3339Nano))
 	return nil
 }
 
 func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ?`, id, tenant))
 }
 
 func (s *SQLiteStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
 }
 
 func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
@@ -258,7 +283,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	}
 	defer tx.Rollback()
 	var existingJSON, existingTenant string
-	err = tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE id = ?`, e.ID).Scan(&existingJSON, &existingTenant)
+	err = tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE lower(id) = lower(?)`, e.ID).Scan(&existingJSON, &existingTenant)
 	if err == nil {
 		if existingTenant != tenant {
 			return DeliveredMessage{}, false, ErrMessageConflict
@@ -271,7 +296,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		if canonErr != nil || !bytes.Equal(oldCanon, canon) {
 			return DeliveredMessage{}, false, ErrMessageConflict
 		}
-		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, e.ID, tenant))
+		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ?`, e.ID, tenant))
 		if scanErr != nil {
 			return DeliveredMessage{}, false, scanErr
 		}
@@ -331,9 +356,9 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, messageTenant string
+	var storedID, recipient, messageTenant string
 	var acknowledged sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &messageTenant, &acknowledged)
+	err = tx.QueryRowContext(ctx, `SELECT id, recipient_id, tenant_id, acknowledged_at FROM messages WHERE lower(id) = lower(?)`, id).Scan(&storedID, &recipient, &messageTenant, &acknowledged)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
@@ -349,7 +374,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	duplicate := acknowledged.Valid
 	if !duplicate {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, storedID); err != nil {
 			return false, err
 		}
 	}
@@ -357,7 +382,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	if duplicate {
 		outcome, code = "duplicate", "already_acknowledged"
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: id, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: storedID, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

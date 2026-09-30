@@ -23,7 +23,7 @@ func TestWebhookFailureLogOmitsURLCredentials(t *testing.T) {
 	}
 	defer store.Close()
 
-	const rawURL = "https://operator-name:operator-password@hooks.example.test/events?token=query-secret"
+	const rawURL = "https://operator-name:operator-password@hooks.example.test/services/path-secret?token=query-secret"
 	requestedURL := make(chan string, 1)
 	notifier := WebhookNotifier{
 		URL: rawURL,
@@ -42,19 +42,19 @@ func TestWebhookFailureLogOmitsURLCredentials(t *testing.T) {
 
 	select {
 	case requested := <-requestedURL:
-		if !strings.Contains(requested, "token=query-secret") {
+		if !strings.Contains(requested, "/services/path-secret") || !strings.Contains(requested, "token=query-secret") {
 			t.Fatalf("credentialed webhook URL was not sent: %q", requested)
 		}
 	default:
 		t.Fatal("credentialed webhook URL was not sent")
 	}
 	logged := output.String()
-	for _, secret := range []string{"operator-name", "operator-password", "query-secret"} {
+	for _, secret := range []string{"operator-name", "operator-password", "path-secret", "query-secret"} {
 		if strings.Contains(logged, secret) {
 			t.Fatalf("webhook log disclosed %q: %s", secret, logged)
 		}
 	}
-	if !strings.Contains(logged, "https://hooks.example.test/events") {
+	if !strings.Contains(logged, "https://hooks.example.test") || strings.Contains(logged, "/services") {
 		t.Fatalf("webhook failure log omitted the safe endpoint: %s", logged)
 	}
 }
