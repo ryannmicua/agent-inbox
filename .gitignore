@@ -1,0 +1,9 @@
+/bin/
+/inboxd
+/agent-inbox
+.env
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.pub

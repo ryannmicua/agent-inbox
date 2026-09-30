@@ -1,0 +1,68 @@
+services:
+  notification-sink:
+    image: python:3.12-alpine
+    command: ["python3", "/app/webhook_sink.py"]
+    volumes:
+      - type: bind
+        source: ./scripts/webhook_sink.py
+        target: /app/webhook_sink.py
+        read_only: true
+    read_only: true
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=1)"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 2s
+    restart: unless-stopped
+
+  server:
+    image: agent-inbox:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      notification-sink:
+        condition: service_healthy
+    environment:
+      INBOX_LISTEN_ADDR: ":8080"
+      INBOX_STORAGE: ${INBOX_STORAGE:-sqlite}
+      INBOX_DB_PATH: /var/lib/agent-inbox/inbox.db
+      INBOX_DATABASE_URL: ${INBOX_DATABASE_URL:-}
+      INBOX_REGISTRY_PATH: /etc/agent-inbox/registry.json
+      # Local Compose uses the bundled sink; production must set a human-operated webhook.
+      INBOX_WEBHOOK_URL: ${INBOX_WEBHOOK_URL:-http://notification-sink:8081/notifications}
+      INBOX_RETRY_INTERVAL: ${INBOX_RETRY_INTERVAL:-30s}
+      INBOX_MAX_DOORBELL_ATTEMPTS: ${INBOX_MAX_DOORBELL_ATTEMPTS:-3}
+      INBOX_REQUEST_SKEW: ${INBOX_REQUEST_SKEW:-5m}
+    ports:
+      - "127.0.0.1:${INBOX_HOST_PORT:-8080}:8080"
+    volumes:
+      - inbox-data:/var/lib/agent-inbox
+      - type: bind
+        source: ${INBOX_REGISTRY_FILE:-./config/registry.json}
+        target: /etc/agent-inbox/registry.json
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/inboxd", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  inbox-data:
