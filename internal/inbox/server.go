@@ -222,6 +222,16 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		s.rejectSend(w, auth.agent, "invalid_id", "new message id must be a UUID v4, UUID v7, or ULID", messageID)
 		return
 	}
+	if e.Kind == "instruction" {
+		if !messageIDPattern.MatchString(e.TaskID) {
+			s.rejectSend(w, auth.agent, "invalid_task_id", "new task_id must be a UUID v4, UUID v7, or ULID", messageID)
+			return
+		}
+		if !messageIDPattern.MatchString(e.ThreadID) {
+			s.rejectSend(w, auth.agent, "invalid_thread_id", "new thread_id must be a UUID v4, UUID v7, or ULID", messageID)
+			return
+		}
+	}
 	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
 		s.rejectRecipient(w, auth.agent, "recipient_not_allowed", messageID)
 		return
@@ -248,7 +258,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		return
 	}
 	if recipient.TenantID != auth.agent.TenantID {
-		s.rejectSend(w, auth.agent, "wrong_tenant", "sender and recipient must belong to the same server-assigned tenant", messageID)
+		s.rejectRecipient(w, auth.agent, "wrong_tenant", messageID)
 		return
 	}
 	if e.ReplyTo != "" {
@@ -375,7 +385,7 @@ func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAg
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
-	case "secret_detected", "wrong_tenant", "recipient_not_allowed", "kind_not_allowed":
+	case "secret_detected", "recipient_not_allowed", "kind_not_allowed":
 		status = http.StatusForbidden
 	case "message_id_conflict":
 		status = http.StatusConflict

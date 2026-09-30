@@ -60,6 +60,27 @@ func TestConfiguredStoreRejectsPostgresqlAlias(t *testing.T) {
 	}
 }
 
+func TestOperatorCommandsRejectUnknownStorageBackend(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "inbox.db")
+	store, err := inbox.OpenSQLite(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INBOX_STORAGE", "postgresql")
+	t.Setenv("INBOX_DATABASE_URL", "postgres://example.invalid/inbox")
+	t.Setenv("INBOX_DB_PATH", databasePath)
+
+	if err := runAudit([]string{"--db", databasePath}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "unsupported storage backend") {
+		t.Fatalf("audit accepted an unknown backend and read the SQLite file: %v", err)
+	}
+	if err := runHealthcheck(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "unsupported storage backend") {
+		t.Fatalf("healthcheck accepted an unknown backend and opened SQLite: %v", err)
+	}
+}
+
 func TestHealthcheckPingsConfiguredStorageAndListener(t *testing.T) {
 	databasePath := filepath.Join(t.TempDir(), "inbox.db")
 	store, err := inbox.OpenSQLite(databasePath)

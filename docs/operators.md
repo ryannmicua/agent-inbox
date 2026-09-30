@@ -343,9 +343,10 @@ TLS-terminating proxy when requests cross an untrusted network.
 | `authentication_failed` | The request could not be authenticated. This response intentionally does not distinguish an unknown or revoked agent, unknown key, invalid request signature, stale timestamp, invalid nonce, replay, or registry/replay-store failure. Check the periodic authentication failure counts in `docker compose logs server`; confirm the agent, key ID, signature inputs, clocks, registry, and database configuration. |
 | `invalid_message_signature` | The HTTP request was authenticated, but the message envelope signature is invalid. Check that the envelope was signed by the active key and was not changed afterward. |
 | `request_too_large` | The request exceeds the 64 KiB limit. Reduce the request body. |
+| `invalid_task_id` / `invalid_thread_id` | A new instruction needs UUID v4, UUID v7, or ULID correlation IDs. Results should copy the exact task and thread IDs from the instruction they answer. |
 | `recipient_not_allowed` | The recipient is absent, inactive, or not in the sender's `allowed_recipients` list. The client response intentionally hides which condition applies; review the registry and server audit records. |
 | `kind_not_allowed` | The sender is not allowed to send that kind. Check the registry's `allowed_kinds`. |
-| `wrong_tenant` | Sender and recipient have different registry tenants. Do not accept a tenant from the caller; review the human-approved assignment. |
+| `wrong_tenant` (audit only) | The sender and recipient have different registry tenants. The client receives `recipient_not_allowed`; review the human-approved assignment. |
 | `secret_detected` | A payload, provenance field, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
 | `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |
 | `reply_to_required` / `invalid_reply_to` | A result must refer to a message addressed to its sender and reuse its task and thread IDs. The client response does not reveal whether a reference is missing, inaccessible, or mis-correlated; inspect the audit record for the internal reason. |

@@ -236,10 +236,15 @@ func openConfiguredStore(sqlitePath string) (inbox.Store, error) {
 }
 
 func openConfiguredStoreWithoutMigration(sqlitePath string) (inbox.Store, error) {
-	if envOr("INBOX_STORAGE", "sqlite") == "postgres" {
+	backend := envOr("INBOX_STORAGE", "sqlite")
+	switch backend {
+	case "sqlite":
+		return inbox.OpenSQLiteWithoutMigration(sqlitePath)
+	case "postgres":
 		return inbox.OpenPostgresWithoutMigration(os.Getenv("INBOX_DATABASE_URL"))
+	default:
+		return nil, fmt.Errorf("unsupported storage backend %q; use sqlite or postgres", backend)
 	}
-	return inbox.OpenSQLiteWithoutMigration(sqlitePath)
 }
 
 func configuredNotifier() (inbox.Notifier, error) {

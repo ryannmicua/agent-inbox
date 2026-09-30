@@ -47,6 +47,10 @@ omitted, the CLI generates a UUID v4. Previously stored UUID IDs remain usable
 for retries, replies, and acknowledgements. The CLI signs each retry as a new
 request with a fresh nonce.
 
+For a new instruction, `task_id` and `thread_id` must also use UUID v4, UUID v7,
+or ULID. When replying to a stored instruction, copy its task and thread IDs
+exactly so legacy correlations remain usable.
+
 Use lowercase UUIDs and uppercase ULIDs, and preserve the returned ID spelling
 when copying identifiers between commands.
 

@@ -458,22 +458,24 @@ func TestRecipientRejectionsDoNotRevealRegistryMembership(t *testing.T) {
 
 	cases := []struct {
 		name      string
+		sender    string
 		recipient string
 		auditCode string
 	}{
-		{name: "active but not allowed", recipient: "agent-c", auditCode: "recipient_not_allowed"},
-		{name: "unknown and not allowed", recipient: "ghost", auditCode: "recipient_not_allowed"},
-		{name: "inactive but allowed", recipient: "agent-revoked", auditCode: "unknown_recipient"},
+		{name: "active but not allowed", sender: "agent-c", recipient: "agent-b", auditCode: "recipient_not_allowed"},
+		{name: "unknown and not allowed", sender: "agent-b", recipient: "ghost", auditCode: "recipient_not_allowed"},
+		{name: "inactive but allowed", sender: "agent-b", recipient: "agent-revoked", auditCode: "unknown_recipient"},
+		{name: "allowed but in another tenant", sender: "agent-a", recipient: "agent-c", auditCode: "wrong_tenant"},
 	}
 	var wantBody string
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			envelope := s.envelope(t, "agent-b", test.recipient, "instruction", `{"value":1}`)
+			envelope := s.envelope(t, test.sender, test.recipient, "instruction", `{"value":1}`)
 			body, err := json.Marshal(envelope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			data, status, err := s.clients["agent-b"].Do(context.Background(), http.MethodPost, "/v1/messages", body)
+			data, status, err := s.clients[test.sender].Do(context.Background(), http.MethodPost, "/v1/messages", body)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -728,7 +730,7 @@ func TestRejectsUnsignedUnknownRevokedCrossTenantDisallowedKindAndSecrets(t *tes
 	cases := []struct{ name, sender, recipient, kind, payload, want string }{
 		{"unknown", "ghost", "agent-b", "instruction", `{"x":1}`, "authentication_failed"},
 		{"revoked", "agent-revoked", "agent-a", "instruction", `{"x":1}`, "authentication_failed"},
-		{"cross-tenant", "agent-c", "agent-a", "instruction", `{"x":1}`, "wrong_tenant"},
+		{"cross-tenant", "agent-c", "agent-a", "instruction", `{"x":1}`, "recipient_not_allowed"},
 		{"recipient-not-allowed", "agent-c", "agent-b", "instruction", `{"x":1}`, "recipient_not_allowed"},
 		{"disallowed-kind", "agent-a", "agent-b", "status", `{"x":1}`, "kind_not_allowed"},
 		{"secret", "agent-a", "agent-b", "instruction", `{"token":"github_pat_123456789012345678901234567890"}`, "secret_detected"},
@@ -867,7 +869,7 @@ func TestNotificationFailuresAreAuditedWithoutChangingResponses(t *testing.T) {
 
 	rejected := s.envelope(t, "agent-a", "agent-c", "instruction", `{"x":2}`)
 	_, status, apiErr = s.send(t, rejected, "agent-a")
-	if apiErr == nil || apiErr.Error.Code != "wrong_tenant" || status != http.StatusForbidden {
+	if apiErr == nil || apiErr.Error.Code != "recipient_not_allowed" || status != http.StatusForbidden {
 		t.Fatalf("notification failure changed rejected send response: HTTP %d err=%+v", status, apiErr)
 	}
 
@@ -1277,6 +1279,31 @@ func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 		if _, status, apiErr := s.send(t, envelope, "agent-a"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_id" {
 			t.Fatalf("unsupported message ID %q was accepted: HTTP %d %+v", id, status, apiErr)
 		}
+	}
+}
+
+func TestNewInstructionCorrelationIDsUseCurrentMessageFormat(t *testing.T) {
+	for _, field := range []string{"task_id", "thread_id"} {
+		t.Run(field, func(t *testing.T) {
+			s := newTestSystem(t)
+			envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"new"}`)
+			legacyUUID := "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+			if field == "task_id" {
+				envelope.TaskID = legacyUUID
+			} else {
+				envelope.ThreadID = legacyUUID
+			}
+			if err := SignEnvelope(&envelope, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			_, status, apiErr := s.send(t, envelope, "agent-a")
+			if status != http.StatusBadRequest || apiErr == nil || apiErr.Error.Code != "invalid_"+field {
+				t.Fatalf("new instruction accepted legacy %s: HTTP %d %+v", field, status, apiErr)
+			}
+			if messages := s.poll(t, "agent-b").Messages; len(messages) != 0 {
+				t.Fatalf("invalid instruction correlation was persisted: %+v", messages)
+			}
+		})
 	}
 }
 
