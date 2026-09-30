@@ -26,6 +26,30 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+type EventStreamConnectError struct {
+	Err error
+}
+
+func (e *EventStreamConnectError) Error() string {
+	return "connect to event stream: " + e.Err.Error()
+}
+
+func (e *EventStreamConnectError) Unwrap() error {
+	return e.Err
+}
+
+type SSEOutputError struct {
+	Err error
+}
+
+func (e *SSEOutputError) Error() string {
+	return "write event stream output: " + e.Err.Error()
+}
+
+func (e *SSEOutputError) Unwrap() error {
+	return e.Err
+}
+
 const maxResponseBytes = 100*(MaxRequestBytes*6+1024) + 1024
 
 func LoadPrivateKey(path string) (ed25519.PrivateKey, error) {
@@ -129,7 +153,11 @@ func (c *Client) OpenEvents(ctx context.Context) (*http.Response, error) {
 	}
 	c.setHeaders(req, timestamp, nonce, base64.StdEncoding.EncodeToString(signature))
 	client := noRedirectClient(&http.Client{Timeout: 0})
-	return client.Do(req)
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, &EventStreamConnectError{Err: err}
+	}
+	return response, nil
 }
 
 func noRedirectClient(client *http.Client) *http.Client {
@@ -187,7 +215,7 @@ func CopySSE(ctx context.Context, response *http.Response, output io.Writer) err
 		}
 		if line == "" && len(dataLines) > 0 {
 			if _, err := fmt.Fprintln(output, strings.Join(dataLines, "")); err != nil {
-				return err
+				return &SSEOutputError{Err: err}
 			}
 			dataLines = dataLines[:0]
 		}

@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -88,6 +89,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		for {
 			response, err := client.OpenEvents(ctx)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				var connectErr *inbox.EventStreamConnectError
+				if !errors.As(err, &connectErr) || !retryableNetworkError(connectErr.Err) {
+					return err
+				}
+				fmt.Fprintln(stderr, "doorbell connection failed; reconnecting:", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
@@ -99,12 +108,36 @@ func run(args []string, stdout, stderr io.Writer) error {
 				return nil
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
+				var outputErr *inbox.SSEOutputError
+				if errors.As(err, &outputErr) || !retryableStreamReadError(err) {
+					return err
+				}
 				fmt.Fprintln(stderr, "doorbell stream disconnected; reconnecting:", err)
 			}
 			time.Sleep(2 * time.Second)
 		}
 	}
 	return nil
+}
+
+func retryableNetworkError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.IsTimeout || dnsErr.IsTemporary
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial" || opErr.Op == "read" || opErr.Op == "write"
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+}
+
+func retryableStreamReadError(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) || retryableNetworkError(err)
 }
 
 func runKeygen(args []string, stdout io.Writer) error {

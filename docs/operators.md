@@ -84,6 +84,14 @@ notification sink. The example PostgreSQL service is suitable for a pilot on
 one host; production deployments should use their managed or separately
 operated PostgreSQL service and a protected `INBOX_DATABASE_URL`.
 
+The Compose fallback inserts `POSTGRES_PASSWORD` into a PostgreSQL URL. Keep
+that password URI-safe, or set `INBOX_DATABASE_URL` explicitly when it contains
+reserved URL characters such as `/`, `?`, `#`, `%`, or `@`. Keep the raw
+password in `POSTGRES_PASSWORD` for the database container and percent-encode
+it only in the URL's password component.
+For example, the raw password `p/a?b#c%d` needs this server URL:
+`postgres://agent_inbox:p%2Fa%3Fb%23c%25d@postgres:5432/agent_inbox?sslmode=disable`.
+
 Each webhook event includes its event name, timestamp, message ID, agent IDs,
 tenant, kind, or rejection code as applicable. It never includes message
 payloads or key material. Events include `message.accepted`,
@@ -371,6 +379,14 @@ export INBOX_WEBHOOK_URL='https://notify.example.com/agent-inbox'
 docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 docker compose -f compose.yaml -f compose.postgres.yaml ps
 docker compose -f compose.yaml -f compose.postgres.yaml exec -T server inboxd healthcheck
+```
+
+If `POSTGRES_PASSWORD` contains reserved URL characters, also export
+`INBOX_DATABASE_URL` using the percent-encoded password, for example:
+
+```sh
+export POSTGRES_PASSWORD='p/a?b#c%d'
+export INBOX_DATABASE_URL='postgres://agent_inbox:p%2Fa%3Fb%23c%25d@postgres:5432/agent_inbox?sslmode=disable'
 ```
 
 For production, use a separately managed PostgreSQL service and set

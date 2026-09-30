@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ryannmicua/agent-inbox/internal/inbox"
@@ -79,6 +81,51 @@ func TestRequestJSONReportsRedirectAsError(t *testing.T) {
 		t.Fatal("CLI forwarded signed request data to the redirect target")
 	default:
 	}
+}
+
+func TestWaitReturnsInvalidServerURL(t *testing.T) {
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	if err := inbox.WriteKeyPair(privateKey, filepath.Join(t.TempDir(), "agent.pub")); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"wait", "--server", "not-a-url", "--agent", "agent-a", "--key", privateKey}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "protocol scheme") {
+		t.Fatalf("wait did not return the invalid URL error: %v", err)
+	}
+}
+
+func TestWaitRetriesStreamEOFAndReturnsOutputError(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: bell\n\n")
+	}))
+	defer server.Close()
+
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	if err := inbox.WriteKeyPair(privateKey, filepath.Join(t.TempDir(), "agent.pub")); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("stdout closed")
+	err := run([]string{"wait", "--server", server.URL, "--agent", "agent-a", "--key", privateKey}, errorWriter{err: writeErr}, io.Discard)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("wait did not return the stdout failure: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("wait made %d stream requests, want 2", got)
+	}
+}
+
+type errorWriter struct {
+	err error
+}
+
+func (w errorWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }
 
 func TestSendWithoutIDGeneratesUUIDv4(t *testing.T) {
