@@ -106,6 +106,7 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !hasRequestSignature(r) {
 		s.preAuth.unsigned.Add(1)
 		writeAuthenticationFailure(w)
@@ -483,7 +484,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, auth authContext
 	ch, remove := s.hub.subscribe(auth.agent.ID)
 	defer remove()
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
