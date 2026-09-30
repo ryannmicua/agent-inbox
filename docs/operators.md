@@ -225,6 +225,9 @@ The signed JSON API is:
 | `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true}`; the server records the acknowledgement time. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
 
+The service marks every HTTP response `Cache-Control: no-store`; SSE responses
+also retain the `no-cache` directive. Preserve these headers through any proxy.
+
 Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 `X-Request-Nonce`, and `X-Request-Signature` headers. The signature covers the
 exact path and query, so reverse proxies must preserve them. Rejected
