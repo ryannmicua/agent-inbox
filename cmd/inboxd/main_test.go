@@ -20,6 +20,23 @@ func TestServerStartupRequiresWebhook(t *testing.T) {
 	}
 }
 
+func TestStartupRejectsRetryIntervalsBelowOneSecond(t *testing.T) {
+	for _, value := range []string{"500ms", "0", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("INBOX_RETRY_INTERVAL", value)
+			t.Setenv("INBOX_WEBHOOK_URL", "")
+			if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "INBOX_RETRY_INTERVAL must be at least 1s") {
+				t.Fatalf("startup did not clearly reject retry interval %q: %v", value, err)
+			}
+		})
+	}
+	t.Setenv("INBOX_RETRY_INTERVAL", "1s")
+	t.Setenv("INBOX_WEBHOOK_URL", "")
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "INBOX_WEBHOOK_URL is required") {
+		t.Fatalf("startup did not accept the 1s minimum before checking other settings: %v", err)
+	}
+}
+
 func TestConfiguredNotifierEnforcesWebhookTransportPolicy(t *testing.T) {
 	for _, webhook := range []string{
 		"", "not-a-url", "ftp://notify.example.com/hook",

@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	HeaderAgent     = "X-Agent-ID"
-	HeaderKeyID     = "X-Key-ID"
-	HeaderTimestamp = "X-Request-Timestamp"
-	HeaderNonce     = "X-Request-Nonce"
-	HeaderSignature = "X-Request-Signature"
+	HeaderAgent          = "X-Agent-ID"
+	HeaderKeyID          = "X-Key-ID"
+	HeaderTimestamp      = "X-Request-Timestamp"
+	HeaderNonce          = "X-Request-Nonce"
+	HeaderSignature      = "X-Request-Signature"
+	MinimumRetryInterval = time.Second
 )
 
 var (
@@ -89,8 +90,11 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 	if config.RequestSkew > requestNonceRetention/2 {
 		return nil, errors.New("request skew cannot exceed half the replay nonce retention window")
 	}
-	if config.RetryInterval <= 0 {
+	if config.RetryInterval == 0 {
 		config.RetryInterval = 30 * time.Second
+	}
+	if config.RetryInterval < MinimumRetryInterval {
+		return nil, errors.New("retry interval must be at least 1s")
 	}
 	if config.MaxDoorbellAttempts <= 0 {
 		config.MaxDoorbellAttempts = 3
@@ -379,6 +383,9 @@ func (s *Server) rejectReply(w http.ResponseWriter, agent RegistryAgent, reason,
 }
 
 func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAgent, code, auditCode, message, messageID string) {
+	if !messageIDPattern.MatchString(messageID) {
+		messageID = ""
+	}
 	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
 		log.Printf("record rejected send by %s (%s): %v", agent.ID, auditCode, err)
 	}
@@ -564,7 +571,7 @@ func (s *Server) recordAuthenticationFailure(reason string) {
 }
 
 func (s *Server) RunNotifications(ctx context.Context) {
-	tickerInterval := min(max(s.config.RetryInterval/2, time.Nanosecond), 10*time.Second)
+	tickerInterval := min(s.config.RetryInterval/2, 10*time.Second)
 	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 	for {
@@ -645,10 +652,14 @@ func (s *Server) notify(event Notification) {
 		} else if errors.Is(err, context.Canceled) {
 			class = "canceled"
 		}
+		detail := map[string]any{"event": event.Event, "error_class": class}
+		if event.MessageID != "" {
+			detail["message_id"] = event.MessageID
+		}
 		if auditErr := s.store.AppendAudit(context.Background(), AuditRecord{
 			Action: "notification.failed", ActorID: actor, SubjectID: event.MessageID,
 			TenantID: event.TenantID, Outcome: "failed", Code: class,
-			Detail: map[string]any{"event": event.Event, "message_id": event.MessageID, "error_class": class},
+			Detail: detail,
 		}); auditErr != nil {
 			log.Printf("record notification failure for %s: %v", event.Event, auditErr)
 		}

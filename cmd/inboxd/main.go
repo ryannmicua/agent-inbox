@@ -46,6 +46,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	listen := envOr("INBOX_LISTEN_ADDR", ":8080")
 	dbPath := envOr("INBOX_DB_PATH", "/var/lib/agent-inbox/inbox.db")
 	registryPath := envOr("INBOX_REGISTRY_PATH", "/etc/agent-inbox/registry.json")
+	retryInterval, err := retryIntervalEnv(inbox.DefaultServerConfig().RetryInterval)
+	if err != nil {
+		return err
+	}
 	notifier, err := configuredNotifier()
 	if err != nil {
 		return err
@@ -61,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	config := inbox.DefaultServerConfig()
 	config.RequestSkew = durationEnv("INBOX_REQUEST_SKEW", config.RequestSkew)
-	config.RetryInterval = durationEnv("INBOX_RETRY_INTERVAL", config.RetryInterval)
+	config.RetryInterval = retryInterval
 	config.MaxDoorbellAttempts = intEnv("INBOX_MAX_DOORBELL_ATTEMPTS", config.MaxDoorbellAttempts)
 	service, err := inbox.NewServer(store, registry, notifier, config)
 	if err != nil {
@@ -204,6 +208,21 @@ func durationEnv(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func retryIntervalEnv(fallback time.Duration) (time.Duration, error) {
+	value := os.Getenv("INBOX_RETRY_INTERVAL")
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("INBOX_RETRY_INTERVAL must be a valid duration: %w", err)
+	}
+	if parsed < inbox.MinimumRetryInterval {
+		return 0, fmt.Errorf("INBOX_RETRY_INTERVAL must be at least %s", inbox.MinimumRetryInterval)
+	}
+	return parsed, nil
 }
 
 func intEnv(name string, fallback int) int {

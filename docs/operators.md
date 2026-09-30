@@ -71,7 +71,7 @@ its test volume.
 | `INBOX_DATABASE_URL` | unset | PostgreSQL connection URL; required when `INBOX_STORAGE=postgres`. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
 | `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Webhook for consequential human-visible events. Remote hosts require HTTPS; HTTP is limited to loopback IPs, `localhost`, and single-label hostnames. Required at startup; use a human-operated endpoint in production. |
-| `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
+| `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax with a minimum of `1s`. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. Tenant reassignment suppresses rings but does not cancel the schedule. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time; maximum `12h` to match nonce retention. Accepts Go duration syntax. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
@@ -222,7 +222,9 @@ Signed API requests carry `X-Agent-ID`, `X-Key-ID`, `X-Request-Timestamp`,
 exact path and query, so reverse proxies must preserve them. Rejected
 pre-authentication requests do not create audit rows or webhook events. Bounded
 in-memory counters are available only in the periodic operator log, once per
-minute when nonzero; the counters reset when the server restarts.
+minute when nonzero; the counters reset when the server restarts. They aggregate
+unauthenticated rejections because row-by-row audit entries would let
+unauthenticated requests grow the audit store without bound.
 
 The sender's `asserted_authority` is stored as an assertion only. A receiver
 must derive its own authority from its own operating context and must never

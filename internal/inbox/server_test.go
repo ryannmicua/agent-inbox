@@ -1107,12 +1107,59 @@ func TestUnsignedRequestRejectedBeforeBodyRead(t *testing.T) {
 	}
 }
 
-func TestRunNotificationsAcceptsNanosecondRetryInterval(t *testing.T) {
+func TestNewServerRequiresMinimumRetryInterval(t *testing.T) {
 	s := newTestSystem(t)
-	s.service.config.RetryInterval = time.Nanosecond
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	s.service.RunNotifications(ctx)
+	config := DefaultServerConfig()
+	config.RetryInterval = MinimumRetryInterval - time.Nanosecond
+	if _, err := NewServer(s.store, FileRegistry{Path: s.registryFile}, s.notifier, config); err == nil || !strings.Contains(err.Error(), "at least 1s") {
+		t.Fatalf("server accepted a subsecond retry interval: %v", err)
+	}
+	config.RetryInterval = MinimumRetryInterval
+	if _, err := NewServer(s.store, FileRegistry{Path: s.registryFile}, s.notifier, config); err != nil {
+		t.Fatalf("server rejected the minimum retry interval: %v", err)
+	}
+}
+
+func TestRejectedInvalidMessageIDIsOmittedFromNotificationAndFailureAudit(t *testing.T) {
+	s := newTestSystem(t)
+	notifier := &failingNotifier{err: errors.New("temporary transport failure")}
+	s.service.notifier = notifier
+	tokenID := "github_pat_123456789012345678901234567890"
+	envelope := s.envelope(t, "agent-a", "agent-b", "instruction", `{"x":1}`)
+	envelope.ID = tokenID
+	if err := SignEnvelope(&envelope, s.agents["agent-a"].private); err != nil {
+		t.Fatal(err)
+	}
+	_, status, apiErr := s.send(t, envelope, "agent-a")
+	if status != http.StatusBadRequest || apiErr == nil || apiErr.Error.Code != "invalid_id" {
+		t.Fatalf("token-like message ID did not receive invalid_id: HTTP %d %+v", status, apiErr)
+	}
+	if len(notifier.events) != 1 || notifier.events[0].Event != "message.rejected" || notifier.events[0].MessageID != "" {
+		t.Fatalf("rejection notification retained the unvalidated ID: %+v", notifier.events)
+	}
+	notificationJSON, err := json.Marshal(notifier.events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(notificationJSON), tokenID) || strings.Contains(string(notificationJSON), "message_id") {
+		t.Fatalf("serialized rejection notification exposed the unvalidated ID: %s", notificationJSON)
+	}
+	entries, err := s.store.AuditEntries(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Action == "notification.failed" && (entry.SubjectID != "" || entry.Detail["message_id"] != nil) {
+			t.Fatalf("notification failure audit retained the unvalidated ID: %+v", entry)
+		}
+	}
+	auditJSON, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(auditJSON), tokenID) {
+		t.Fatalf("audit log exposed the unvalidated ID: %s", auditJSON)
+	}
 }
 
 func TestMessageSignatureAndReplyCorrelationAreVerified(t *testing.T) {
