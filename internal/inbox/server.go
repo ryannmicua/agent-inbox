@@ -262,7 +262,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 			}
 			return
 		}
-		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || !strings.EqualFold(original.ThreadID, e.ThreadID) || !strings.EqualFold(original.TaskID, e.TaskID) {
+		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
 			s.rejectReply(w, auth.agent, "reply_correlation_mismatch", messageID)
 			return
 		}

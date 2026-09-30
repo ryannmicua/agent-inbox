@@ -15,7 +15,9 @@ notification events; production must configure a human-operated webhook.
   [`config/registry.json`](../config/registry.json).
 - A reachable webhook URL for human-visible notifications. The local Compose
   default is the bundled notification sink; production must set
-  `INBOX_WEBHOOK_URL` to a human-operated endpoint.
+  `INBOX_WEBHOOK_URL` to a human-operated endpoint. Remote webhooks must use
+  HTTPS; plain HTTP is limited to loopback IPs, `localhost`, and single-label
+  hostnames such as the Compose service name `notification-sink`.
 - A TLS-terminating reverse proxy for use outside a trusted local test. The
   service itself listens on plain HTTP and does not manage certificates.
 
@@ -68,7 +70,7 @@ its test volume.
 | `INBOX_DB_PATH` | `/var/lib/agent-inbox/inbox.db` | SQLite database path. |
 | `INBOX_DATABASE_URL` | unset | PostgreSQL connection URL; required when `INBOX_STORAGE=postgres`. |
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
-| `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Generic HTTP webhook for consequential human-visible events. Required at startup; use a human-operated endpoint in production. |
+| `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Webhook for consequential human-visible events. Remote hosts require HTTPS; HTTP is limited to loopback IPs, `localhost`, and single-label hostnames. Required at startup; use a human-operated endpoint in production. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. Tenant reassignment suppresses rings but does not cancel the schedule. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time; maximum `12h` to match nonce retention. Accepts Go duration syntax. |

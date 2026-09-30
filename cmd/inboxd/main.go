@@ -10,10 +10,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -249,7 +251,24 @@ func configuredNotifier() (inbox.Notifier, error) {
 	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, errors.New("INBOX_WEBHOOK_URL must be an absolute HTTP or HTTPS URL")
 	}
+	if parsed.Scheme == "http" && !allowsInsecureWebhookHost(parsed.Hostname()) {
+		return nil, errors.New("INBOX_WEBHOOK_URL must use HTTPS for remote webhook hosts")
+	}
 	return inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, nil
+}
+
+func allowsInsecureWebhookHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if address, err := netip.ParseAddr(host); err == nil {
+		return address.Unmap().IsLoopback()
+	}
+	return !strings.ContainsAny(host, ".:%")
 }
 
 func usage(w io.Writer) {

@@ -20,20 +20,35 @@ func TestServerStartupRequiresWebhook(t *testing.T) {
 	}
 }
 
-func TestConfiguredNotifierRequiresAbsoluteHTTPURL(t *testing.T) {
-	for _, webhook := range []string{"", "not-a-url", "ftp://notify.example.com/hook"} {
+func TestConfiguredNotifierEnforcesWebhookTransportPolicy(t *testing.T) {
+	for _, webhook := range []string{
+		"", "not-a-url", "ftp://notify.example.com/hook",
+		"http://hooks.example.com/events", "http://192.0.2.1/events", "http://[2001:4860:4860::8888]/events",
+	} {
 		t.Setenv("INBOX_WEBHOOK_URL", webhook)
 		if _, err := configuredNotifier(); err == nil {
 			t.Fatalf("configured notifier accepted URL %q", webhook)
 		}
 	}
-	t.Setenv("INBOX_WEBHOOK_URL", "http://notification-sink:8081/notifications")
-	notifier, err := configuredNotifier()
-	if err != nil {
-		t.Fatal(err)
+	for _, webhook := range []string{
+		"http://127.0.0.1:8081/notifications",
+		"http://[::1]:8081/notifications",
+		"http://localhost:8081/notifications",
+		"http://notification-sink:8081/notifications",
+		"https://hooks.example.com/events",
+	} {
+		t.Setenv("INBOX_WEBHOOK_URL", webhook)
+		notifier, err := configuredNotifier()
+		if err != nil {
+			t.Fatalf("configured notifier rejected URL %q: %v", webhook, err)
+		}
+		if _, ok := notifier.(inbox.WebhookNotifier); !ok {
+			t.Fatalf("configured notifier selected %T, want inbox.WebhookNotifier", notifier)
+		}
 	}
-	if _, ok := notifier.(inbox.WebhookNotifier); !ok {
-		t.Fatalf("configured notifier selected %T, want inbox.WebhookNotifier", notifier)
+	t.Setenv("INBOX_WEBHOOK_URL", "http://hooks.example.com/events")
+	if _, err := configuredNotifier(); err == nil || !strings.Contains(err.Error(), "must use HTTPS for remote webhook hosts") {
+		t.Fatalf("remote cleartext webhook error was unclear: %v", err)
 	}
 }
 

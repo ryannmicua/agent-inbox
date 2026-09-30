@@ -260,11 +260,11 @@ func (s *SQLiteStore) RecordNonce(ctx context.Context, agent, nonce string, now 
 }
 
 func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ?`, id, tenant))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, id, tenant))
 }
 
 func (s *SQLiteStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
 }
 
 func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
@@ -283,7 +283,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	}
 	defer tx.Rollback()
 	var existingJSON, existingTenant string
-	err = tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE lower(id) = lower(?)`, e.ID).Scan(&existingJSON, &existingTenant)
+	err = tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id FROM messages WHERE id = ?`, e.ID).Scan(&existingJSON, &existingTenant)
 	if err == nil {
 		if existingTenant != tenant {
 			return DeliveredMessage{}, false, ErrMessageConflict
@@ -296,7 +296,7 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		if canonErr != nil || !bytes.Equal(oldCanon, canon) {
 			return DeliveredMessage{}, false, ErrMessageConflict
 		}
-		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE lower(id) = lower(?) AND tenant_id = ?`, e.ID, tenant))
+		message, scanErr := scanMessage(tx.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ?`, e.ID, tenant))
 		if scanErr != nil {
 			return DeliveredMessage{}, false, scanErr
 		}
@@ -356,9 +356,9 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 		return false, err
 	}
 	defer tx.Rollback()
-	var storedID, recipient, messageTenant string
+	var recipient, messageTenant string
 	var acknowledged sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT id, recipient_id, tenant_id, acknowledged_at FROM messages WHERE lower(id) = lower(?)`, id).Scan(&storedID, &recipient, &messageTenant, &acknowledged)
+	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &messageTenant, &acknowledged)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
@@ -374,7 +374,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	duplicate := acknowledged.Valid
 	if !duplicate {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, storedID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, id); err != nil {
 			return false, err
 		}
 	}
@@ -382,7 +382,7 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	if duplicate {
 		outcome, code = "duplicate", "already_acknowledged"
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: storedID, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "ack", ActorID: agent, SubjectID: id, TenantID: tenant, Outcome: outcome, Code: code}, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

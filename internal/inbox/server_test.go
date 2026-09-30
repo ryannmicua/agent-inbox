@@ -1280,12 +1280,12 @@ func TestMessageIDsAcceptUUIDv4UUIDv7AndULID(t *testing.T) {
 	}
 }
 
-func TestMessageIdentifierCaseIsConsistentAcrossOperations(t *testing.T) {
+func TestMessageIdentifiersRequireExactStoredSpelling(t *testing.T) {
 	ids := []string{"01890f3e-7b12-7abc-8def-0123456789ab", "01ARZ3NDEKTSV4RRFFQ69G5FAV"}
 	for _, id := range ids {
 		t.Run(id, func(t *testing.T) {
 			s := newTestSystem(t)
-			instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"case":"stable"}`)
+			instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"identity":"exact"}`)
 			instruction.ID, instruction.TaskID, instruction.ThreadID = id, id, id
 			if err := SignEnvelope(&instruction, s.agents["agent-a"].private); err != nil {
 				t.Fatal(err)
@@ -1295,35 +1295,76 @@ func TestMessageIdentifierCaseIsConsistentAcrossOperations(t *testing.T) {
 				t.Fatalf("canonical identifier was rejected: HTTP %d %+v", status, apiErr)
 			}
 
+			aliasedID := instruction
+			aliasedID.ID = toggleIdentifierCase(aliasedID.ID)
+			if err := SignEnvelope(&aliasedID, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			if _, status, apiErr := s.send(t, aliasedID, "agent-a"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_id" {
+				t.Fatalf("case-changed message ID matched the stored row: HTTP %d %+v", status, apiErr)
+			}
+
+			aliasedCorrelation := instruction
+			aliasedCorrelation.TaskID = toggleIdentifierCase(aliasedCorrelation.TaskID)
+			if err := SignEnvelope(&aliasedCorrelation, s.agents["agent-a"].private); err != nil {
+				t.Fatal(err)
+			}
+			if _, status, apiErr := s.send(t, aliasedCorrelation, "agent-a"); apiErr == nil || status != http.StatusConflict || apiErr.Error.Code != "message_id_conflict" {
+				t.Fatalf("case-changed task ID matched the stored retry: HTTP %d %+v", status, apiErr)
+			}
+
+			result := s.envelope(t, "agent-b", "agent-a", "result", `{"case":"reply"}`)
+			result.TaskID, result.ThreadID, result.ReplyTo = id, id, toggleIdentifierCase(id)
+			if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
+				t.Fatal(err)
+			}
+			if _, status, apiErr := s.send(t, result, "agent-b"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_reply_to" {
+				t.Fatalf("case-changed reply ID matched the stored row: HTTP %d %+v", status, apiErr)
+			}
+			if status, code := s.ack(t, "agent-b", toggleIdentifierCase(id), true); status != http.StatusNotFound || code != "message_not_found" {
+				t.Fatalf("case-changed ack ID matched the stored row: HTTP %d %q", status, code)
+			}
+			for _, field := range []string{"task_id", "thread_id"} {
+				aliasedReply := s.envelope(t, "agent-b", "agent-a", "result", `{"case":"reply"}`)
+				aliasedReply.TaskID, aliasedReply.ThreadID, aliasedReply.ReplyTo = id, id, id
+				if field == "task_id" {
+					aliasedReply.TaskID = toggleIdentifierCase(id)
+				} else {
+					aliasedReply.ThreadID = toggleIdentifierCase(id)
+				}
+				if err := SignEnvelope(&aliasedReply, s.agents["agent-b"].private); err != nil {
+					t.Fatal(err)
+				}
+				if _, status, apiErr := s.send(t, aliasedReply, "agent-b"); apiErr == nil || status != http.StatusBadRequest || apiErr.Error.Code != "invalid_reply_to" {
+					t.Fatalf("case-changed %s matched the stored reply correlation: HTTP %d %+v", field, status, apiErr)
+				}
+			}
+
 			retry := instruction
-			retry.ID = toggleIdentifierCase(retry.ID)
-			retry.TaskID = toggleIdentifierCase(retry.TaskID)
-			retry.ThreadID = toggleIdentifierCase(retry.ThreadID)
 			retry.CreatedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
 			if err := SignEnvelope(&retry, s.agents["agent-a"].private); err != nil {
 				t.Fatal(err)
 			}
 			duplicate, status, apiErr := s.send(t, retry, "agent-a")
 			if apiErr != nil || status != http.StatusOK || duplicate.Sequence != stored.Sequence {
-				t.Fatalf("case-changed retry did not return original message: HTTP %d %+v %+v", status, apiErr, duplicate)
+				t.Fatalf("exact-spelling retry did not return the original message: HTTP %d %+v %+v", status, apiErr, duplicate)
 			}
 
-			result := s.envelope(t, "agent-b", "agent-a", "result", `{"case":"reply"}`)
-			result.TaskID, result.ThreadID, result.ReplyTo = toggleIdentifierCase(id), toggleIdentifierCase(id), toggleIdentifierCase(id)
+			result.ReplyTo = id
 			if err := SignEnvelope(&result, s.agents["agent-b"].private); err != nil {
 				t.Fatal(err)
 			}
 			if _, status, apiErr := s.send(t, result, "agent-b"); apiErr != nil || status != http.StatusCreated {
-				t.Fatalf("case-changed reply reference was rejected: HTTP %d %+v", status, apiErr)
+				t.Fatalf("exact-spelling reply reference was rejected: HTTP %d %+v", status, apiErr)
 			}
-			if status, code := s.ack(t, "agent-b", toggleIdentifierCase(id), true); status != http.StatusOK || code != "" {
-				t.Fatalf("case-changed ack reference was rejected: HTTP %d %q", status, code)
+			if status, code := s.ack(t, "agent-b", id, true); status != http.StatusOK || code != "" {
+				t.Fatalf("exact-spelling ack reference was rejected: HTTP %d %q", status, code)
 			}
 			if got := s.poll(t, "agent-b"); len(got.Messages) != 0 {
 				t.Fatalf("acknowledged message remained visible: %+v", got.Messages)
 			}
 			if got := s.poll(t, "agent-a"); len(got.Messages) != 1 || got.Messages[0].ID != result.ID {
-				t.Fatalf("case-changed identifiers created inconsistent delivery: %+v", got.Messages)
+				t.Fatalf("exact-spelling identifiers created inconsistent delivery: %+v", got.Messages)
 			}
 		})
 	}
@@ -1352,7 +1393,7 @@ func toggleIdentifierCase(id string) string {
 
 func TestLegacyStoredMessageRemainsRetryableAckableAndReplyable(t *testing.T) {
 	s := newTestSystem(t)
-	legacyID := "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+	legacyID := "f81D4fae-7dec-11d0-a765-00a0c91e6bf6"
 	instruction := s.envelope(t, "agent-a", "agent-b", "instruction", `{"task":"legacy"}`)
 	instruction.ID = legacyID
 	instruction.TaskID = legacyID
