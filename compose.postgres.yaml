@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   server:
-    image: agent-inbox:local
+    image: ${INBOX_IMAGE:-agent-inbox:local}
     build:
       context: .
       dockerfile: Dockerfile
