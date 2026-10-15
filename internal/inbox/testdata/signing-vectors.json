@@ -1,0 +1,201 @@
+{
+  "description": "agent-inbox signing test vectors. Rebuild with: go test ./internal/inbox -run TestSigningVectors -update-vectors. The key is a published test key; never register it.",
+  "seed_base64": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+  "private_key_file": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkIhUvjRm3kdJEUyQuFfLqtst8/6e2pe0wCXlg4GmIHbEg==",
+  "public_key_base64": "IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=",
+  "envelopes": [
+    {
+      "name": "minimal-instruction",
+      "note": "Empty object payload, no artifacts. Optional fields are omitted from the canonical form.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "instruction",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "payload": {},
+        "artifacts": [],
+        "signature": "NkStSOH5ta0FWxwhPKQv3Ve1Ey927tEgqJM8zOd2fU4fElTkH+/PHkWNgXZSOr6HGaA4OWtO4J7ya+0siWCMDw=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"instruction\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"payload\":{},\"artifacts\":[]}",
+      "signature": "NkStSOH5ta0FWxwhPKQv3Ve1Ey927tEgqJM8zOd2fU4fElTkH+/PHkWNgXZSOr6HGaA4OWtO4J7ya+0siWCMDw=="
+    },
+    {
+      "name": "html-escaping",
+      "note": "Go escapes <, > and & inside strings as \\u003c, \\u003e and \\u0026. Signing plain JSON text here fails.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1c",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "instruction",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "payload": {
+          "note": "x < y & z > w"
+        },
+        "artifacts": [],
+        "signature": "sZNAsfIboHjnbxM8a+RwOLayWUVuD1rP0lAq3iL34knI6RCjltYh2Frq5nYhlIHeXLwaEB6HBFsK6lAV2Su3Bw=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1c\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"instruction\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"payload\":{\"note\":\"x \\u003c y \\u0026 z \\u003e w\"},\"artifacts\":[]}",
+      "signature": "sZNAsfIboHjnbxM8a+RwOLayWUVuD1rP0lAq3iL34knI6RCjltYh2Frq5nYhlIHeXLwaEB6HBFsK6lAV2Su3Bw=="
+    },
+    {
+      "name": "unicode",
+      "note": "Non-ASCII stays raw UTF-8; U+2028 and U+2029 are escaped.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1d",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "instruction",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "payload": {
+          "text": "café – naïve   next   end"
+        },
+        "artifacts": [],
+        "signature": "N/pEcfBm9gpfuxUq6HntRMTCvqIzE8OxIBDUPMoJsPJEDeVObPs86mrMAb7LUT3YoTEqZtZxF3UTmXJ97TunAA=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1d\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"instruction\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"payload\":{\"text\":\"café – naïve \\u2028 next \\u2029 end\"},\"artifacts\":[]}",
+      "signature": "N/pEcfBm9gpfuxUq6HntRMTCvqIzE8OxIBDUPMoJsPJEDeVObPs86mrMAb7LUT3YoTEqZtZxF3UTmXJ97TunAA=="
+    },
+    {
+      "name": "nested-keys-and-numbers",
+      "note": "Object keys are sorted at every depth, array order is kept, and numbers keep their original text.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1e",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "instruction",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "payload": {
+          "zeta": 1,
+          "alpha": {
+            "b": [
+              3,
+              1,
+              2
+            ],
+            "a": true
+          },
+          "mid": null,
+          "price": 1.50,
+          "big": 1e3
+        },
+        "artifacts": [],
+        "signature": "fq81IbFe1qCnt65RPyJ9JTmbzIqA/o0psj7XpuOpdrDUPWAlWaRs0WSC5Uc/ydhHxu51jCdPFVJwYPfWndDnCw=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1e\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"instruction\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"payload\":{\"alpha\":{\"a\":true,\"b\":[3,1,2]},\"big\":1e3,\"mid\":null,\"price\":1.50,\"zeta\":1},\"artifacts\":[]}",
+      "signature": "fq81IbFe1qCnt65RPyJ9JTmbzIqA/o0psj7XpuOpdrDUPWAlWaRs0WSC5Uc/ydhHxu51jCdPFVJwYPfWndDnCw=="
+    },
+    {
+      "name": "control-characters",
+      "note": "Quote, backslash, \\b \\f \\n \\r \\t use short escapes; other control characters use lowercase \\u00XX.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1f",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "instruction",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "payload": {
+          "s": "tab\there \"q\" back\\slash \b\f\n\r \u0001 \u001f"
+        },
+        "artifacts": [],
+        "signature": "LwECMc4rRTW+V3q6pmCDGeSKTdw5t8AXIuyq7NSquM1eLlfzVeGU/n3tsoHb7eL2rt1645j3ymkeX1ddUf92AA=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1f\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"instruction\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"payload\":{\"s\":\"tab\\there \\\"q\\\" back\\\\slash \\b\\f\\n\\r \\u0001 \\u001f\"},\"artifacts\":[]}",
+      "signature": "LwECMc4rRTW+V3q6pmCDGeSKTdw5t8AXIuyq7NSquM1eLlfzVeGU/n3tsoHb7eL2rt1645j3ymkeX1ddUf92AA=="
+    },
+    {
+      "name": "result-with-optional-fields",
+      "note": "reply_to, asserted_authority and provenance appear only when set; provenance keys are sorted; artifacts keep their order.",
+      "envelope": {
+        "type": "message",
+        "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a20",
+        "task_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "thread_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "reply_to": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b",
+        "sender_id": "vector-bot",
+        "recipient_id": "peer-bot",
+        "key_id": "primary",
+        "kind": "result",
+        "created_at": "2026-10-15T12:00:00Z",
+        "asserted_authority": "operator approved this run",
+        "content_is_data": true,
+        "payload": {
+          "summary": "done",
+          "count": 3
+        },
+        "artifacts": [
+          {
+            "uri": "https://files.example.com/a.txt",
+            "media_type": "text/plain",
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "size": 4
+          },
+          {
+            "uri": "inbox-artifact://space/2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+            "media_type": "application/octet-stream",
+            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+            "size": 3
+          }
+        ],
+        "provenance": {
+          "run": "42",
+          "tool": "unit-test"
+        },
+        "signature": "MMGIUGSB6MpCrwN1hUzZ0iuhbH3bUeIF4zQmywykTb5Mt2WxtXctGr14cvfjMYIYvDjLUkkgnUpwBh2pjIEBCA=="
+      },
+      "canonical": "agent-inbox-envelope-v1\n{\"type\":\"message\",\"id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a20\",\"task_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"thread_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"reply_to\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b\",\"sender_id\":\"vector-bot\",\"recipient_id\":\"peer-bot\",\"key_id\":\"primary\",\"kind\":\"result\",\"created_at\":\"2026-10-15T12:00:00Z\",\"asserted_authority\":\"operator approved this run\",\"content_is_data\":true,\"payload\":{\"count\":3,\"summary\":\"done\"},\"artifacts\":[{\"uri\":\"https://files.example.com/a.txt\",\"media_type\":\"text/plain\",\"sha256\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"size\":4},{\"uri\":\"inbox-artifact://space/2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae\",\"media_type\":\"application/octet-stream\",\"sha256\":\"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae\",\"size\":3}],\"provenance\":{\"run\":\"42\",\"tool\":\"unit-test\"}}",
+      "signature": "MMGIUGSB6MpCrwN1hUzZ0iuhbH3bUeIF4zQmywykTb5Mt2WxtXctGr14cvfjMYIYvDjLUkkgnUpwBh2pjIEBCA=="
+    }
+  ],
+  "requests": [
+    {
+      "name": "poll",
+      "agent_id": "vector-bot",
+      "key_id": "primary",
+      "method": "GET",
+      "path": "/v1/messages?limit=100",
+      "timestamp": "1792065600",
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "body": "",
+      "canonical": "agent-inbox-request-v1\nvector-bot\nprimary\nGET\n/v1/messages?limit=100\n1792065600\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "X68OEHC6QPa3lsp3RFT4kB1Xzg8kK+T1i9YV2f43k2eT/6mYI6FLyL3eYnf7fUKP5pfrMf8t3G9vj6cv9O8MDw=="
+    },
+    {
+      "name": "ack",
+      "agent_id": "vector-bot",
+      "key_id": "primary",
+      "method": "POST",
+      "path": "/v1/messages/0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b/ack",
+      "timestamp": "1792065601",
+      "nonce": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "body": "{\"processed\":true}",
+      "canonical": "agent-inbox-request-v1\nvector-bot\nprimary\nPOST\n/v1/messages/0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b/ack\n1792065601\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nc9e654e8902aa47de7edcd7ab902ed16ef68b2d1beb54a4644aada70c1964b49",
+      "signature": "xv40hG+Gh+4vXjBoc9g9QIvdge1NpQxpmDPnFbNUpd8m2tpIYYNuFr9MuYhDLOyWlKiQqYQRklEqlHOB0l2SDw=="
+    }
+  ]
+}

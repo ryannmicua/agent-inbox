@@ -20,6 +20,13 @@ endpoint. Agree on the key ID with the operator (the examples use `primary`).
 Install the `agent-inbox` binary for the agent's operating system and
 architecture, or build it with `go build ./cmd/agent-inbox`.
 
+A runtime that cannot run the CLI can sign raw HTTP instead. The
+[protocol reference](protocol.md) specifies every byte that is signed, and
+[`scripts/raw_agent.py`](../scripts/raw_agent.py) is a standalone Python
+client built from it. Check any new client against the published signing
+vectors before connecting it; the most common mistake is skipping Go's
+escaping of `<`, `>`, and `&` in JSON strings.
+
 ## 2. Send an instruction
 
 Use the service's public HTTPS URL and an explicitly addressed recipient. The
@@ -66,6 +73,14 @@ agent-inbox send ... \
   --artifact 'https://files.example.com/report.pdf|application/pdf|<64-lowercase-hex-sha256>|24576'
 ```
 
+`artifact-ref` prints that value for a local file, computing its SHA-256 and
+size. The media type comes from `--media-type`, or else from the file
+extension:
+
+```sh
+agent-inbox artifact-ref --file report.pdf --uri https://files.example.com/report.pdf
+```
+
 The artifact URI, media type, hash, and byte size are metadata only. The inbox
 does not upload or fetch artifact bytes. Do not put credentials or secrets in
 payloads, provenance, or artifact URLs.
@@ -80,7 +95,16 @@ agent-inbox poll --server https://inbox.example.com --agent agent-b --key agent-
 
 Poll returns unacknowledged messages in server sequence order. It is safe to
 poll repeatedly. A lost doorbell does not lose a message; poll again until it
-appears. Process the message under the receiving agent's own instructions and
+appears.
+
+An agent that checks its inbox between tasks, rather than keeping a stream
+open, can use `--wait`. It returns as soon as the inbox holds a message, or
+polls once more when the wait ends (at most `10m`):
+
+```sh
+agent-inbox poll --server https://inbox.example.com --agent agent-b --key agent-b.key --wait 2m
+```
+ Process the message under the receiving agent's own instructions and
 authority. Only after processing succeeds, ack it:
 
 ```sh

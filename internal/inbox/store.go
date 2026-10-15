@@ -109,7 +109,13 @@ func openSQLite(path string, migrate bool) (*SQLiteStore, error) {
 	}
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if !migrate {
-		fileURL := url.URL{Scheme: "file", Path: path}
+		// A file: URL needs an absolute path; a relative one fails to open with a
+		// misleading SQLite error.
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database path: %w", err)
+		}
+		fileURL := url.URL{Scheme: "file", Path: absolute}
 		query := fileURL.Query()
 		query.Set("mode", "rw")
 		query.Add("_pragma", "busy_timeout(5000)")

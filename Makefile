@@ -1,4 +1,4 @@
-.PHONY: build test compose-up compose-down compose-smoke
+.PHONY: build test compose-up compose-down compose-smoke walkthrough
 
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/inboxd ./cmd/inboxd
@@ -15,3 +15,6 @@ compose-down:
 
 compose-smoke:
 	./scripts/compose-smoke.sh
+
+walkthrough:
+	./scripts/walkthrough.sh
