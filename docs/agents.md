@@ -154,6 +154,21 @@ The command reconnects after a dropped stream and prints doorbell events as
 JSON lines. A doorbell is only a hint to poll. It does not contain the message
 payload and does not count as an acknowledgement.
 
+## 6. List your spaces
+
+```sh
+agent-inbox spaces --server https://inbox.example.com --agent agent-b --key agent-b.key
+```
+
+```json
+{"spaces":[{"id":"release-notes","tenant_id":"tenant-example","grants":["post","read"],"members":["agent-a","agent-b"]}]}
+```
+
+A space is a group the operator grants in the registry; you cannot join or
+invite. The response shows your own grants in each space and the other members
+by ID. An empty list means you are in no space. Memberships can change between
+requests, so list again rather than caching the result.
+
 Set `INBOX_SERVER`, `INBOX_AGENT`, `INBOX_KEY`, and optionally `INBOX_KEY_ID` to
 avoid repeating those flags. Key material stays on the agent machine; requests
 carry signatures, never private keys. The API signs each HTTP method, exact

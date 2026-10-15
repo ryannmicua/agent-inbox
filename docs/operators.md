@@ -147,14 +147,69 @@ Each agent entry contains:
 }
 ```
 
-The top-level object has `"version": 1` and an `"agents"` array. Use unique
-agent IDs and key IDs. `public_key` is the base64-encoded 32-byte public key
+The top-level object has `"version": 1` or `2` and an `"agents"` array.
+Version 2 adds an optional `"spaces"` array (see
+[Spaces and grants](#spaces-and-grants)); a version 1 file loads unchanged and
+must not contain `spaces`. Use unique agent IDs and key IDs. `public_key` is the base64-encoded 32-byte public key
 printed by `agent-inbox keygen`. The envelope vocabulary recognizes
 `instruction`, `result`, `finding`, `status`, and `ack`, but this pilot accepts
 message sends of `instruction` and `result` only; acknowledgement uses its
 separate API. Each sender must still be explicitly allowed each pilot kind and
 recipient. There is no `*` recipient and no caller-supplied tenant: the server
 assigns the sender's registered tenant and rejects cross-tenant delivery.
+
+### Spaces and grants
+
+A space is an operator-granted group of agents in one tenant. Spaces live only
+in the reviewed registry: there is no endpoint that creates a space or changes
+its members, and an agent cannot invite another. Add them to a version 2 file:
+
+```json
+{
+  "version": 2,
+  "agents": [ ... ],
+  "spaces": [
+    {
+      "id": "release-notes",
+      "tenant_id": "tenant-example",
+      "members": [
+        {"agent": "agent-a", "grants": ["read", "post", "note.write", "artifact.put", "artifact.get"]},
+        {"agent": "agent-b", "grants": ["read", "post", "note.write", "artifact.get"]}
+      ]
+    }
+  ]
+}
+```
+
+The grants form a closed set. Each later space feature checks exactly one:
+
+| Grant | Allows |
+| --- | --- |
+| `read` | Receiving the space's group messages and reading its notes. |
+| `post` | Sending a group message to the space. |
+| `note.write` | Writing a new note revision. |
+| `artifact.put` | Requesting an upload grant for a file. |
+| `artifact.get` | Requesting a download grant for a file. |
+
+In this release a membership is visible through `GET /v1/spaces` and
+`agent-inbox spaces`; group messages, notes, and files arrive in later
+releases and will check these grants.
+
+Loading rejects the whole file, and every request then fails closed, when:
+
+- a space ID or tenant ID is invalid, or two spaces share an ID;
+- a member is not a listed agent, or is listed twice in one space;
+- a member's tenant differs from the space's tenant;
+- a member has no grants, or a grant outside the set above or repeated.
+
+A member may be a disabled agent; it keeps its entry but gets no access until
+it is re-enabled. Space IDs are a separate namespace from agent IDs: a space
+may share an ID with an agent, and a space is never a message recipient.
+
+Membership is read from the registry at request time, like keys, so an edit
+applies to the next request without a restart. Removing a member or a grant
+takes effect immediately. Each edit is recorded in the
+[registry change audit](#registry-change-audit) with the membership diff.
 
 ### Add an agent
 
@@ -239,8 +294,11 @@ seconds even when no agent is active. The detail holds:
 | `disabled`, `enabled` | Agents whose own `disabled` flag changed. |
 | `keys_changed` | Agents whose keys were added, removed, replaced, disabled, or re-enabled. |
 | `policy_changed` | Agents whose tenant, allowed recipients, or allowed kinds changed. |
+| `spaces_added`, `spaces_removed` | Space IDs that appeared or disappeared. |
+| `spaces_changed` | Spaces whose tenant changed. |
+| `memberships_changed` | One `{"space","agent","old_grants","new_grants"}` entry per member whose grants changed, ordered by space and agent. An added member, including every member of a new space, has empty `old_grants`; a removed member, including every member of a removed space, has empty `new_grants`. Grants are sorted. |
 
-The last recorded hash and parsed agents are kept in the `registry_state`
+The last recorded hash and parsed agents and spaces are kept in the `registry_state`
 table and updated in the same transaction as the audit row, only if the
 recorded hash has not moved. Restarts and several instances on one PostgreSQL
 database therefore record each edit once. Edits that come and go between two
@@ -388,6 +446,13 @@ and stay on the normal doorbell schedule. The first start after upgrading
 records one baseline `registry.changed` row. An older binary ignores the new
 column and table, but it would resume doorbells and escalation for
 dispositioned messages.
+Registry spaces add a nullable `registry_state.spaces_json` column on both
+backends. A database upgraded from an earlier release has no recorded spaces,
+so its first `registry.changed` row after a space is added lists that space in
+`spaces_added`. An older binary ignores the column and keeps recording agent
+changes; it refuses a version 2 registry, so roll back the registry file with
+the binary. After such a rollback, the next membership diff compares against
+the spaces recorded before it.
 Keep the prior image available until health and audit checks pass. Restore a
 backup to roll back across an incompatible schema change.
 
@@ -511,7 +576,7 @@ sqlite3 -header -csv agent-inbox-backup.db \
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT message_id,attempts,last_notified_at,escalated_at,disposition FROM notification_state' > notification_state.csv
 sqlite3 -header -csv agent-inbox-backup.db \
-  'SELECT id,sha256,agents_json,observed_at FROM registry_state' > registry_state.csv
+  'SELECT id,sha256,agents_json,spaces_json,observed_at FROM registry_state' > registry_state.csv
 ```
 
 Set `INBOX_DATABASE_URL` to the PostgreSQL target, then import with `psql` in
@@ -531,7 +596,7 @@ psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 \copy request_nonces(agent_id,nonce,created_at) FROM 'request_nonces.csv' CSV HEADER
 \copy audit_log(sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json) FROM 'audit_log.csv' CSV HEADER
 \copy notification_state(message_id,attempts,last_notified_at,escalated_at,disposition) FROM 'notification_state.csv' CSV HEADER
-\copy registry_state(id,sha256,agents_json,observed_at) FROM 'registry_state.csv' CSV HEADER
+\copy registry_state(id,sha256,agents_json,spaces_json,observed_at) FROM 'registry_state.csv' CSV HEADER
 SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
 SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
 SQL

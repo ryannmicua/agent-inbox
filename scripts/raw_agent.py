@@ -224,7 +224,7 @@ def main(argv):
     sub = parser.add_subparsers(dest="command", required=True)
     vec = sub.add_parser("vectors", help="check this client against the published signing vectors")
     vec.add_argument("file")
-    for name in ("poll", "ack", "send"):
+    for name in ("poll", "ack", "send", "spaces"):
         p = sub.add_parser(name)
         p.add_argument("--server", default=os.environ.get("INBOX_SERVER"))
         p.add_argument("--agent", default=os.environ.get("INBOX_AGENT"))
@@ -234,7 +234,7 @@ def main(argv):
             p.add_argument("--limit", type=int, default=100)
         elif name == "ack":
             p.add_argument("--message", required=True)
-        else:
+        elif name == "send":
             p.add_argument("--to", required=True)
             p.add_argument("--kind", required=True)
             p.add_argument("--payload", default="{}")
@@ -252,6 +252,8 @@ def main(argv):
         return finish(*call(args, "GET", f"/v1/messages?limit={args.limit}"))
     if args.command == "ack":
         return finish(*call(args, "POST", f"/v1/messages/{args.message}/ack", b'{"processed":true}'))
+    if args.command == "spaces":
+        return finish(*call(args, "GET", "/v1/spaces"))
     return cmd_send(args)
 
 
