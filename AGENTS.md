@@ -8,8 +8,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Protocol, registry operations, canonical signing, and delivery semantics are documented in [docs/operators.md](docs/operators.md); agent commands are in [docs/agents.md](docs/agents.md).
 - HTTP handlers and request verification live in `internal/inbox/server.go`; the storage boundary and SQLite implementation live in `internal/inbox/store.go`.
-- Run `go test ./...` for behavioral tests and `make compose-smoke` for the two-agent Compose exchange (requires Docker, Go, and Python 3). `make walkthrough` replays a CLI bot and a standalone Python bot without Docker (needs Python `cryptography`); `scripts/walkthrough.sh remote` runs the same exchange against a deployed server.
-- The wire contract for non-Go clients is [docs/protocol.md](docs/protocol.md), pinned by `internal/inbox/testdata/signing-vectors.json`. Any change to signing bytes breaks every existing client: rebuild the vectors with `go test ./internal/inbox -run TestSigningVectors -update-vectors` only on purpose. `TestDocumentedSignerMatchesVectors` and `scripts/raw_agent.py vectors` check the doc-derived signers against them.
+- Run `go test ./...` for behavioral tests and `make compose-smoke` for the two-agent Compose exchange (requires Docker, Go, and Python 3).
 
 ## Maintaining this file
 
