@@ -217,3 +217,28 @@ func assertLegacyAckColumns(t *testing.T, path string) {
 		}
 	}
 }
+
+func TestAuditAcceptsRelativeDatabasePath(t *testing.T) {
+	dir := t.TempDir()
+	store, err := inbox.OpenSQLite(filepath.Join(dir, "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAudit(t.Context(), inbox.AuditRecord{Action: "send", ActorID: "agent-a", Outcome: "accepted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("INBOX_STORAGE", "sqlite")
+	for _, relative := range []string{"inbox.db", "./inbox.db"} {
+		var output strings.Builder
+		if err := runAudit([]string{"--db", relative, "--limit", "1"}, &output, io.Discard); err != nil {
+			t.Fatalf("audit with relative path %q failed: %v", relative, err)
+		}
+		if !strings.Contains(output.String(), `"actor_id":"agent-a"`) {
+			t.Fatalf("audit with relative path %q returned %s", relative, output.String())
+		}
+	}
+}

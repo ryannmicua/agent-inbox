@@ -74,6 +74,13 @@ creates temporary keys and a temporary registry, starts an isolated Compose
 project, performs an instruction/result exchange through the CLI, then removes
 its test volume.
 
+To check a running deployment, register two test bots that may message each
+other, then run `scripts/walkthrough.sh remote` with `INBOX_SERVER`, `CLI_BOT`,
+`CLI_KEY`, `RAW_BOT`, and `RAW_KEY` set. One bot uses the CLI and the other the
+standalone Python client from the [protocol reference](protocol.md), so the
+run proves both join paths. The local mode, `make walkthrough`, also replays
+revocation.
+
 ## Configuration reference
 
 | Setting | Default | Purpose |

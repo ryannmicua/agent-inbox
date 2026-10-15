@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_BODY_BYTES = 16 * 1024
@@ -45,4 +46,6 @@ class WebhookSink(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    HTTPServer(("0.0.0.0", 8081), WebhookSink).serve_forever()
+    host = os.environ.get("WEBHOOK_SINK_HOST", "0.0.0.0")
+    port = int(os.environ.get("WEBHOOK_SINK_PORT", "8081"))
+    HTTPServer((host, port), WebhookSink).serve_forever()

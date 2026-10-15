@@ -32,6 +32,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if args[0] == "keygen" {
 		return runKeygen(args[1:], stdout)
 	}
+	if args[0] == "artifact-ref" {
+		return runArtifactRef(args[1:], stdout, stderr)
+	}
 	command := args[0]
 	if command != "send" && command != "poll" && command != "ack" && command != "wait" {
 		return fmt.Errorf("unknown command %q (run agent-inbox help)", args[0])
@@ -52,6 +55,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	messageID := flags.String("id", "", "message UUID (set to retry idempotently)")
 	authority := flags.String("asserted-authority", "", "sender assertion; receiver must re-derive authority")
 	limit := flags.Int("limit", 100, "maximum messages to return")
+	waitFor := flags.Duration("wait", 0, "poll: wait up to this long (max 10m) for a message before returning")
 	ackID := flags.String("message", "", "message UUID to acknowledge")
 	var artifacts repeatedStrings
 	flags.Var(&artifacts, "artifact", "artifact reference URI|media-type|sha256|size (repeatable)")
@@ -77,7 +81,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if *limit < 1 || *limit > 100 {
 			return errors.New("--limit must be between 1 and 100")
 		}
+		if *waitFor < 0 || *waitFor > maxPollWait {
+			return fmt.Errorf("--wait must be between 0 and %s", maxPollWait)
+		}
 		path := fmt.Sprintf("/v1/messages?limit=%d", *limit)
+		if *waitFor > 0 {
+			return runPollWait(ctx, client, path, *waitFor, stdout, stderr)
+		}
 		return requestJSON(ctx, client, "GET", path, nil, stdout)
 	case "ack":
 		if *ackID == "" {
@@ -251,9 +261,11 @@ func usage(w io.Writer) {
 Commands:
   keygen --private-key PATH --public-key PATH
   send --server URL --agent ID --key PATH --to ID --kind instruction|result --payload-file FILE
-	poll [--limit N]
-	ack --message UUID
+  poll [--limit N] [--wait DURATION]     (--wait returns early when a message arrives)
+  ack --message UUID
   wait                                   (listen for doorbell prompts)
+  artifact-ref --file PATH --uri URI [--media-type TYPE]
+                                         (print an --artifact value with sha256 and size)
 
 Each API command requires --agent and --key, or INBOX_AGENT and INBOX_KEY.
 The doorbell only prompts; poll for durable delivery and acknowledge after processing.`)
