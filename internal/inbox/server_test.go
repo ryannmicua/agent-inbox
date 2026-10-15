@@ -90,6 +90,18 @@ func openTestStore(t *testing.T, sqlitePath string) Store {
 
 func openIsolatedPostgres(t *testing.T, databaseURL string) Store {
 	t.Helper()
+	store, err := OpenPostgres(isolatedPostgresURL(t, databaseURL))
+	if err != nil {
+		t.Fatalf("open isolated PostgreSQL test store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// isolatedPostgresURL creates a fresh schema that is dropped when the test
+// ends and returns a URL whose search_path selects it.
+func isolatedPostgresURL(t *testing.T, databaseURL string) string {
+	t.Helper()
 	admin, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +121,13 @@ func openIsolatedPostgres(t *testing.T, databaseURL string) Store {
 		admin.Close()
 		t.Fatalf("create isolated PostgreSQL test schema: %v", err)
 	}
+	// Registered first so it runs after the store's own cleanup closes it.
+	t.Cleanup(func() {
+		if _, err := admin.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
+			t.Logf("drop PostgreSQL test schema: %v", err)
+		}
+		_ = admin.Close()
+	})
 	isolatedURL, err := url.Parse(databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -116,20 +135,7 @@ func openIsolatedPostgres(t *testing.T, databaseURL string) Store {
 	query := isolatedURL.Query()
 	query.Set("search_path", schema)
 	isolatedURL.RawQuery = query.Encode()
-	store, err := OpenPostgres(isolatedURL.String())
-	if err != nil {
-		_, _ = admin.ExecContext(ctx, `DROP SCHEMA "`+schema+`" CASCADE`)
-		admin.Close()
-		t.Fatalf("open isolated PostgreSQL test store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-		if _, err := admin.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
-			t.Logf("drop PostgreSQL test schema: %v", err)
-		}
-		_ = admin.Close()
-	})
-	return store
+	return isolatedURL.String()
 }
 
 func testRegistryAgent(id, tenant string, public ed25519.PublicKey, recipients, kinds []string, disabled bool) RegistryAgent {
@@ -1958,14 +1964,11 @@ func TestTenantReassignmentIsolatesExistingMessages(t *testing.T) {
 		t.Fatalf("tenant reassignment rang an old-tenant doorbell: %+v", event)
 	default:
 	}
-	if s.notifier.count("message.unacknowledged_escalation") != 0 {
-		t.Fatal("tenant reassignment escalated before the bounded retry schedule completed")
-	}
 	base = base.Add(2 * time.Second)
 	s.service.dispatchDue(context.Background())
 	s.service.dispatchDue(context.Background())
-	if s.notifier.count("message.unacknowledged_escalation") != 1 {
-		t.Fatalf("tenant reassignment did not produce one operator escalation: %d", s.notifier.count("message.unacknowledged_escalation"))
+	if s.notifier.count("delivery.recipient_revoked") != 1 || s.notifier.count("message.unacknowledged_escalation") != 0 {
+		t.Fatalf("tenant reassignment did not produce one revoked-recipient disposition instead of an escalation: revoked=%d escalations=%d", s.notifier.count("delivery.recipient_revoked"), s.notifier.count("message.unacknowledged_escalation"))
 	}
 	staleEventDone := make(chan error, 1)
 	go func() {

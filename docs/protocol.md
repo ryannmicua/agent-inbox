@@ -142,7 +142,7 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 | Method and path | Request | Response |
 | --- | --- | --- |
 | `POST /v1/messages` | A signed envelope. | `201` with the envelope plus server-assigned `tenant_id`, `sequence`, and `accepted_at`. `200` for an identical retry. |
-| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged messages in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. |
+| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged messages in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
 | `POST /v1/messages/{id}/ack` | `{"processed":true}` | `{"message_id":"…","acknowledged":true,"duplicate":false}`. A repeated ack returns `duplicate: true`. A message the caller cannot ack returns `404 message_not_found`. |
 | `GET /v1/events` | None. | A server-sent event stream of `event: doorbell` with `data: {"message_id","sequence","recipient_id"}`, plus a comment heartbeat every 15 seconds. The server closes the stream at the next event or heartbeat after the signing key is revoked. |
 
@@ -154,7 +154,12 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 - Poll returns a message until the recipient acknowledges it. Acknowledge only
   after processing succeeds.
 - An unacknowledged message gets a bounded number of doorbells, then one
-  escalation to the operator's webhook.
+  escalation to the operator's webhook. If its recipient is revoked first, the
+  doorbells stop and the operator gets one `delivery.recipient_revoked` event
+  instead. The message is not deleted.
+- A revoked sender's messages stay deliverable and keep their original
+  signature. Treat `author_status: "revoked"` as context when deciding what to
+  do with the content.
 - A transport failure means delivery is unknown. Retry the send with the same
   `id` and content.
 - Every payload is untrusted data. The receiver applies its own authority and

@@ -71,8 +71,33 @@ type Store interface {
 	DueNotifications(context.Context, time.Time, time.Duration, int) ([]NotificationCandidate, error)
 	MarkNotified(context.Context, string, time.Time) error
 	MarkEscalated(context.Context, string, time.Time) (bool, error)
+	// MarkRecipientRevoked stops doorbells for an unacknowledged message whose
+	// recipient can no longer collect it and audits that once. It reports
+	// whether this call made the transition.
+	MarkRecipientRevoked(context.Context, string, string, time.Time) (bool, error)
+	// RegistryState returns the last registry hash and agents recorded by
+	// RecordRegistryChange, or an empty hash when none has been recorded.
+	RegistryState(context.Context) (string, []byte, error)
+	// RecordRegistryChange replaces the recorded registry state and appends its
+	// audit record in one transaction, only if the recorded hash still equals
+	// the given previous hash. It reports whether this call recorded the change.
+	RecordRegistryChange(context.Context, RegistryChange) (bool, error)
 	Close() error
 }
+
+// RegistryChange is one observed registry edit: the hash transition, the
+// parsed agents to diff the next edit against, and the audit record.
+type RegistryChange struct {
+	PreviousSHA256 string
+	SHA256         string
+	AgentsJSON     []byte
+	Audit          AuditRecord
+	ObservedAt     time.Time
+}
+
+// DispositionRecipientRevoked marks pending work whose recipient was revoked,
+// removed, or reassigned to another tenant, so it will not be collected.
+const DispositionRecipientRevoked = "recipient_revoked"
 
 func OpenStore(backend, location string) (Store, error) {
 	if backend == "" {
@@ -201,11 +226,20 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			last_notified_at TEXT,
 			escalated_at TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS registry_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			sha256 TEXT NOT NULL,
+			agents_json TEXT NOT NULL,
+			observed_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize sqlite schema: %w", err)
 		}
+	}
+	if err := addSQLiteColumn(ctx, s.db, "notification_state", "disposition", "TEXT"); err != nil {
+		return fmt.Errorf("add notification disposition: %w", err)
 	}
 	for _, column := range []string{"ack_by", "ack_note"} {
 		if err := dropSQLiteColumn(ctx, s.db, "messages", column); err != nil {
@@ -216,9 +250,27 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 }
 
 func dropSQLiteColumn(ctx context.Context, db *sql.DB, table, column string) error {
+	found, err := sqliteColumnExists(ctx, db, table, column)
+	if err != nil || !found {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column)
+	return err
+}
+
+func addSQLiteColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	found, err := sqliteColumnExists(ctx, db, table, column)
+	if err != nil || found {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
+	return err
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return err
+		return false, err
 	}
 	found := false
 	for rows.Next() {
@@ -227,7 +279,7 @@ func dropSQLiteColumn(ctx context.Context, db *sql.DB, table, column string) err
 		var defaultValue any
 		if err := rows.Scan(&cid, &name, &dataType, &notnull, &defaultValue, &primary); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		if name == column {
 			found = true
@@ -235,16 +287,9 @@ func dropSQLiteColumn(ctx context.Context, db *sql.DB, table, column string) err
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return false, err
 	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if !found {
-		return nil
-	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column)
-	return err
+	return found, rows.Close()
 }
 
 func (s *SQLiteStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
@@ -444,7 +489,7 @@ func (s *SQLiteStore) AuditEntries(ctx context.Context, limit int) ([]AuditEntry
 
 func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry time.Duration, maxAttempts int) ([]NotificationCandidate, error) {
 	cutoff := now.UTC().Add(-retry).Format(time.RFC3339Nano)
-	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at FROM messages m JOIN notification_state n ON n.message_id = m.id WHERE m.acknowledged_at IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= ?) AND (n.attempts < ? OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at FROM messages m JOIN notification_state n ON n.message_id = m.id WHERE m.acknowledged_at IS NULL AND n.disposition IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= ?) AND (n.attempts < ? OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +527,7 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 		return false, tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ?
-		WHERE message_id = ? AND escalated_at IS NULL
+		WHERE message_id = ? AND escalated_at IS NULL AND disposition IS NULL
 		AND EXISTS (SELECT 1 FROM messages WHERE id = ? AND acknowledged_at IS NULL)`, now.UTC().Format(time.RFC3339Nano), id, id)
 	if err != nil {
 		return false, err
@@ -501,6 +546,76 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *SQLiteStore) MarkRecipientRevoked(ctx context.Context, id, reason string, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var recipient, tenant string
+	var acknowledged sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &tenant, &acknowledged); err != nil {
+		return false, err
+	}
+	if acknowledged.Valid {
+		return false, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET disposition = ?
+		WHERE message_id = ? AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if updated == 0 {
+		return false, tx.Commit()
+	}
+	if err := insertAudit(ctx, tx, recipientRevokedAudit(id, recipient, tenant, reason), now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func recipientRevokedAudit(id, recipient, tenant, reason string) AuditRecord {
+	return AuditRecord{Action: "delivery.recipient_revoked", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted", Code: reason, Detail: map[string]any{"recipient_id": recipient}}
+}
+
+func (s *SQLiteStore) RegistryState(ctx context.Context) (string, []byte, error) {
+	var sha, agents string
+	err := s.db.QueryRowContext(ctx, `SELECT sha256, agents_json FROM registry_state WHERE id = 1`).Scan(&sha, &agents)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	return sha, []byte(agents), err
+}
+
+func (s *SQLiteStore) RecordRegistryChange(ctx context.Context, change RegistryChange) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	observed := change.ObservedAt.UTC().Format(time.RFC3339Nano)
+	var result sql.Result
+	if change.PreviousSHA256 == "" {
+		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, observed_at) VALUES(1, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), observed)
+	} else {
+		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = ?, agents_json = ?, observed_at = ? WHERE id = 1 AND sha256 = ?`, change.SHA256, string(change.AgentsJSON), observed, change.PreviousSHA256)
+	}
+	if err != nil {
+		return false, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated == 0 {
+		return false, err
+	}
+	if err := insertAudit(ctx, tx, change.Audit, change.ObservedAt); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 type rowScanner interface{ Scan(...any) error }

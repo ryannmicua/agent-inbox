@@ -49,12 +49,19 @@ type Envelope struct {
 	Signature         string            `json:"signature"`
 }
 
+// AuthorStatusRevoked marks a polled message whose sender has since been
+// revoked. The message itself is kept as stored and stays attributed.
+const AuthorStatusRevoked = "revoked"
+
 type DeliveredMessage struct {
 	Envelope
 	TenantID       string     `json:"tenant_id"`
 	Sequence       int64      `json:"sequence"`
 	AcceptedAt     time.Time  `json:"accepted_at"`
 	AcknowledgedAt *time.Time `json:"acknowledged_at,omitempty"`
+	// AuthorStatus is computed from the registry at read time; it is empty
+	// while the sender is active.
+	AuthorStatus string `json:"author_status,omitempty"`
 }
 
 type SendResponse struct {
