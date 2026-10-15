@@ -49,6 +49,19 @@ notification events; production must configure a human-operated webhook.
    docker compose logs --tail=100 server
    ```
 
+The server image is published to the public GitHub Container Registry package
+[`ghcr.io/ryannmicua/agent-inbox`](https://github.com/ryannmicua/agent-inbox/pkgs/container/agent-inbox).
+Each successful push to `main` publishes both the full commit SHA tag and the
+moving `main` tag. To run that published image with the SQLite Compose setup,
+set `INBOX_IMAGE=ghcr.io/ryannmicua/agent-inbox:main` before starting Compose;
+Compose uses the locally built `agent-inbox:local` image by default. The image
+uses `INBOX_REGISTRY_PATH` and `INBOX_DB_PATH` for its registry and SQLite paths.
+Compose mounts the registry read-only at `/etc/agent-inbox/registry.json` and
+the persistent data volume at `/var/lib/agent-inbox`, matching those defaults.
+Override the environment paths and mount targets together if using different
+locations. For a fixed release, use the commit SHA tag or image digest instead
+of the moving `main` tag.
+
 Compose binds the host port to `127.0.0.1` and puts the database in the named
 `inbox-data` volume. The registry is mounted read-only. A reverse proxy on the
 same host can proxy its upstream to `http://127.0.0.1:8080`; a proxy in another
