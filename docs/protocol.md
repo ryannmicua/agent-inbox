@@ -145,6 +145,7 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 | `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged messages in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
 | `POST /v1/messages/{id}/ack` | `{"processed":true}` | `{"message_id":"…","acknowledged":true,"duplicate":false}`. A repeated ack returns `duplicate: true`. A message the caller cannot ack returns `404 message_not_found`. |
 | `GET /v1/events` | None. | A server-sent event stream of `event: doorbell` with `data: {"message_id","sequence","recipient_id"}`, plus a comment heartbeat every 15 seconds. The server closes the stream at the next event or heartbeat after the signing key is revoked. |
+| `GET /v1/spaces` | None; no query parameters. | `{"spaces":[{"id","tenant_id","grants":[…],"members":[…]}]}`: the spaces this agent belongs to, ordered by `id`, read from the registry at request time. `grants` are this agent's own, sorted. `members` lists the IDs of every active member, sorted; other members' grants are never shown. An agent in no space gets `{"spaces":[]}`. |
 
 ## Delivery semantics
 

@@ -153,6 +153,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.events(w, r, identity)
 	case strings.HasPrefix(r.URL.Path, "/v1/messages/") && strings.HasSuffix(r.URL.Path, "/ack") && r.Method == http.MethodPost:
 		s.ack(w, r, identity)
+	case r.URL.Path == "/v1/spaces" && r.Method == http.MethodGet:
+		s.listSpaces(w, r, identity)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "route not found")
 	}
@@ -260,30 +262,38 @@ func (s *Server) observeRegistry(ctx context.Context) {
 		return
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		previousSHA, previousJSON, err := s.store.RegistryState(ctx)
+		state, err := s.store.RegistryState(ctx)
 		if err != nil {
 			log.Printf("read recorded registry state: %v", err)
 			return
 		}
+		previousSHA := state.SHA256
 		if previousSHA == snapshot.SHA256 {
 			s.registrySHA256 = snapshot.SHA256
 			return
 		}
-		previous := map[string]RegistryAgent{}
-		if len(previousJSON) > 0 {
-			if err := json.Unmarshal(previousJSON, &previous); err != nil {
-				log.Printf("decode recorded registry state: %v", err)
-				return
-			}
+		previous := RegistrySnapshot{Agents: map[string]RegistryAgent{}, Spaces: map[string]RegistrySpace{}}
+		if err := decodeRecordedJSON(state.AgentsJSON, &previous.Agents); err != nil {
+			log.Printf("decode recorded registry agents: %v", err)
+			return
 		}
-		encoded, err := json.Marshal(snapshot.Agents)
+		if err := decodeRecordedJSON(state.SpacesJSON, &previous.Spaces); err != nil {
+			log.Printf("decode recorded registry spaces: %v", err)
+			return
+		}
+		agentsJSON, err := json.Marshal(snapshot.Agents)
+		if err != nil {
+			log.Printf("encode registry state: %v", err)
+			return
+		}
+		spacesJSON, err := json.Marshal(snapshot.Spaces)
 		if err != nil {
 			log.Printf("encode registry state: %v", err)
 			return
 		}
 		recorded, err := s.store.RecordRegistryChange(ctx, RegistryChange{
-			PreviousSHA256: previousSHA, SHA256: snapshot.SHA256, AgentsJSON: encoded, ObservedAt: s.now(),
-			Audit: AuditRecord{Action: "registry.changed", ActorID: "system", Outcome: "recorded", Detail: registryChangeDetail(previousSHA, snapshot.SHA256, previous, snapshot.Agents)},
+			PreviousSHA256: previousSHA, SHA256: snapshot.SHA256, AgentsJSON: agentsJSON, SpacesJSON: spacesJSON, ObservedAt: s.now(),
+			Audit: AuditRecord{Action: "registry.changed", ActorID: "system", Outcome: "recorded", Detail: registryChangeDetail(previousSHA, snapshot.SHA256, previous, snapshot)},
 		})
 		if err != nil {
 			log.Printf("record registry change: %v", err)
@@ -297,7 +307,24 @@ func (s *Server) observeRegistry(ctx context.Context) {
 	}
 }
 
-func registryChangeDetail(oldSHA, newSHA string, previous, current map[string]RegistryAgent) map[string]any {
+// decodeRecordedJSON decodes one recorded registry column; a column written
+// before spaces existed is empty.
+func decodeRecordedJSON[T any](data []byte, target *T) error {
+	if len(data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(data, target)
+}
+
+type membershipChange struct {
+	Space     string   `json:"space"`
+	Agent     string   `json:"agent"`
+	OldGrants []string `json:"old_grants"`
+	NewGrants []string `json:"new_grants"`
+}
+
+func registryChangeDetail(oldSHA, newSHA string, previousState, currentState RegistrySnapshot) map[string]any {
+	previous, current := previousState.Agents, currentState.Agents
 	added, removed, disabled, enabled, keysChanged, policyChanged := []string{}, []string{}, []string{}, []string{}, []string{}, []string{}
 	for id, agent := range current {
 		before, existed := previous[id]
@@ -323,14 +350,70 @@ func registryChangeDetail(oldSHA, newSHA string, previous, current map[string]Re
 			removed = append(removed, id)
 		}
 	}
-	for _, list := range [][]string{added, removed, disabled, enabled, keysChanged, policyChanged} {
+	spacesAdded, spacesRemoved, spacesChanged := []string{}, []string{}, []string{}
+	memberships := []membershipChange{}
+	for id, space := range currentState.Spaces {
+		before, existed := previousState.Spaces[id]
+		if !existed {
+			spacesAdded = append(spacesAdded, id)
+		} else if before.TenantID != space.TenantID {
+			spacesChanged = append(spacesChanged, id)
+		}
+		memberships = append(memberships, diffMemberships(id, before.Members, space.Members)...)
+	}
+	for id, space := range previousState.Spaces {
+		if _, exists := currentState.Spaces[id]; !exists {
+			spacesRemoved = append(spacesRemoved, id)
+			memberships = append(memberships, diffMemberships(id, space.Members, nil)...)
+		}
+	}
+	for _, list := range [][]string{added, removed, disabled, enabled, keysChanged, policyChanged, spacesAdded, spacesRemoved, spacesChanged} {
 		slices.Sort(list)
 	}
+	slices.SortFunc(memberships, func(a, b membershipChange) int {
+		if order := strings.Compare(a.Space, b.Space); order != 0 {
+			return order
+		}
+		return strings.Compare(a.Agent, b.Agent)
+	})
 	return map[string]any{
 		"old_sha256": oldSHA, "new_sha256": newSHA,
 		"added": added, "removed": removed, "disabled": disabled, "enabled": enabled,
 		"keys_changed": keysChanged, "policy_changed": policyChanged,
+		"spaces_added": spacesAdded, "spaces_removed": spacesRemoved, "spaces_changed": spacesChanged,
+		"memberships_changed": memberships,
 	}
+}
+
+// diffMemberships lists each agent whose grants in one space differ between
+// two member lists. An added member has no old grants; a removed one has no
+// new grants.
+func diffMemberships(spaceID string, before, after []RegistrySpaceMember) []membershipChange {
+	grants := func(members []RegistrySpaceMember) map[string][]string {
+		out := make(map[string][]string, len(members))
+		for _, member := range members {
+			sorted := slices.Clone(member.Grants)
+			slices.Sort(sorted)
+			out[member.Agent] = sorted
+		}
+		return out
+	}
+	old, current := grants(before), grants(after)
+	changes := []membershipChange{}
+	for agent, newGrants := range current {
+		if oldGrants, existed := old[agent]; !existed || !slices.Equal(oldGrants, newGrants) {
+			if !existed {
+				oldGrants = []string{}
+			}
+			changes = append(changes, membershipChange{Space: spaceID, Agent: agent, OldGrants: oldGrants, NewGrants: newGrants})
+		}
+	}
+	for agent, oldGrants := range old {
+		if _, kept := current[agent]; !kept {
+			changes = append(changes, membershipChange{Space: spaceID, Agent: agent, OldGrants: oldGrants, NewGrants: []string{}})
+		}
+	}
+	return changes
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) {
@@ -589,6 +672,28 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		messages[i].AuthorStatus = status
 	}
 	writeJSON(w, http.StatusOK, PollResponse{Messages: messages})
+}
+
+// listSpaces returns the caller's own memberships, read from the registry at
+// request time. Other members appear by ID only, never with their grants.
+func (s *Server) listSpaces(w http.ResponseWriter, r *http.Request, auth authContext) {
+	if r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "unsupported_query_parameter", "spaces accepts no query parameters")
+		return
+	}
+	grants, err := s.registry.SpaceGrants(auth.agent.ID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "registry_unavailable", "spaces could not be read")
+		return
+	}
+	spaces := make([]Space, 0, len(grants))
+	for _, grant := range grants {
+		if grant.TenantID != auth.agent.TenantID {
+			continue
+		}
+		spaces = append(spaces, Space{ID: grant.SpaceID, TenantID: grant.TenantID, Grants: grant.Grants, Members: grant.Members})
+	}
+	writeJSON(w, http.StatusOK, SpacesResponse{Spaces: spaces})
 }
 
 func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {

@@ -36,7 +36,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runArtifactRef(args[1:], stdout, stderr)
 	}
 	command := args[0]
-	if command != "send" && command != "poll" && command != "ack" && command != "wait" {
+	if command != "send" && command != "poll" && command != "ack" && command != "wait" && command != "spaces" {
 		return fmt.Errorf("unknown command %q (run agent-inbox help)", args[0])
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -95,6 +95,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		body, _ := json.Marshal(inbox.AckRequest{Processed: true})
 		return requestJSON(ctx, client, "POST", "/v1/messages/"+*ackID+"/ack", body, stdout)
+	case "spaces":
+		return requestJSON(ctx, client, "GET", "/v1/spaces", nil, stdout)
 	case "wait":
 		for {
 			response, err := client.OpenEvents(ctx)
@@ -264,6 +266,7 @@ Commands:
   poll [--limit N] [--wait DURATION]     (--wait returns early when a message arrives)
   ack --message UUID
   wait                                   (listen for doorbell prompts)
+  spaces                                 (list your spaces and your grants in each)
   artifact-ref --file PATH --uri URI [--media-type TYPE]
                                          (print an --artifact value with sha256 and size)
 

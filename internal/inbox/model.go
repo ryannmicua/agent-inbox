@@ -79,6 +79,19 @@ type PollResponse struct {
 	Messages []DeliveredMessage `json:"messages"`
 }
 
+// Space is one of the caller's space memberships. Grants are the caller's
+// own; Members lists every active member by ID.
+type Space struct {
+	ID       string   `json:"id"`
+	TenantID string   `json:"tenant_id"`
+	Grants   []string `json:"grants"`
+	Members  []string `json:"members"`
+}
+
+type SpacesResponse struct {
+	Spaces []Space `json:"spaces"`
+}
+
 type DoorbellEvent struct {
 	MessageID string `json:"message_id"`
 	Sequence  int64  `json:"sequence"`

@@ -110,6 +110,7 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			agents_json TEXT NOT NULL,
 			observed_at TIMESTAMPTZ NOT NULL
 		)`,
+		`ALTER TABLE registry_state ADD COLUMN IF NOT EXISTS spaces_json TEXT`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -432,13 +433,8 @@ func (s *PostgresStore) MarkRecipientRevoked(ctx context.Context, id, reason str
 	return true, tx.Commit()
 }
 
-func (s *PostgresStore) RegistryState(ctx context.Context) (string, []byte, error) {
-	var sha, agents string
-	err := s.db.QueryRowContext(ctx, `SELECT sha256, agents_json FROM registry_state WHERE id = 1`).Scan(&sha, &agents)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil, nil
-	}
-	return sha, []byte(agents), err
+func (s *PostgresStore) RegistryState(ctx context.Context) (RecordedRegistry, error) {
+	return scanRecordedRegistry(s.db.QueryRowContext(ctx, `SELECT sha256, agents_json, spaces_json FROM registry_state WHERE id = 1`))
 }
 
 func (s *PostgresStore) RecordRegistryChange(ctx context.Context, change RegistryChange) (bool, error) {
@@ -449,9 +445,9 @@ func (s *PostgresStore) RecordRegistryChange(ctx context.Context, change Registr
 	defer tx.Rollback()
 	var result sql.Result
 	if change.PreviousSHA256 == "" {
-		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, observed_at) VALUES(1, $1, $2, $3) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), change.ObservedAt.UTC())
+		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, spaces_json, observed_at) VALUES(1, $1, $2, $3, $4) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), string(change.SpacesJSON), change.ObservedAt.UTC())
 	} else {
-		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = $1, agents_json = $2, observed_at = $3 WHERE id = 1 AND sha256 = $4`, change.SHA256, string(change.AgentsJSON), change.ObservedAt.UTC(), change.PreviousSHA256)
+		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = $1, agents_json = $2, spaces_json = $3, observed_at = $4 WHERE id = 1 AND sha256 = $5`, change.SHA256, string(change.AgentsJSON), string(change.SpacesJSON), change.ObservedAt.UTC(), change.PreviousSHA256)
 	}
 	if err != nil {
 		return false, err

@@ -75,9 +75,9 @@ type Store interface {
 	// recipient can no longer collect it and audits that once. It reports
 	// whether this call made the transition.
 	MarkRecipientRevoked(context.Context, string, string, time.Time) (bool, error)
-	// RegistryState returns the last registry hash and agents recorded by
+	// RegistryState returns the last registry state recorded by
 	// RecordRegistryChange, or an empty hash when none has been recorded.
-	RegistryState(context.Context) (string, []byte, error)
+	RegistryState(context.Context) (RecordedRegistry, error)
 	// RecordRegistryChange replaces the recorded registry state and appends its
 	// audit record in one transaction, only if the recorded hash still equals
 	// the given previous hash. It reports whether this call recorded the change.
@@ -85,12 +85,23 @@ type Store interface {
 	Close() error
 }
 
+// RecordedRegistry is the last observed registry: its hash and the parsed
+// agents and spaces to diff the next edit against. SpacesJSON is nil when the
+// row was written before spaces existed.
+type RecordedRegistry struct {
+	SHA256     string
+	AgentsJSON []byte
+	SpacesJSON []byte
+}
+
 // RegistryChange is one observed registry edit: the hash transition, the
-// parsed agents to diff the next edit against, and the audit record.
+// parsed agents and spaces to diff the next edit against, and the audit
+// record.
 type RegistryChange struct {
 	PreviousSHA256 string
 	SHA256         string
 	AgentsJSON     []byte
+	SpacesJSON     []byte
 	Audit          AuditRecord
 	ObservedAt     time.Time
 }
@@ -240,6 +251,9 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	}
 	if err := addSQLiteColumn(ctx, s.db, "notification_state", "disposition", "TEXT"); err != nil {
 		return fmt.Errorf("add notification disposition: %w", err)
+	}
+	if err := addSQLiteColumn(ctx, s.db, "registry_state", "spaces_json", "TEXT"); err != nil {
+		return fmt.Errorf("add registry spaces state: %w", err)
 	}
 	for _, column := range []string{"ack_by", "ack_note"} {
 		if err := dropSQLiteColumn(ctx, s.db, "messages", column); err != nil {
@@ -584,13 +598,25 @@ func recipientRevokedAudit(id, recipient, tenant, reason string) AuditRecord {
 	return AuditRecord{Action: "delivery.recipient_revoked", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted", Code: reason, Detail: map[string]any{"recipient_id": recipient}}
 }
 
-func (s *SQLiteStore) RegistryState(ctx context.Context) (string, []byte, error) {
+func (s *SQLiteStore) RegistryState(ctx context.Context) (RecordedRegistry, error) {
+	return scanRecordedRegistry(s.db.QueryRowContext(ctx, `SELECT sha256, agents_json, spaces_json FROM registry_state WHERE id = 1`))
+}
+
+func scanRecordedRegistry(row rowScanner) (RecordedRegistry, error) {
 	var sha, agents string
-	err := s.db.QueryRowContext(ctx, `SELECT sha256, agents_json FROM registry_state WHERE id = 1`).Scan(&sha, &agents)
+	var spaces sql.NullString
+	err := row.Scan(&sha, &agents, &spaces)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil, nil
+		return RecordedRegistry{}, nil
 	}
-	return sha, []byte(agents), err
+	if err != nil {
+		return RecordedRegistry{}, err
+	}
+	recorded := RecordedRegistry{SHA256: sha, AgentsJSON: []byte(agents)}
+	if spaces.Valid {
+		recorded.SpacesJSON = []byte(spaces.String)
+	}
+	return recorded, nil
 }
 
 func (s *SQLiteStore) RecordRegistryChange(ctx context.Context, change RegistryChange) (bool, error) {
@@ -602,9 +628,9 @@ func (s *SQLiteStore) RecordRegistryChange(ctx context.Context, change RegistryC
 	observed := change.ObservedAt.UTC().Format(time.RFC3339Nano)
 	var result sql.Result
 	if change.PreviousSHA256 == "" {
-		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, observed_at) VALUES(1, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), observed)
+		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, spaces_json, observed_at) VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), string(change.SpacesJSON), observed)
 	} else {
-		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = ?, agents_json = ?, observed_at = ? WHERE id = 1 AND sha256 = ?`, change.SHA256, string(change.AgentsJSON), observed, change.PreviousSHA256)
+		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = ?, agents_json = ?, spaces_json = ?, observed_at = ? WHERE id = 1 AND sha256 = ?`, change.SHA256, string(change.AgentsJSON), string(change.SpacesJSON), observed, change.PreviousSHA256)
 	}
 	if err != nil {
 		return false, err

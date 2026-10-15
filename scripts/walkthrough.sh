@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Replay the two-runtime walkthrough: a bot using the Go CLI and a bot using
 # the standalone Python client exchange an instruction with a file reference,
-# poll and acknowledge while offline, and reply with a correlated result.
+# poll and acknowledge while offline, reply with a correlated result, and list
+# the spaces the operator granted them.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
-#                                   replay, then revoke the Python bot and
-#                                   show what the audit records about it
+#                                   replay, edit the Python bot's space grants,
+#                                   then revoke it and show what the audit
+#                                   records about it
 #   scripts/walkthrough.sh remote   replay against an existing server; set
-#                                   INBOX_SERVER, CLI_BOT, CLI_KEY, RAW_BOT, RAW_KEY
+#                                   INBOX_SERVER, CLI_BOT, CLI_KEY, RAW_BOT, RAW_KEY,
+#                                   and optionally WALKTHROUGH_SPACE to require
+#                                   that both bots are members of that space
 #
 # Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
 # skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
@@ -59,17 +63,23 @@ if [[ "$mode" == local ]]; then
   CLI_KEY="$tmp_dir/cli-bot.key" RAW_KEY="$tmp_dir/raw-bot.key"
   "$cli_bin" keygen --private-key "$CLI_KEY" --public-key "$tmp_dir/cli-bot.pub" >/dev/null
   "$cli_bin" keygen --private-key "$RAW_KEY" --public-key "$tmp_dir/raw-bot.pub" >/dev/null
+  # write_registry RAW_DISABLED RAW_GRANTS: an empty RAW_GRANTS removes
+  # raw-bot from the release-notes space.
   write_registry() {
-    local raw_disabled="$1"
+    local raw_disabled="$1" raw_member=""
+    [[ -n "$2" ]] && raw_member=",{\"agent\":\"raw-bot\",\"grants\":$2}"
     cat > "$tmp_dir/registry.json.tmp" <<EOF
-{"version":1,"agents":[
+{"version":2,"agents":[
  {"id":"cli-bot","tenant_id":"walkthrough","public_keys":[{"id":"primary","public_key":"$(tr -d '\r\n' < "$tmp_dir/cli-bot.pub")"}],"allowed_recipients":["raw-bot"],"allowed_kinds":["instruction","result"]},
  {"id":"raw-bot","tenant_id":"walkthrough","disabled":$raw_disabled,"public_keys":[{"id":"primary","public_key":"$(tr -d '\r\n' < "$tmp_dir/raw-bot.pub")"}],"allowed_recipients":["cli-bot"],"allowed_kinds":["instruction","result"]}
+],"spaces":[
+ {"id":"release-notes","tenant_id":"walkthrough","members":[
+  {"agent":"cli-bot","grants":["read","post","note.write","artifact.put","artifact.get"]}$raw_member]}
 ]}
 EOF
     mv "$tmp_dir/registry.json.tmp" "$tmp_dir/registry.json"
   }
-  write_registry false
+  write_registry false '["read","post","note.write","artifact.get"]'
   WEBHOOK_SINK_HOST=127.0.0.1 WEBHOOK_SINK_PORT="$sink_port" python3 scripts/webhook_sink.py > "$tmp_dir/notifications.log" 2>&1 &
   pids+=("$!")
   export INBOX_LISTEN_ADDR="127.0.0.1:$server_port" INBOX_DB_PATH="$tmp_dir/inbox.db"
@@ -126,11 +136,48 @@ returned="$(cli poll --wait 30s)"
 echo "received result $(json_field messages.0.id <<< "$returned")"
 cli ack --message "$result_id"
 
+step "Both bots list their spaces; each sees only its own grants"
+cli_spaces="$(cli spaces)"
+raw_spaces="$(raw spaces)"
+space_grants() { python3 -c 'import json,sys
+space = next((s for s in json.load(sys.stdin)["spaces"] if s["id"] == sys.argv[1]), None)
+print("not a member" if space is None else ",".join(space["grants"]) + " (members " + ",".join(space["members"]) + ")")' "$1"; }
+if [[ "$mode" == local ]]; then
+  WALKTHROUGH_SPACE=release-notes
+  [[ "$(space_grants release-notes <<< "$cli_spaces")" == "artifact.get,artifact.put,note.write,post,read (members cli-bot,raw-bot)" ]] || { echo "unexpected spaces for $CLI_BOT: $cli_spaces" >&2; exit 1; }
+  [[ "$(space_grants release-notes <<< "$raw_spaces")" == "artifact.get,note.write,post,read (members cli-bot,raw-bot)" ]] || { echo "unexpected spaces for $RAW_BOT: $raw_spaces" >&2; exit 1; }
+fi
+if [[ -n "${WALKTHROUGH_SPACE:-}" ]]; then
+  echo "$CLI_BOT in $WALKTHROUGH_SPACE: $(space_grants "$WALKTHROUGH_SPACE" <<< "$cli_spaces")"
+  echo "$RAW_BOT in $WALKTHROUGH_SPACE: $(space_grants "$WALKTHROUGH_SPACE" <<< "$raw_spaces")"
+  for listed in "$cli_spaces" "$raw_spaces"; do
+    [[ "$(space_grants "$WALKTHROUGH_SPACE" <<< "$listed")" != "not a member" ]] || { echo "a bot is not a member of $WALKTHROUGH_SPACE" >&2; exit 1; }
+  done
+else
+  echo "$CLI_BOT: $cli_spaces"
+  echo "$RAW_BOT: $raw_spaces"
+fi
+
 if [[ "$mode" == local ]]; then
   audit_rows() { "$tmp_dir/inboxd" audit --limit 100; }
   audit_has() { audit_rows | python3 -c 'import json,sys
 action, outcome, code = sys.argv[1:4]
 sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("code","") == code for e in json.load(sys.stdin)) else 1)' "$@"; }
+
+  step "The operator narrows $RAW_BOT's grants, then removes it from the space; no restart"
+  write_registry false '["read"]'
+  [[ "$(raw spaces | space_grants release-notes)" == "read (members cli-bot,raw-bot)" ]] || { echo "grant edit did not apply" >&2; exit 1; }
+  echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
+  write_registry false ''
+  [[ "$(raw spaces)" == '{"spaces":[]}' ]] || { echo "removed member still lists the space" >&2; exit 1; }
+  echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
+  echo "$CLI_BOT in release-notes: $(cli spaces | space_grants release-notes)"
+  audit_rows | python3 -c 'import json,sys
+changes = [c for e in json.load(sys.stdin) if e["action"] == "registry.changed" for c in (e.get("detail") or {}).get("memberships_changed", [])]
+want = [{"space": "release-notes", "agent": "raw-bot", "old_grants": ["read"], "new_grants": []},
+        {"space": "release-notes", "agent": "raw-bot", "old_grants": ["artifact.get", "note.write", "post", "read"], "new_grants": ["read"]}]
+sys.exit(0 if changes[:2] == want else "registry.changed did not record the membership edits: %s" % changes)'
+  echo "registry.changed recorded both membership edits"
 
   step "Work is left pending in both directions"
   pending="$(cli send --to "$RAW_BOT" --kind instruction --payload '{"task":"never collected"}')"
@@ -140,7 +187,7 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   echo "pending for $RAW_BOT: $pending_id; pending for $CLI_BOT: $authored_id"
 
   step "The operator disables $RAW_BOT (disable first, remove later)"
-  write_registry true
+  write_registry true ''
   if raw poll 2>"$tmp_dir/refused.txt"; then echo "revoked bot could still poll" >&2; exit 1; fi
   cat "$tmp_dir/refused.txt"
   if cli send --to "$RAW_BOT" --kind instruction --payload '{"task":"anything"}' 2>"$tmp_dir/refused.txt"; then
@@ -171,7 +218,7 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   audit_rows | python3 -c 'import json,sys
 for e in reversed(json.load(sys.stdin)):
     d = e.get("detail") or {}
-    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id") if d.get(k)}
+    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "memberships_changed") if d.get(k)}
     print(e["sequence"], e["action"], e.get("actor_id",""), e.get("subject_id","")[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
 fi
 

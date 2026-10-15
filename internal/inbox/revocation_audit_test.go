@@ -441,8 +441,8 @@ func TestPreSliceDatabaseMigratesToNotificationDisposition(t *testing.T) {
 		if err != nil || len(due) != 1 || due[0].MessageID != "pre-slice-message" || due[0].Attempts != 1 {
 			t.Fatalf("pre-slice pending message is not due after migration: %+v err=%v", due, err)
 		}
-		if sha, _, err := store.RegistryState(ctx); err != nil || sha != "" {
-			t.Fatalf("migrated database has unexpected registry state %q: %v", sha, err)
+		if state, err := store.RegistryState(ctx); err != nil || state.SHA256 != "" {
+			t.Fatalf("migrated database has unexpected registry state %q: %v", state.SHA256, err)
 		}
 		marked, err := store.MarkRecipientRevoked(ctx, "pre-slice-message", "unknown_recipient", time.Now())
 		if err != nil || !marked {
@@ -492,12 +492,12 @@ func TestPreSliceDatabaseMigratesToNotificationDisposition(t *testing.T) {
 }
 
 func TestRegistryChangeDetailIsJSONStable(t *testing.T) {
-	detail := registryChangeDetail("", "abc", nil, map[string]RegistryAgent{"b": {}, "a": {}})
+	detail := registryChangeDetail("", "abc", RegistrySnapshot{}, RegistrySnapshot{Agents: map[string]RegistryAgent{"b": {}, "a": {}}})
 	encoded, err := json.Marshal(detail)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"added":["a","b"],"disabled":[],"enabled":[],"keys_changed":[],"new_sha256":"abc","old_sha256":"","policy_changed":[],"removed":[]}`
+	want := `{"added":["a","b"],"disabled":[],"enabled":[],"keys_changed":[],"memberships_changed":[],"new_sha256":"abc","old_sha256":"","policy_changed":[],"removed":[],"spaces_added":[],"spaces_changed":[],"spaces_removed":[]}`
 	if string(encoded) != want {
 		t.Fatalf("registry.changed detail = %s, want %s", encoded, want)
 	}

@@ -262,3 +262,32 @@ func TestAckCommandSendsOnlyProcessedAssertion(t *testing.T) {
 		t.Fatalf("ack command did not send only processed=true: %v", body)
 	}
 }
+
+func TestSpacesCommandListsCallerSpaces(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.RequestURI() != "/v1/spaces" || r.Header.Get(inbox.HeaderAgent) != "agent-b" || r.Header.Get(inbox.HeaderSignature) == "" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"spaces":[{"id":"release-notes","tenant_id":"tenant-one","grants":["read"],"members":["agent-a","agent-b"]}]}`)
+	}))
+	defer server.Close()
+
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	publicKey := filepath.Join(t.TempDir(), "agent.pub")
+	if err := inbox.WriteKeyPair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	var stdout strings.Builder
+	if err := run([]string{"spaces", "--server", server.URL, "--agent", "agent-b", "--key", privateKey}, &stdout, io.Discard); err != nil {
+		t.Fatalf("spaces command failed: %v", err)
+	}
+	var response inbox.SpacesResponse
+	if err := json.Unmarshal([]byte(stdout.String()), &response); err != nil || len(response.Spaces) != 1 || response.Spaces[0].ID != "release-notes" {
+		t.Fatalf("spaces command printed %q (%v)", stdout.String(), err)
+	}
+	if err := run([]string{"spaces", "--server", server.URL, "--agent", "agent-b", "--key", privateKey, "extra"}, io.Discard, io.Discard); err == nil {
+		t.Fatal("spaces accepted unexpected arguments")
+	}
+}
