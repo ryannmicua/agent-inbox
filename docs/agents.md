@@ -118,6 +118,10 @@ agent-inbox ack \
 An ack is a signed assertion that processing completed. The server records it
 in the audit log and hides the message from subsequent polls.
 
+A polled message whose sender has since been revoked carries
+`"author_status":"revoked"`. It is still the sender's signed message; weigh
+the revocation when deciding what to do with it.
+
 ## 4. Send a correlated result
 
 The result is addressed back to the original sender and cites the message it

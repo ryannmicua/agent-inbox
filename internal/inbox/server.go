@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,9 @@ const (
 	HeaderNonce          = "X-Request-Nonce"
 	HeaderSignature      = "X-Request-Signature"
 	MinimumRetryInterval = time.Second
+	// revokedCredentialAuditInterval caps auth.revoked_credential rows to one
+	// per agent and key in this window, so a revoked bot cannot flood the log.
+	revokedCredentialAuditInterval = time.Minute
 )
 
 var (
@@ -56,6 +60,11 @@ type Server struct {
 	now      func() time.Time
 	hub      *doorbellHub
 	preAuth  preAuthCounters
+
+	registryMu       sync.Mutex
+	registrySHA256   string // last registry hash known to be recorded
+	revokedAuditMu   sync.Mutex
+	revokedAuditedAt map[string]time.Time
 }
 
 type preAuthCounters struct {
@@ -102,7 +111,7 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 	if config.MaxPollLimit <= 0 {
 		config.MaxPollLimit = 100
 	}
-	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub()}, nil
+	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub(), revokedAuditedAt: make(map[string]time.Time)}, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +138,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAuthenticationFailure(w)
 		return
 	}
+	s.observeRegistry(r.Context())
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	s.route(w, r, identity)
 }
@@ -163,8 +173,15 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 	if err != nil || requestTime.Before(now.Add(-s.config.RequestSkew)) || requestTime.After(now.Add(s.config.RequestSkew)) {
 		return authContext{}, &APIError{Code: "stale_request", Message: "request timestamp is outside the accepted clock window"}
 	}
+	verify := func(public ed25519.PublicKey) bool {
+		sig, err := base64.StdEncoding.DecodeString(signature)
+		return err == nil && len(sig) == ed25519.SignatureSize && ed25519.Verify(public, RequestSigningBytes(agentID, keyID, r.Method, r.URL.RequestURI(), timestamp, nonce, body), sig)
+	}
 	agent, public, err := s.registry.Key(agentID, keyID)
 	if err != nil {
+		if errors.Is(err, ErrUnknownAgent) || errors.Is(err, ErrUnknownKey) {
+			s.auditRevokedCredential(r, agentID, keyID, verify)
+		}
 		if errors.Is(err, ErrUnknownAgent) {
 			return authContext{}, &APIError{Code: "unregistered_agent", Message: "agent is unknown, disabled, or revoked"}
 		}
@@ -173,8 +190,7 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 		}
 		return authContext{}, &APIError{Code: "registry_unavailable", Message: "agent registry could not be loaded"}
 	}
-	sig, err := base64.StdEncoding.DecodeString(signature)
-	if err != nil || len(sig) != ed25519.SignatureSize || !ed25519.Verify(public, RequestSigningBytes(agentID, keyID, r.Method, r.URL.RequestURI(), timestamp, nonce, body), sig) {
+	if !verify(public) {
 		return authContext{}, &APIError{Code: "invalid_signature", Message: "request signature is invalid"}
 	}
 	err = s.store.RecordNonce(r.Context(), agentID, nonce, s.now())
@@ -185,6 +201,136 @@ func (s *Server) authenticate(r *http.Request, body []byte) (authContext, *APIEr
 		return authContext{}, &APIError{Code: "storage_unavailable", Message: "request replay state could not be saved"}
 	}
 	return authContext{agent: agent, keyID: keyID, key: public}, nil
+}
+
+// auditRevokedCredential records use of a key that is still listed but
+// disabled, directly or through its agent. Only a request whose signature
+// verifies against that key is recorded, so unknown callers still cannot grow
+// the audit log, and rows are capped per agent and key.
+func (s *Server) auditRevokedCredential(r *http.Request, agentID, keyID string, verify func(ed25519.PublicKey) bool) {
+	agent, public, err := s.registry.DisabledKey(agentID, keyID)
+	if err != nil || !verify(public) {
+		return
+	}
+	now := s.now()
+	capKey := agentID + "\x00" + keyID
+	s.revokedAuditMu.Lock()
+	for key, at := range s.revokedAuditedAt {
+		if now.Sub(at) >= revokedCredentialAuditInterval {
+			delete(s.revokedAuditedAt, key)
+		}
+	}
+	if _, recent := s.revokedAuditedAt[capKey]; recent {
+		s.revokedAuditMu.Unlock()
+		return
+	}
+	s.revokedAuditedAt[capKey] = now
+	s.revokedAuditMu.Unlock()
+
+	s.observeRegistry(r.Context())
+	code := "key_disabled"
+	if agent.Disabled {
+		code = "agent_disabled"
+	}
+	path := r.URL.Path
+	if len(path) > 200 {
+		path = path[:200]
+	}
+	if err := s.store.AppendAudit(r.Context(), AuditRecord{
+		Action: "auth.revoked_credential", ActorID: agentID, TenantID: agent.TenantID,
+		Outcome: "rejected", Code: code,
+		Detail: map[string]any{"key_id": keyID, "method": r.Method, "path": path},
+	}); err != nil {
+		log.Printf("record revoked credential use by %s/%s: %v", agentID, keyID, err)
+	}
+}
+
+// observeRegistry appends one registry.changed audit row for each registry
+// edit the service observes. The store records the hash transition and the
+// audit row together, so restarts and concurrent instances record a change
+// once.
+func (s *Server) observeRegistry(ctx context.Context) {
+	snapshot, err := s.registry.Snapshot()
+	if err != nil {
+		return // Requests already fail closed on an unreadable registry.
+	}
+	s.registryMu.Lock()
+	defer s.registryMu.Unlock()
+	if snapshot.SHA256 == s.registrySHA256 {
+		return
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		previousSHA, previousJSON, err := s.store.RegistryState(ctx)
+		if err != nil {
+			log.Printf("read recorded registry state: %v", err)
+			return
+		}
+		if previousSHA == snapshot.SHA256 {
+			s.registrySHA256 = snapshot.SHA256
+			return
+		}
+		previous := map[string]RegistryAgent{}
+		if len(previousJSON) > 0 {
+			if err := json.Unmarshal(previousJSON, &previous); err != nil {
+				log.Printf("decode recorded registry state: %v", err)
+				return
+			}
+		}
+		encoded, err := json.Marshal(snapshot.Agents)
+		if err != nil {
+			log.Printf("encode registry state: %v", err)
+			return
+		}
+		recorded, err := s.store.RecordRegistryChange(ctx, RegistryChange{
+			PreviousSHA256: previousSHA, SHA256: snapshot.SHA256, AgentsJSON: encoded, ObservedAt: s.now(),
+			Audit: AuditRecord{Action: "registry.changed", ActorID: "system", Outcome: "recorded", Detail: registryChangeDetail(previousSHA, snapshot.SHA256, previous, snapshot.Agents)},
+		})
+		if err != nil {
+			log.Printf("record registry change: %v", err)
+			return
+		}
+		if recorded {
+			s.registrySHA256 = snapshot.SHA256
+			return
+		}
+		// Another instance recorded a change first; diff against its state.
+	}
+}
+
+func registryChangeDetail(oldSHA, newSHA string, previous, current map[string]RegistryAgent) map[string]any {
+	added, removed, disabled, enabled, keysChanged, policyChanged := []string{}, []string{}, []string{}, []string{}, []string{}, []string{}
+	for id, agent := range current {
+		before, existed := previous[id]
+		if !existed {
+			added = append(added, id)
+			continue
+		}
+		if agent.Disabled && !before.Disabled {
+			disabled = append(disabled, id)
+		}
+		if !agent.Disabled && before.Disabled {
+			enabled = append(enabled, id)
+		}
+		if !slices.Equal(agent.PublicKeys, before.PublicKeys) {
+			keysChanged = append(keysChanged, id)
+		}
+		if agent.TenantID != before.TenantID || !slices.Equal(agent.AllowedRecipients, before.AllowedRecipients) || !slices.Equal(agent.AllowedKinds, before.AllowedKinds) {
+			policyChanged = append(policyChanged, id)
+		}
+	}
+	for id := range previous {
+		if _, exists := current[id]; !exists {
+			removed = append(removed, id)
+		}
+	}
+	for _, list := range [][]string{added, removed, disabled, enabled, keysChanged, policyChanged} {
+		slices.Sort(list)
+	}
+	return map[string]any{
+		"old_sha256": oldSHA, "new_sha256": newSHA,
+		"added": added, "removed": removed, "disabled": disabled, "enabled": enabled,
+		"keys_changed": keysChanged, "policy_changed": policyChanged,
+	}
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) {
@@ -387,7 +533,7 @@ func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAg
 	if !messageIDPattern.MatchString(messageID) {
 		messageID = ""
 	}
-	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
+	if err := s.store.AppendAudit(context.Background(), AuditRecord{Action: "send", ActorID: agent.ID, SubjectID: messageID, TenantID: agent.TenantID, Outcome: "rejected", Code: auditCode}); err != nil {
 		log.Printf("record rejected send by %s (%s): %v", agent.ID, auditCode, err)
 	}
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
@@ -429,6 +575,18 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
 		return
+	}
+	authorStatus := map[string]string{}
+	for i := range messages {
+		sender := messages[i].SenderID
+		status, known := authorStatus[sender]
+		if !known {
+			if _, revoked, err := s.revocation(sender, messages[i].TenantID); err == nil && revoked {
+				status = AuthorStatusRevoked
+			}
+			authorStatus[sender] = status
+		}
+		messages[i].AuthorStatus = status
 	}
 	writeJSON(w, http.StatusOK, PollResponse{Messages: messages})
 }
@@ -586,6 +744,7 @@ func (s *Server) RunNotifications(ctx context.Context) {
 }
 
 func (s *Server) dispatchDue(ctx context.Context) {
+	s.observeRegistry(ctx)
 	candidates, err := s.store.DueNotifications(ctx, s.now(), s.config.RetryInterval, s.config.MaxDoorbellAttempts)
 	if err != nil {
 		log.Printf("load due notifications: %v", err)
@@ -593,6 +752,17 @@ func (s *Server) dispatchDue(ctx context.Context) {
 	}
 	for _, c := range candidates {
 		if c.Escalated {
+			continue
+		}
+		if reason, revoked, err := s.revocation(c.Recipient, c.TenantID); err == nil && revoked {
+			marked, err := s.store.MarkRecipientRevoked(ctx, c.MessageID, reason, s.now())
+			if err != nil {
+				log.Printf("record revoked recipient for %s: %v", c.MessageID, err)
+				continue
+			}
+			if marked {
+				s.notify(Notification{Event: "delivery.recipient_revoked", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID, Code: reason})
+			}
 			continue
 		}
 		if c.Attempts < s.config.MaxDoorbellAttempts {
@@ -625,6 +795,24 @@ func (s *Server) ring(message DeliveredMessage) {
 		return
 	}
 	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
+}
+
+// revocation reports whether an agent can no longer act in a tenant: it was
+// removed or disabled, moved to another tenant, or has no active key. A
+// registry read failure is returned as an error, never as a revocation.
+func (s *Server) revocation(agentID, tenantID string) (string, bool, error) {
+	agent, err := s.registry.Agent(agentID)
+	switch {
+	case errors.Is(err, ErrUnknownAgent):
+		return "unknown_recipient", true, nil
+	case err != nil:
+		return "", false, err
+	case agent.TenantID != tenantID:
+		return "wrong_tenant", true, nil
+	case !contains(agent.PublicKeys, func(k RegistryKey) bool { return !k.Disabled }):
+		return "recipient_key_unavailable", true, nil
+	}
+	return "", false, nil
 }
 
 func (s *Server) assignedToTenant(agentID, tenantID string) bool {

@@ -92,7 +92,7 @@ revocation.
 | `INBOX_REGISTRY_PATH` | `/etc/agent-inbox/registry.json` | Human-managed JSON registry path. |
 | `INBOX_WEBHOOK_URL` | `http://notification-sink:8081/notifications` in Compose | Webhook for consequential human-visible events. Remote hosts require HTTPS; HTTP is limited to loopback IPs, `localhost`, and the exact bundled Compose hostname `notification-sink`. Required at startup; use a human-operated endpoint in production. |
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax with a minimum of `1s`. |
-| `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. Tenant reassignment suppresses rings but does not cancel the schedule. |
+| `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. A recipient that is revoked, removed, or moved to another tenant stops the schedule with `delivery.recipient_revoked` instead. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time; maximum `12h` to match nonce retention. Accepts Go duration syntax. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
@@ -115,8 +115,8 @@ For example, the raw password `p/a?b#c%d` needs this server URL:
 Each webhook event includes its event name, timestamp, message ID, agent IDs,
 tenant, kind, or rejection code as applicable. It never includes message
 payloads or key material. Events include `message.accepted`,
-`message.acknowledged`, `message.rejected`, and
-`message.unacknowledged_escalation`. Webhook delivery is best-effort and each
+`message.acknowledged`, `message.rejected`,
+`message.unacknowledged_escalation`, and `delivery.recipient_revoked`. Webhook delivery is best-effort and each
 event is attempted once after its consequence is persisted. A delivery failure
 adds a `notification.failed` audit entry with the event, message ID when
 available, and error class; it does not undo a message or acknowledgement or
@@ -182,19 +182,71 @@ The service supports multiple active key IDs per agent to allow overlap:
 
 ### Revoke an agent or key
 
-For a whole agent, either remove its entry or set `"disabled": true`. For a
-single key, set `"disabled": true` on that `public_keys` entry or remove it.
-Replace the file and confirm requests signed by the old credentials receive
-`authentication_failed`. The periodic server log reports aggregate counts by
-authentication failure reason. Revocation affects new requests immediately; it
-does not delete already accepted messages or audit history. Open doorbell
-streams are closed at the next heartbeat after their signing key is revoked.
+Disable before you remove. For a whole agent, set `"disabled": true` on its
+entry; for a single key, set `"disabled": true` on that `public_keys` entry.
+Keep the disabled entry listed: the server then audits later use of the
+credential and can still check the agent's historical signatures. Remove the
+entry only after you no longer need either. Replace the file and confirm
+requests signed by the old credentials receive `authentication_failed`.
+Revocation affects new requests immediately; it does not delete already
+accepted messages or audit history. Open doorbell streams are closed at the
+next heartbeat after their signing key is revoked.
+
+The revocation leaves these records:
+
+- One `registry.changed` audit row for the edit (see
+  [Registry change audit](#registry-change-audit)).
+- `auth.revoked_credential` when a request's signature verifies against a key
+  that is listed but disabled, directly or through its agent. The row names the
+  agent, tenant, `key_id`, method, and path, with code `agent_disabled` or
+  `key_disabled`. It is capped at one row per agent and key per minute, in
+  memory, so the count restarts with the server. The caller still receives the
+  same `authentication_failed` response as any other failure. Requests from
+  unlisted agents or keys, or with signatures that do not verify, stay out of
+  the audit log and appear only in the periodic server log's aggregate counts
+  by reason.
+- `delivery.recipient_revoked` for each unacknowledged message whose recipient
+  was disabled, removed, moved to another tenant, or left without an active key.
+  At its next scheduled retry the message stops ringing, gets one audit row
+  (code `unknown_recipient`, `wrong_tenant`, or `recipient_key_unavailable`)
+  and one webhook event, and never escalates as merely unacknowledged. This
+  means "this work will not be picked up", not "a bot is slow". Nothing is
+  deleted: if the agent is restored, its poll still returns the message and it
+  can acknowledge it, but doorbells do not resume. An unreadable registry is
+  never treated as a revocation.
+- Messages the revoked agent authored stay stored, attributed, and
+  acknowledgeable by their recipients. Polls flag them `author_status:
+  "revoked"`, computed from the registry at read time.
 
 Changing an agent's tenant immediately isolates it from messages stored under
 its previous tenant. Those messages remain in the audit and storage history but
 no longer appear in that agent's polls, can no longer be acknowledged by it, and
-will not trigger further doorbells to it. An unacknowledged message still follows
-the bounded notification schedule and escalates once to the operator webhook.
+will not trigger further doorbells to it. Its unacknowledged messages get the
+`delivery.recipient_revoked` disposition with code `wrong_tenant`.
+
+### Registry change audit
+
+The service records each registry edit it observes as one `registry.changed`
+audit row, actor `system`, outcome `recorded`. It checks the file's SHA-256 on
+every authenticated request, before auditing revoked-credential use, and on
+every notification tick (at most every 10 s), so an edit is recorded within
+seconds even when no agent is active. The detail holds:
+
+| Field | Meaning |
+| --- | --- |
+| `old_sha256`, `new_sha256` | The previously recorded and the new file hash. The first row in a database has an empty `old_sha256` and lists every agent as added. |
+| `added`, `removed` | Agent IDs that appeared or disappeared. |
+| `disabled`, `enabled` | Agents whose own `disabled` flag changed. |
+| `keys_changed` | Agents whose keys were added, removed, replaced, disabled, or re-enabled. |
+| `policy_changed` | Agents whose tenant, allowed recipients, or allowed kinds changed. |
+
+The last recorded hash and parsed agents are kept in the `registry_state`
+table and updated in the same transaction as the audit row, only if the
+recorded hash has not moved. Restarts and several instances on one PostgreSQL
+database therefore record each edit once. Edits that come and go between two
+checks are not seen; the review history of `registry.json` remains the full
+record. A malformed registry is not recorded; requests fail closed until it is
+fixed.
 
 ## Signing and delivery behavior
 
@@ -330,6 +382,12 @@ The Compose named volume survives container replacement. The server initializes
 tables idempotently and applies documented compatibility migrations at startup.
 This release removes legacy acknowledgement metadata columns from SQLite; make a
 backup first and do not expect an older binary to use the migrated database.
+It also adds a nullable `notification_state.disposition` column and a
+`registry_state` table on both backends. Existing rows keep a null disposition
+and stay on the normal doorbell schedule. The first start after upgrading
+records one baseline `registry.changed` row. An older binary ignores the new
+column and table, but it would resume doorbells and escalation for
+dispositioned messages.
 Keep the prior image available until health and audit checks pass. Restore a
 backup to roll back across an incompatible schema change.
 
@@ -344,8 +402,10 @@ docker compose exec -T server inboxd audit \
 
 Output is JSON in descending audit sequence. Records include accepted and
 authenticated rejected sends, accepted and rejected acknowledgements, duplicate
-sends, unacknowledged escalation attempts, and failed webhook deliveries.
-Unauthenticated failures are not persisted. Audit rows are append-only: both
+sends, unacknowledged escalation attempts, revoked-recipient dispositions,
+registry changes, use of disabled credentials, and failed webhook deliveries.
+Rejected sends carry the message ID as `subject_id` when the envelope's ID is
+well formed. Other unauthenticated failures are not persisted. Audit rows are append-only: both
 backends reject updates and deletes with database triggers. Restrict access to
 the database and audit output.
 
@@ -439,7 +499,7 @@ acknowledgements to finish, then take an online SQLite snapshot with the
 and verifying the snapshot. Start the PostgreSQL Compose profile once to create
 its empty schema, then stop its server before import. Use `sqlite3` and `psql`
 clients on the operator machine; `INBOX_DATABASE_URL` must be reachable from
-that machine. Export/import the four data tables in dependency order:
+that machine. Export/import the five data tables in dependency order:
 
 ```sh
 sqlite3 -header -csv agent-inbox-backup.db \
@@ -449,7 +509,9 @@ sqlite3 -header -csv agent-inbox-backup.db \
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json FROM audit_log ORDER BY sequence' > audit_log.csv
 sqlite3 -header -csv agent-inbox-backup.db \
-  'SELECT message_id,attempts,last_notified_at,escalated_at FROM notification_state' > notification_state.csv
+  'SELECT message_id,attempts,last_notified_at,escalated_at,disposition FROM notification_state' > notification_state.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT id,sha256,agents_json,observed_at FROM registry_state' > registry_state.csv
 ```
 
 Set `INBOX_DATABASE_URL` to the PostgreSQL target, then import with `psql` in
@@ -468,7 +530,8 @@ psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 \copy messages(sequence,id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at) FROM 'messages.csv' CSV HEADER
 \copy request_nonces(agent_id,nonce,created_at) FROM 'request_nonces.csv' CSV HEADER
 \copy audit_log(sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json) FROM 'audit_log.csv' CSV HEADER
-\copy notification_state(message_id,attempts,last_notified_at,escalated_at) FROM 'notification_state.csv' CSV HEADER
+\copy notification_state(message_id,attempts,last_notified_at,escalated_at,disposition) FROM 'notification_state.csv' CSV HEADER
+\copy registry_state(id,sha256,agents_json,observed_at) FROM 'registry_state.csv' CSV HEADER
 SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
 SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
 SQL

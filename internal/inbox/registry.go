@@ -2,7 +2,9 @@ package inbox
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +38,18 @@ type RegistryKey struct {
 type RegistrySource interface {
 	Agent(id string) (RegistryAgent, error)
 	Key(agentID, keyID string) (RegistryAgent, ed25519.PublicKey, error)
+	// DisabledKey returns a key that is still listed but disabled, directly or
+	// through its agent, so revoked-credential use can be told apart from
+	// unknown callers. It returns ErrUnknownKey for anything else.
+	DisabledKey(agentID, keyID string) (RegistryAgent, ed25519.PublicKey, error)
+	// Snapshot returns every listed agent, including disabled ones, and the
+	// SHA-256 of the registry file the entries were parsed from.
+	Snapshot() (RegistrySnapshot, error)
+}
+
+type RegistrySnapshot struct {
+	SHA256 string
+	Agents map[string]RegistryAgent
 }
 
 // FileRegistry reads the human-managed file for every lookup. This intentionally
@@ -51,10 +65,24 @@ func (f FileRegistry) Validate() error {
 }
 
 func (f FileRegistry) load() (map[string]RegistryAgent, error) {
+	snapshot, err := f.Snapshot()
+	return snapshot.Agents, err
+}
+
+func (f FileRegistry) Snapshot() (RegistrySnapshot, error) {
 	data, err := os.ReadFile(f.Path)
 	if err != nil {
-		return nil, fmt.Errorf("read registry: %w", err)
+		return RegistrySnapshot{}, fmt.Errorf("read registry: %w", err)
 	}
+	agents, err := parseRegistry(data)
+	if err != nil {
+		return RegistrySnapshot{}, err
+	}
+	sum := sha256.Sum256(data)
+	return RegistrySnapshot{SHA256: hex.EncodeToString(sum[:]), Agents: agents}, nil
+}
+
+func parseRegistry(data []byte) (map[string]RegistryAgent, error) {
 	if err := validateRegistryFieldNames(data); err != nil {
 		return nil, fmt.Errorf("parse registry JSON: %w", err)
 	}
@@ -197,6 +225,25 @@ func (f FileRegistry) Key(agentID, keyID string) (RegistryAgent, ed25519.PublicK
 	}
 	for _, k := range a.PublicKeys {
 		if k.ID != keyID || k.Disabled {
+			continue
+		}
+		pub, _ := base64.StdEncoding.DecodeString(k.PublicKey)
+		return a, ed25519.PublicKey(pub), nil
+	}
+	return RegistryAgent{}, nil, ErrUnknownKey
+}
+
+func (f FileRegistry) DisabledKey(agentID, keyID string) (RegistryAgent, ed25519.PublicKey, error) {
+	entries, err := f.load()
+	if err != nil {
+		return RegistryAgent{}, nil, err
+	}
+	a, ok := entries[agentID]
+	if !ok {
+		return RegistryAgent{}, nil, ErrUnknownKey
+	}
+	for _, k := range a.PublicKeys {
+		if k.ID != keyID || (!k.Disabled && !a.Disabled) {
 			continue
 		}
 		pub, _ := base64.StdEncoding.DecodeString(k.PublicKey)

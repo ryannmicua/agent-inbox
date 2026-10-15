@@ -103,6 +103,13 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			last_notified_at TIMESTAMPTZ,
 			escalated_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE notification_state ADD COLUMN IF NOT EXISTS disposition TEXT`,
+		`CREATE TABLE IF NOT EXISTS registry_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			sha256 TEXT NOT NULL,
+			agents_json TEXT NOT NULL,
+			observed_at TIMESTAMPTZ NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -333,7 +340,7 @@ func (s *PostgresStore) DueNotifications(ctx context.Context, now time.Time, ret
 	cutoff := now.UTC().Add(-retry)
 	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at
 		FROM messages m JOIN notification_state n ON n.message_id = m.id
-		WHERE m.acknowledged_at IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= $1)
+		WHERE m.acknowledged_at IS NULL AND n.disposition IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= $1)
 		AND (n.attempts < $2 OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
 	if err != nil {
 		return nil, err
@@ -372,7 +379,7 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 		return false, tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = $1
-		WHERE message_id = $2 AND escalated_at IS NULL
+		WHERE message_id = $2 AND escalated_at IS NULL AND disposition IS NULL
 		AND EXISTS (SELECT 1 FROM messages WHERE id = $2 AND acknowledged_at IS NULL)`, now.UTC(), id)
 	if err != nil {
 		return false, err
@@ -391,6 +398,71 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *PostgresStore) MarkRecipientRevoked(ctx context.Context, id, reason string, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var recipient, tenant string
+	var acknowledged any
+	if err := tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&recipient, &tenant, &acknowledged); err != nil {
+		return false, err
+	}
+	if acknowledged != nil {
+		return false, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET disposition = $1
+		WHERE message_id = $2 AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if updated == 0 {
+		return false, tx.Commit()
+	}
+	if err := insertPostgresAudit(ctx, tx, recipientRevokedAudit(id, recipient, tenant, reason), now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *PostgresStore) RegistryState(ctx context.Context) (string, []byte, error) {
+	var sha, agents string
+	err := s.db.QueryRowContext(ctx, `SELECT sha256, agents_json FROM registry_state WHERE id = 1`).Scan(&sha, &agents)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	return sha, []byte(agents), err
+}
+
+func (s *PostgresStore) RecordRegistryChange(ctx context.Context, change RegistryChange) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var result sql.Result
+	if change.PreviousSHA256 == "" {
+		result, err = tx.ExecContext(ctx, `INSERT INTO registry_state(id, sha256, agents_json, observed_at) VALUES(1, $1, $2, $3) ON CONFLICT(id) DO NOTHING`, change.SHA256, string(change.AgentsJSON), change.ObservedAt.UTC())
+	} else {
+		result, err = tx.ExecContext(ctx, `UPDATE registry_state SET sha256 = $1, agents_json = $2, observed_at = $3 WHERE id = 1 AND sha256 = $4`, change.SHA256, string(change.AgentsJSON), change.ObservedAt.UTC(), change.PreviousSHA256)
+	}
+	if err != nil {
+		return false, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated == 0 {
+		return false, err
+	}
+	if err := insertPostgresAudit(ctx, tx, change.Audit, change.ObservedAt); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 type postgresStateError interface {

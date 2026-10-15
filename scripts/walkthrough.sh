@@ -4,11 +4,13 @@
 # poll and acknowledge while offline, and reply with a correlated result.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
-#                                   replay, then revoke the Python bot
+#                                   replay, then revoke the Python bot and
+#                                   show what the audit records about it
 #   scripts/walkthrough.sh remote   replay against an existing server; set
 #                                   INBOX_SERVER, CLI_BOT, CLI_KEY, RAW_BOT, RAW_KEY
 #
-# Needs Go, Python 3, and the Python 'cryptography' package. In remote mode the
+# Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
+# skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
 # operator must have registered both bots, each allowed to message the other
 # with kinds instruction and result. Revocation is an operator registry edit,
 # so only local mode replays it. Both bots should start with empty inboxes.
@@ -21,7 +23,9 @@ if [[ "$mode" != local && "$mode" != remote ]]; then
   echo "usage: $0 [local|remote]" >&2
   exit 2
 fi
-command -v go >/dev/null || { echo "go is required" >&2; exit 1; }
+if [[ "$mode" == local || -z "${AGENT_INBOX_BIN:-}" ]]; then
+  command -v go >/dev/null || { echo "go is required" >&2; exit 1; }
+fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 python3 -c 'import cryptography' 2>/dev/null || { echo "the Python 'cryptography' package is required" >&2; exit 1; }
 
@@ -38,8 +42,12 @@ json_field() { python3 -c 'import json,sys; v=json.load(sys.stdin)
 for k in sys.argv[1].split("."): v=v[int(k)] if k.isdigit() else v[k]
 print(v)' "$1"; }
 
-go build -trimpath -o "$tmp_dir/agent-inbox" ./cmd/agent-inbox
-cli_bin="$tmp_dir/agent-inbox"
+if [[ "$mode" == remote && -n "${AGENT_INBOX_BIN:-}" ]]; then
+  cli_bin="$AGENT_INBOX_BIN"
+else
+  go build -trimpath -o "$tmp_dir/agent-inbox" ./cmd/agent-inbox
+  cli_bin="$tmp_dir/agent-inbox"
+fi
 raw_agent=(python3 "$repo_root/scripts/raw_agent.py")
 
 if [[ "$mode" == local ]]; then
@@ -66,7 +74,7 @@ EOF
   pids+=("$!")
   export INBOX_LISTEN_ADDR="127.0.0.1:$server_port" INBOX_DB_PATH="$tmp_dir/inbox.db"
   INBOX_REGISTRY_PATH="$tmp_dir/registry.json" \
-    INBOX_WEBHOOK_URL="http://127.0.0.1:$sink_port/notifications" \
+    INBOX_WEBHOOK_URL="http://127.0.0.1:$sink_port/notifications" INBOX_RETRY_INTERVAL=2s \
     "$tmp_dir/inboxd" > "$tmp_dir/server.log" 2>&1 &
   pids+=("$!")
   INBOX_SERVER="http://127.0.0.1:$server_port"
@@ -119,7 +127,19 @@ echo "received result $(json_field messages.0.id <<< "$returned")"
 cli ack --message "$result_id"
 
 if [[ "$mode" == local ]]; then
-  step "The operator disables $RAW_BOT"
+  audit_rows() { "$tmp_dir/inboxd" audit --limit 100; }
+  audit_has() { audit_rows | python3 -c 'import json,sys
+action, outcome, code = sys.argv[1:4]
+sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("code","") == code for e in json.load(sys.stdin)) else 1)' "$@"; }
+
+  step "Work is left pending in both directions"
+  pending="$(cli send --to "$RAW_BOT" --kind instruction --payload '{"task":"never collected"}')"
+  pending_id="$(json_field id <<< "$pending")"
+  authored="$(raw send --to "$CLI_BOT" --kind instruction --payload '{"task":"written before revocation"}')"
+  authored_id="$(json_field id <<< "$authored")"
+  echo "pending for $RAW_BOT: $pending_id; pending for $CLI_BOT: $authored_id"
+
+  step "The operator disables $RAW_BOT (disable first, remove later)"
   write_registry true
   if raw poll 2>"$tmp_dir/refused.txt"; then echo "revoked bot could still poll" >&2; exit 1; fi
   cat "$tmp_dir/refused.txt"
@@ -128,10 +148,31 @@ if [[ "$mode" == local ]]; then
   fi
   cat "$tmp_dir/refused.txt"
 
+  step "$CLI_BOT still receives $RAW_BOT's earlier message, flagged as from a revoked author"
+  flagged="$(cli poll)"
+  [[ "$(json_field messages.0.id <<< "$flagged")" == "$authored_id" && "$(json_field messages.0.author_status <<< "$flagged")" == revoked ]] || { echo "unexpected poll: $flagged" >&2; exit 1; }
+  echo "message $authored_id from $(json_field messages.0.sender_id <<< "$flagged"): author_status=revoked"
+  cli ack --message "$authored_id"
+
+  step "The pending work for $RAW_BOT is dispositioned instead of escalated"
+  for _ in $(seq 1 30); do
+    audit_has delivery.recipient_revoked attempted unknown_recipient && break
+    sleep 0.5
+  done
+  audit_has delivery.recipient_revoked attempted unknown_recipient || { echo "pending work was not dispositioned" >&2; exit 1; }
+  if audit_has message.unacknowledged_escalation attempted ""; then echo "revoked recipient's work escalated as unacknowledged" >&2; exit 1; fi
+  for _ in $(seq 1 10); do grep -q '"delivery.recipient_revoked"' "$tmp_dir/notifications.log" && break; sleep 0.2; done
+  grep -q '"delivery.recipient_revoked"' "$tmp_dir/notifications.log" || { echo "operator webhook missed delivery.recipient_revoked" >&2; exit 1; }
+  echo "webhook: $(grep -o '{"code".*"delivery.recipient_revoked"[^}]*}' "$tmp_dir/notifications.log" | head -1)"
+  audit_has registry.changed recorded "" || { echo "registry change was not audited" >&2; exit 1; }
+  audit_has auth.revoked_credential rejected agent_disabled || { echo "revoked credential use was not audited" >&2; exit 1; }
+
   step "Audit trail"
-  "$tmp_dir/inboxd" audit --limit 20 | python3 -c 'import json,sys
+  audit_rows | python3 -c 'import json,sys
 for e in reversed(json.load(sys.stdin)):
-    print(e["sequence"], e["action"], e.get("actor_id",""), e.get("subject_id",""), e["outcome"], e.get("code",""))'
+    d = e.get("detail") or {}
+    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id") if d.get(k)}
+    print(e["sequence"], e["action"], e.get("actor_id",""), e.get("subject_id","")[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
 fi
 
 step "Walkthrough passed ($mode)"
