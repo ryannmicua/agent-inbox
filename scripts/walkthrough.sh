@@ -6,7 +6,8 @@
 # space, each acknowledging only its own delivery, and edit a shared note from
 # the same revision, where the second write conflicts and is merged. When the
 # inbox has an object store, the CLI bot also uploads a file to the space and
-# the Python bot downloads and verifies it.
+# the Python bot downloads and verifies it. Last, the CLI bot's agent runtime
+# repeats a short exchange through the MCP adapter, agent-inbox-mcp.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
 #                                   replay, edit the Python bot's space grants
@@ -26,7 +27,8 @@
 # Without a store, the walkthrough shows artifacts_disabled and goes on.
 #
 # Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
-# skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
+# skip Go by setting AGENT_INBOX_BIN and AGENT_INBOX_MCP_BIN to a prebuilt
+# agent-inbox CLI and agent-inbox-mcp adapter. In remote mode the
 # operator must have registered both bots, each allowed to message the other
 # with kinds instruction and result. Revocation is an operator registry edit,
 # so only local mode replays it. Both bots should start with empty inboxes.
@@ -39,7 +41,7 @@ if [[ "$mode" != local && "$mode" != remote ]]; then
   echo "usage: $0 [local|remote]" >&2
   exit 2
 fi
-if [[ "$mode" == local || -z "${AGENT_INBOX_BIN:-}" ]]; then
+if [[ "$mode" == local || -z "${AGENT_INBOX_BIN:-}" || -z "${AGENT_INBOX_MCP_BIN:-}" ]]; then
   command -v go >/dev/null || { echo "go is required" >&2; exit 1; }
 fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
@@ -64,6 +66,12 @@ if [[ "$mode" == remote && -n "${AGENT_INBOX_BIN:-}" ]]; then
 else
   go build -trimpath -o "$tmp_dir/agent-inbox" ./cmd/agent-inbox
   cli_bin="$tmp_dir/agent-inbox"
+fi
+if [[ "$mode" == remote && -n "${AGENT_INBOX_MCP_BIN:-}" ]]; then
+  mcp_bin="$AGENT_INBOX_MCP_BIN"
+else
+  go build -trimpath -o "$tmp_dir/agent-inbox-mcp" ./cmd/agent-inbox-mcp
+  mcp_bin="$tmp_dir/agent-inbox-mcp"
 fi
 raw_agent=(python3 "$repo_root/scripts/raw_agent.py")
 
@@ -280,6 +288,36 @@ sys.exit(0 if rows[:3] == want else "unexpected artifact audit rows: %s" % rows)
     exit 1
   fi
 fi
+
+step "$CLI_BOT's agent runtime uses the inbox through the MCP adapter"
+# mcp runs one MCP session as the CLI bot: tool calls on stdin, one JSON
+# line per result on stdout.
+mcp() { python3 "$repo_root/scripts/mcp_session.py" "$mcp_bin" --server "$INBOX_SERVER" --agent "$CLI_BOT" --key "$CLI_KEY"; }
+calls="$(printf '{"name":"list_spaces","arguments":{}}\n{"name":"send_message","arguments":{"to":"%s","kind":"instruction","payload":{"task":"summarize the release plan"}}}' "$RAW_BOT")"
+[[ -z "${WALKTHROUGH_SPACE:-}" ]] || calls+="$(printf '\n{"name":"read_note","arguments":{"space":"%s","note":"release-plan"}}' "$WALKTHROUGH_SPACE")"
+session="$(mcp <<< "$calls")"
+mcp_line() { sed -n "${1}p" <<< "$session"; }
+for n in $(seq 1 "$(wc -l <<< "$session")"); do
+  [[ "$(json_field is_error <<< "$(mcp_line "$n")")" == False ]] || { echo "MCP tool call failed: $(mcp_line "$n")" >&2; exit 1; }
+done
+echo "list_spaces: $(mcp_line 1 | python3 -c 'import json,sys; print(", ".join(s["id"] for s in json.load(sys.stdin)["result"]["spaces"]) or "no spaces")')"
+mcp_instruction_id="$(json_field result.id <<< "$(mcp_line 2)")"
+echo "send_message: accepted instruction $mcp_instruction_id"
+if [[ -n "${WALKTHROUGH_SPACE:-}" ]]; then
+  echo "read_note: release-plan @$(json_field result.revision <<< "$(mcp_line 3)") by $(json_field result.author_id <<< "$(mcp_line 3)")"
+fi
+polled="$(raw poll)"
+[[ "$(json_field messages.0.id <<< "$polled")" == "$mcp_instruction_id" ]] || { echo "unexpected poll: $polled" >&2; exit 1; }
+raw ack --message "$mcp_instruction_id" >/dev/null
+mcp_result="$(raw send --to "$CLI_BOT" --kind result --thread "$mcp_instruction_id" --reply-to "$mcp_instruction_id" --payload '{"summary":"two owners, one plan"}')"
+echo "$RAW_BOT (Python) received it, acknowledged, and replied with result $(json_field id <<< "$mcp_result")"
+waited="$(mcp <<< '{"name":"poll_inbox","arguments":{"wait_seconds":30}}')"
+[[ "$(json_field result.messages.0.reply_to <<< "$waited")" == "$mcp_instruction_id" ]] || { echo "unexpected MCP poll: $waited" >&2; exit 1; }
+mcp_result_id="$(json_field result.messages.0.id <<< "$waited")"
+echo "poll_inbox: result $mcp_result_id replying to $mcp_instruction_id"
+acked="$(mcp <<< "$(printf '{"name":"ack_message","arguments":{"message_id":"%s"}}\n{"name":"poll_inbox","arguments":{}}' "$mcp_result_id")")"
+[[ "$(json_field result.acknowledged <<< "$(sed -n 1p <<< "$acked")")" == True && "$(json_field result.messages <<< "$(sed -n 2p <<< "$acked")")" == "[]" ]] || { echo "unexpected MCP ack: $acked" >&2; exit 1; }
+echo "ack_message: acknowledged; the inbox is empty"
 
 if [[ "$mode" == local ]]; then
   audit_rows() { "$tmp_dir/inboxd" audit --limit 100; }

@@ -33,7 +33,8 @@ a prompt to poll, never proof of delivery.
   configuration, backup and restore, upgrades, monitoring, audit, and
   troubleshooting.
 - [Agent quickstart](docs/agents.md): key generation, signed send, poll, ack,
-  doorbell, space, shared note, and file-sharing commands.
+  doorbell, space, shared note, and file-sharing commands, and the
+  `agent-inbox-mcp` adapter that offers the inbox as tools to MCP clients.
 - [Protocol reference](docs/protocol.md): request and envelope signing, the
   HTTP API, and delivery semantics for clients written without the CLI, with
   published signing test vectors.
@@ -41,14 +42,15 @@ a prompt to poll, never proof of delivery.
 The default registry is empty. Add and review agents before exposing the
 service. For local validation, run `make test` and `make compose-smoke`.
 `make walkthrough` replays a full exchange between a Go CLI bot and a
-standalone Python bot, including a note edit conflict and revocation; it
-needs the Python `cryptography` package.
+standalone Python bot, including a note edit conflict, an exchange through
+the MCP adapter, and revocation; it needs the Python `cryptography` package.
 
 ## Build
 
 ```sh
 go build -o inboxd ./cmd/inboxd
 go build -o agent-inbox ./cmd/agent-inbox
+go build -o agent-inbox-mcp ./cmd/agent-inbox-mcp
 ```
 
 The SQLite and PostgreSQL drivers are pure Go, so these binaries build without
