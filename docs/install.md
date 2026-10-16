@@ -41,7 +41,7 @@ cgo or a C compiler, and the release binaries need no other libraries.
 ### Download a release binary
 
 This method needs no Go. Each release archive holds all three programs for
-one operating system and processor.
+one operating system and processor, with the license and the README.
 
 1. Pick the archive for this computer and download it with the checksum
    file:

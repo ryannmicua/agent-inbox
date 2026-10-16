@@ -79,6 +79,12 @@ names a pushed commit, branch, or tag; CI sets it to the commit under review.
 standalone Python bot, including a note edit conflict, an exchange through
 the MCP adapter, and revocation; it needs the Python `cryptography` package.
 
+To cut a release, run `make release VERSION=v0.1.0` from a clean, pushed
+checkout of `main` with `gh` logged in. It builds the archives and
+`SHA256SUMS` on this machine, pushes the tag, and publishes the GitHub
+release. `make release-dry-run VERSION=v0.1.0` builds and checks the
+archives in `dist/` without tagging or publishing.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

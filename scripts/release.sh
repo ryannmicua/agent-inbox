@@ -5,8 +5,10 @@
 #   scripts/release.sh --dry-run v0.1.0   build and checksum into dist/v0.1.0 only
 #   scripts/release.sh v0.1.0             build, tag, push the tag, and publish
 #
-# A release must run from a clean checkout of the default branch at the same
-# commit as origin. A dry run reports those checks as warnings and continues.
+# Each archive holds the three programs with LICENSE and README.md. A release
+# must run from a clean checkout of the default branch at the same commit as
+# origin, with LICENSE present. A dry run reports those checks as warnings and
+# continues.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -79,6 +81,12 @@ default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/d
 default_branch="${default_branch#origin/}"
 default_branch="${default_branch:-main}"
 
+# Every archive carries these files beside the programs.
+bundled_files=(LICENSE README.md)
+for file in "${bundled_files[@]}"; do
+  [[ -f "$file" ]] || check_failed "$file is missing; every archive must include it"
+done
+
 if [[ -n "$(git status --porcelain)" ]]; then
   check_failed "the working tree has uncommitted or untracked changes"
 fi
@@ -131,7 +139,9 @@ for target in "${targets[@]}"; do
       -ldflags "-s -w -X $version_var=$version" \
       -o "$stage_dir/$name/$program$ext" "./cmd/$program"
   done
-  cp README.md "$stage_dir/$name/README.md"
+  for file in "${bundled_files[@]}"; do
+    [[ ! -f "$file" ]] || cp "$file" "$stage_dir/$name/$file"
+  done
   find "$stage_dir/$name" -exec env TZ=UTC0 touch -h -t "$touch_stamp" {} +
   if [[ "$goos" == windows ]]; then
     (cd "$stage_dir" && zip -q -r -X "$out_dir/$name.zip" "$name")
