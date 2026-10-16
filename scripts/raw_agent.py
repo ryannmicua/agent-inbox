@@ -11,6 +11,10 @@ Commands (flags fall back to INBOX_SERVER, INBOX_AGENT, INBOX_KEY, INBOX_KEY_ID)
   raw_agent.py send (--to ID | --space ID) --kind instruction|result --payload JSON
                     [--id ID] [--task ID] [--thread ID] [--reply-to ID]
                     [--artifact URI|TYPE|SHA256|SIZE]...
+  raw_agent.py note get --space ID --note ID [--revision N]
+  raw_agent.py note put --space ID --note ID --base N --file PATH
+                        [--media-type TYPE] [--id ID]
+  raw_agent.py note log --space ID --note ID [--limit N]
 """
 
 import argparse
@@ -35,6 +39,9 @@ BACKSLASH = chr(92)
 SHORT_ESCAPES = {'"': '"', BACKSLASH: BACKSLASH, chr(8): "b", chr(12): "f", chr(10): "n", chr(13): "r", chr(9): "t"}
 REQUEST_PREFIX = "agent-inbox-request-v1"
 ENVELOPE_PREFIX = "agent-inbox-envelope-v1\n"
+NOTE_PREFIX = "agent-inbox-note-v1\n"
+NOTE_FIELDS = ("type", "revision_id", "space_id", "note_id", "base_revision", "author_id", "key_id",
+               "created_at", "content_is_data", "media_type", "sha256", "body")
 
 
 class RawNumber(str):
@@ -115,6 +122,15 @@ def canonical_object(env):
 
 def canonical_envelope(env):
     return (ENVELOPE_PREFIX + canonical_object(env)).encode("utf-8")
+
+
+def canonical_note_object(rev):
+    """The canonical note revision object text: every member, in protocol order."""
+    return "{" + ",".join(encode_string(name) + ":" + encode(rev[name]) for name in NOTE_FIELDS) + "}"
+
+
+def canonical_note(rev):
+    return (NOTE_PREFIX + canonical_note_object(rev)).encode("utf-8")
 
 
 def request_bytes(agent, key_id, method, path, timestamp, nonce, body):
@@ -203,6 +219,33 @@ def cmd_send(args):
     return finish(*call(args, "POST", "/v1/messages", body.encode("utf-8")))
 
 
+def cmd_note(args):
+    path = f"/v1/spaces/{args.space}/notes/{args.note}"
+    if args.action == "get":
+        return finish(*call(args, "GET", path + (f"?revision={args.revision}" if args.revision else "")))
+    if args.action == "log":
+        return finish(*call(args, "GET", f"{path}/revisions?limit={args.limit}"))
+    # Read bytes, not text, so the hash covers the file exactly as written.
+    body = open(args.file, "rb").read().decode("utf-8")
+    rev = {
+        "type": "note_revision",
+        "revision_id": args.id or str(uuid.uuid4()),
+        "space_id": args.space,
+        "note_id": args.note,
+        "base_revision": args.base,
+        "author_id": args.agent,
+        "key_id": args.key_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "content_is_data": True,
+        "media_type": args.media_type,
+        "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "body": body,
+    }
+    signature = b64(load_key(args.key).sign(canonical_note(rev)))
+    payload = canonical_note_object(rev)[:-1] + ',"signature":' + encode_string(signature) + "}"
+    return finish(*call(args, "PUT", path, payload.encode("utf-8")))
+
+
 def cmd_vectors(path):
     vectors = parse_json(open(path, encoding="utf-8").read())
     key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(vectors["seed_base64"]))
@@ -220,7 +263,14 @@ def cmd_vectors(path):
         if canonical.decode("utf-8") != r["canonical"] or b64(key.sign(canonical)) != r["signature"]:
             print(f"request vector {r['name']} differs", file=sys.stderr)
             return 1
-    print(f"ok: {len(vectors['envelopes'])} envelope and {len(vectors['requests'])} request vectors match")
+    for v in vectors["notes"]:
+        rev = v["revision"]
+        canonical = canonical_note(rev)
+        if canonical.decode("utf-8") != v["canonical"] or b64(key.sign(canonical)) != v["signature"] \
+                or hashlib.sha256(rev["body"].encode("utf-8")).hexdigest() != rev["sha256"]:
+            print(f"note vector {v['name']} differs:\n got {canonical!r}\nwant {v['canonical']!r}", file=sys.stderr)
+            return 1
+    print(f"ok: {len(vectors['envelopes'])} envelope, {len(vectors['requests'])} request and {len(vectors['notes'])} note vectors match")
     return 0
 
 
@@ -229,12 +279,30 @@ def main(argv):
     sub = parser.add_subparsers(dest="command", required=True)
     vec = sub.add_parser("vectors", help="check this client against the published signing vectors")
     vec.add_argument("file")
-    for name in ("poll", "ack", "send", "spaces"):
-        p = sub.add_parser(name)
+    def connection(p):
         p.add_argument("--server", default=os.environ.get("INBOX_SERVER"))
         p.add_argument("--agent", default=os.environ.get("INBOX_AGENT"))
         p.add_argument("--key", default=os.environ.get("INBOX_KEY"))
         p.add_argument("--key-id", default=os.environ.get("INBOX_KEY_ID", "primary"))
+    note = sub.add_parser("note", help="read and write a space's versioned notes")
+    actions = note.add_subparsers(dest="action", required=True)
+    for action in ("get", "put", "log"):
+        p = actions.add_parser(action)
+        connection(p)
+        p.add_argument("--space", required=True)
+        p.add_argument("--note", required=True)
+        if action == "get":
+            p.add_argument("--revision", type=int)
+        elif action == "log":
+            p.add_argument("--limit", type=int, default=100)
+        else:
+            p.add_argument("--base", type=int, required=True)
+            p.add_argument("--file", required=True)
+            p.add_argument("--media-type", default="text/markdown")
+            p.add_argument("--id")
+    for name in ("poll", "ack", "send", "spaces"):
+        p = sub.add_parser(name)
+        connection(p)
         if name == "poll":
             p.add_argument("--limit", type=int, default=100)
         elif name == "ack":
@@ -261,6 +329,8 @@ def main(argv):
         return finish(*call(args, "POST", f"/v1/messages/{args.message}/ack", b'{"processed":true}'))
     if args.command == "spaces":
         return finish(*call(args, "GET", "/v1/spaces"))
+    if args.command == "note":
+        return cmd_note(args)
     return cmd_send(args)
 
 

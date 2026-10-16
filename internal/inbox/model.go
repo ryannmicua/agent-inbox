@@ -94,6 +94,85 @@ type SpacesResponse struct {
 	Spaces []Space `json:"spaces"`
 }
 
+const (
+	NoteRevisionType = "note_revision"
+	// MaxNoteBodyBytes keeps a revision request under MaxRequestBytes; larger
+	// documents belong in an artifact referenced from a short note.
+	MaxNoteBodyBytes = 48 * 1024
+	// NoticeType and NoticeKind mark a server-authored delivery, such as a new
+	// note revision. A notice is unsigned and has no sender.
+	NoticeType = "notice"
+	NoticeKind = "notice"
+)
+
+// NoteRevision is one signed, author-proposed version of a note. A revision
+// with base_revision 0 creates the note; otherwise base_revision must be the
+// note's head when the server accepts it.
+type NoteRevision struct {
+	Type          string `json:"type"`
+	RevisionID    string `json:"revision_id"`
+	SpaceID       string `json:"space_id"`
+	NoteID        string `json:"note_id"`
+	BaseRevision  int64  `json:"base_revision"`
+	AuthorID      string `json:"author_id"`
+	KeyID         string `json:"key_id"`
+	CreatedAt     string `json:"created_at"`
+	ContentIsData bool   `json:"content_is_data"`
+	MediaType     string `json:"media_type"`
+	SHA256        string `json:"sha256"`
+	Body          string `json:"body"`
+	Signature     string `json:"signature"`
+}
+
+// StoredNoteRevision is an accepted revision with its server-assigned number.
+type StoredNoteRevision struct {
+	NoteRevision
+	TenantID   string    `json:"tenant_id"`
+	Revision   int64     `json:"revision"`
+	AcceptedAt time.Time `json:"accepted_at"`
+	// AuthorStatus is computed from the registry at read time; it is empty
+	// while the author is active.
+	AuthorStatus string `json:"author_status,omitempty"`
+}
+
+// NoteLogEntry describes one revision in a note's history, without its body.
+type NoteLogEntry struct {
+	Revision     int64     `json:"revision"`
+	BaseRevision int64     `json:"base_revision"`
+	RevisionID   string    `json:"revision_id"`
+	AuthorID     string    `json:"author_id"`
+	KeyID        string    `json:"key_id"`
+	CreatedAt    string    `json:"created_at"`
+	MediaType    string    `json:"media_type"`
+	SHA256       string    `json:"sha256"`
+	AcceptedAt   time.Time `json:"accepted_at"`
+	AuthorStatus string    `json:"author_status,omitempty"`
+}
+
+type NoteLogResponse struct {
+	SpaceID   string         `json:"space_id"`
+	NoteID    string         `json:"note_id"`
+	Revisions []NoteLogEntry `json:"revisions"`
+}
+
+// NoteConflictResponse is the 409 answer to a write whose base is not the
+// head. The head fields are empty when the note does not exist yet.
+type NoteConflictResponse struct {
+	Error        APIError `json:"error"`
+	HeadRevision int64    `json:"head_revision"`
+	HeadSHA256   string   `json:"head_sha256"`
+	HeadAuthor   string   `json:"head_author"`
+}
+
+// NoteNotice is the payload of the notice each other reader of a space gets
+// when a note revision is accepted.
+type NoteNotice struct {
+	SpaceID  string `json:"space_id"`
+	NoteID   string `json:"note_id"`
+	Revision int64  `json:"revision"`
+	AuthorID string `json:"author_id"`
+}
+
 type DoorbellEvent struct {
 	MessageID string `json:"message_id"`
 	Sequence  int64  `json:"sequence"`

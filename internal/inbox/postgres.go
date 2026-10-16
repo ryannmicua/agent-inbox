@@ -126,6 +126,39 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS deliveries_recipient ON deliveries(recipient_id, tenant_id, acknowledged_at)`,
 		deliveryBackfill,
+		`CREATE TABLE IF NOT EXISTS notes (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			note_id TEXT NOT NULL,
+			head_revision BIGINT NOT NULL,
+			created_by TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(tenant_id, space_id, note_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS note_revisions (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			note_id TEXT NOT NULL,
+			revision BIGINT NOT NULL,
+			base_revision BIGINT NOT NULL,
+			revision_id TEXT NOT NULL UNIQUE,
+			author_id TEXT NOT NULL,
+			key_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			media_type TEXT NOT NULL,
+			sha256 TEXT NOT NULL,
+			body TEXT NOT NULL,
+			signature TEXT NOT NULL,
+			accepted_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(tenant_id, space_id, note_id, revision)
+		)`,
+		`CREATE OR REPLACE FUNCTION agent_inbox_reject_note_revision_mutation() RETURNS trigger AS $$
+			BEGIN RAISE EXCEPTION 'note revisions are append-only'; END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS note_revisions_no_update ON note_revisions`,
+		`CREATE TRIGGER note_revisions_no_update BEFORE UPDATE ON note_revisions FOR EACH ROW EXECUTE FUNCTION agent_inbox_reject_note_revision_mutation()`,
+		`DROP TRIGGER IF EXISTS note_revisions_no_delete ON note_revisions`,
+		`CREATE TRIGGER note_revisions_no_delete BEFORE DELETE ON note_revisions FOR EACH ROW EXECUTE FUNCTION agent_inbox_reject_note_revision_mutation()`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -332,9 +365,7 @@ func (s *PostgresStore) AppendAudit(ctx context.Context, record AuditRecord) err
 	return insertPostgresAudit(ctx, s.db, record, time.Now().UTC())
 }
 
-func insertPostgresAudit(ctx context.Context, exec interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, record AuditRecord, now time.Time) error {
+func insertPostgresAudit(ctx context.Context, exec sqlExecer, record AuditRecord, now time.Time) error {
 	detail := record.Detail
 	if detail == nil {
 		detail = map[string]any{}
@@ -496,6 +527,18 @@ func (s *PostgresStore) RecordRegistryChange(ctx context.Context, change Registr
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+func (s *PostgresStore) PutNoteRevision(ctx context.Context, w NoteWrite) (NoteWriteResult, error) {
+	return postgresNotes.put(ctx, s.db, w)
+}
+
+func (s *PostgresStore) GetNoteRevision(ctx context.Context, tenant, space, note string, revision int64) (StoredNoteRevision, error) {
+	return postgresNotes.get(ctx, s.db, tenant, space, note, revision)
+}
+
+func (s *PostgresStore) ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error) {
+	return postgresNotes.list(ctx, s.db, tenant, space, note, limit)
 }
 
 type postgresStateError interface {

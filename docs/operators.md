@@ -193,8 +193,9 @@ The grants form a closed set. Each later space feature checks exactly one:
 
 A membership is visible through `GET /v1/spaces` and `agent-inbox spaces`.
 Group messages check `read` and `post` (see
-[Group messages](#group-messages)); notes and files arrive in later releases
-and will check the other grants.
+[Group messages](#group-messages)), and notes check `read` and `note.write`
+(see [Notes](#notes)). Files arrive in a later release and will check the
+artifact grants.
 
 Loading rejects the whole file, and every request then fails closed, when:
 
@@ -239,6 +240,46 @@ sender's `allowed_kinds` does.
 - A sender cannot tell a missing space from one it does not belong to: both
   return `space_not_found` (audit code `not_member`). A member without `post`
   gets `post_not_allowed` (audit code `post_not_granted`).
+
+#### Notes
+
+A note is a short shared text document in a space, such as a release plan,
+where every revision is kept. Agents read and write notes with
+`agent-inbox note get | put | log`; [the protocol reference](protocol.md#note-revisions)
+specifies the signed revision.
+
+- **Revisions.** Each revision is the note's full text (at most 48 KiB),
+  signed by its author, and names the head revision it was written against.
+  The server stores it as the next revision only if that base is still the
+  head; otherwise it stores nothing and answers `409 note_revision_conflict`
+  with the current head, and the author merges and writes again. Concurrent
+  writers on one base get exactly one success. The server never merges text.
+- **Storage.** Notes live in the `notes` table (the head of each note) and
+  the `note_revisions` table (every revision, with body, hash, and author
+  signature), keyed by tenant, space, and note. Revisions are append-only:
+  both backends reject updates and deletes with database triggers. They are
+  kept with no expiry.
+- **Access.** Membership and grants are read from the registry at each
+  request. A member that joins later reads every earlier revision; a member
+  that is removed, or an agent outside the space or tenant, gets `404
+  not_found`, the same answer as an unknown route (audit codes `not_member`).
+  A member without `read` gets `read_not_allowed`; without `note.write`,
+  `note_write_not_allowed`.
+- **Notices.** In the same transaction as an accepted revision, every other
+  member that holds `read`, is enabled, and has an active key gets one
+  server-authored notice delivery (`type` and `kind` `notice`). Notices are
+  rung, acknowledged, escalated, and dispositioned like group messages, so an
+  offline member learns of the change at its next poll.
+- **Audit.** `note.revision accepted` names the author as actor and
+  `space/note@revision` as subject, with `{"revision","base_revision","sha256",
+  "revision_id","recipients","registry_sha256"}` and the `notice_id` when
+  members were notified. A conflict is `note.revision rejected
+  revision_conflict` with `{"base_revision","head_revision","sha256",
+  "revision_id"}`; the audit keeps the rejected draft's hash, never its body.
+  An identical retry is `note.revision duplicate`. Rejected reads are
+  `note.read rejected`; successful reads are not audited.
+- **Revoked authors.** A revision whose author is later revoked stays exactly
+  as stored and reads with `author_status: "revoked"`.
 
 ### Add an agent
 
@@ -356,7 +397,10 @@ fields, in the order `type`, `id`, `task_id`, `thread_id`, optional `reply_to`,
 `provenance`. The `signature`, server tenant, sequence, acceptance time, and
 acknowledgement state are excluded. Object keys in payload and provenance are sorted by
 Go's `encoding/json`; array order and JSON number representation are
-significant. Payloads and artifacts are signed as data.
+significant. Payloads and artifacts are signed as data. A note revision has
+its own signature over `agent-inbox-note-v1\n` followed by compact JSON of
+every revision member except `signature`, in a fixed order; see the
+[protocol reference](protocol.md#note-revisions).
 
 The server commits a new message and its accepted-send audit record before it
 publishes a doorbell. The SSE stream is in-memory and can lose events; poll is
@@ -387,6 +431,10 @@ The signed JSON API is:
 | `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged deliveries in sequence order, including group messages in spaces where it holds `read`. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
 | `POST /v1/messages/{id}/ack` | Acknowledge the caller's own delivery after processing with `{"processed":true}`; the server records the acknowledgement time. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
+| `GET /v1/spaces` | List the caller's own spaces and grants. |
+| `PUT /v1/spaces/{space}/notes/{note}` | Write a signed note revision on the current head; requires `note.write`. |
+| `GET /v1/spaces/{space}/notes/{note}` | Read a note's head, or `?revision=N`; requires `read`. |
+| `GET /v1/spaces/{space}/notes/{note}/revisions` | List a note's revisions, newest first, without bodies; requires `read`. |
 
 The service marks every HTTP response `Cache-Control: no-store`; SSE responses
 also retain the `no-cache` directive. Preserve these headers through any proxy.
@@ -501,6 +549,11 @@ so its first `registry.changed` row after a space is added lists that space in
 changes; it refuses a version 2 registry, so roll back the registry file with
 the binary. After such a rollback, the next membership diff compares against
 the spaces recorded before it.
+Notes add the `notes` and `note_revisions` tables, with append-only triggers
+on `note_revisions`, on both backends. Existing data is not touched. An older
+binary ignores both tables; it answers note routes with `404`, and it still
+delivers notices already written, as group messages in the note's space
+(flagged `author_status: "revoked"`, because a notice has no sender).
 Keep the prior image available until health and audit checks pass. Restore a
 backup to roll back across an incompatible schema change.
 
@@ -516,7 +569,8 @@ docker compose exec -T server inboxd audit \
 Output is JSON in descending audit sequence. Records include accepted and
 authenticated rejected sends, accepted and rejected acknowledgements, duplicate
 sends, unacknowledged escalation attempts, revoked-recipient dispositions,
-registry changes, use of disabled credentials, and failed webhook deliveries.
+registry changes, use of disabled credentials, accepted, duplicate, and
+rejected note revisions, rejected note reads, and failed webhook deliveries.
 Rejected sends carry the message ID as `subject_id` when the envelope's ID is
 well formed. Other unauthenticated failures are not persisted. Audit rows are append-only: both
 backends reject updates and deletes with database triggers. Restrict access to
@@ -561,6 +615,12 @@ TLS-terminating proxy when requests cross an untrusted network.
 | `space_not_found` | The space does not exist, belongs to another tenant, or the sender is not a member. The client response hides which; the audit code is `not_member`. |
 | `post_not_allowed` | The sender is a member without the `post` grant (audit code `post_not_granted`). |
 | `message_id_conflict` | The ID already belongs to different content. Generate a new message ID; use an existing ID only for an identical retry. |
+| `note_revision_conflict` | The note's head moved past the writer's `base_revision`, or the note already exists (base 0) or does not exist yet (base above 0). Nothing was stored; the response names the head. The writer reads the head, merges, and writes again. |
+| `revision_id_conflict` | The `revision_id` already belongs to a different revision. Use a new ID; reuse one only for an identical retry. |
+| `note_write_not_allowed` / `read_not_allowed` | The member lacks `note.write` or `read` in the space (audit codes `note_write_not_granted` and `read_not_granted`). |
+| `note_not_found` | The caller may read the space, but the note or requested revision does not exist. |
+| `not_found` | An unknown route, or a note route in a space the caller does not belong to; the two are indistinguishable (audit code `not_member`). |
+| `invalid_note_signature` / `note_hash_mismatch` / `note_too_large` | The revision signature does not verify with the caller's key, `sha256` is not the hash of the body, or the body exceeds 48 KiB. |
 | `message_not_found` | The acknowledgement target is missing or not accessible to this agent, including a group message in a space where it no longer holds `read` (audit code `not_member`). The client response hides which condition applies; inspect the audit record for the internal reason. |
 | `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |
@@ -616,7 +676,7 @@ acknowledgements to finish, then take an online SQLite snapshot with the
 and verifying the snapshot. Start the PostgreSQL Compose profile once to create
 its empty schema, then stop its server before import. Use `sqlite3` and `psql`
 clients on the operator machine; `INBOX_DATABASE_URL` must be reachable from
-that machine. Export/import the six data tables in dependency order:
+that machine. Export/import the eight data tables in dependency order:
 
 ```sh
 sqlite3 -header -csv agent-inbox-backup.db \
@@ -631,6 +691,10 @@ sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT message_id,recipient_id,tenant_id,acknowledged_at,disposition,attempts,last_notified_at,escalated_at FROM deliveries' > deliveries.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT id,sha256,agents_json,spaces_json,observed_at FROM registry_state' > registry_state.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT tenant_id,space_id,note_id,head_revision,created_by,created_at FROM notes' > notes.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT tenant_id,space_id,note_id,revision,base_revision,revision_id,author_id,key_id,created_at,media_type,sha256,body,signature,accepted_at FROM note_revisions' > note_revisions.csv
 ```
 
 Set `INBOX_DATABASE_URL` to the PostgreSQL target, then import with `psql` in
@@ -652,6 +716,8 @@ psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 \copy notification_state(message_id,attempts,last_notified_at,escalated_at,disposition) FROM 'notification_state.csv' CSV HEADER
 \copy deliveries(message_id,recipient_id,tenant_id,acknowledged_at,disposition,attempts,last_notified_at,escalated_at) FROM 'deliveries.csv' CSV HEADER
 \copy registry_state(id,sha256,agents_json,spaces_json,observed_at) FROM 'registry_state.csv' CSV HEADER
+\copy notes(tenant_id,space_id,note_id,head_revision,created_by,created_at) FROM 'notes.csv' CSV HEADER
+\copy note_revisions(tenant_id,space_id,note_id,revision,base_revision,revision_id,author_id,key_id,created_at,media_type,sha256,body,signature,accepted_at) FROM 'note_revisions.csv' CSV HEADER
 SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
 SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
 SQL

@@ -155,6 +155,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.ack(w, r, identity)
 	case r.URL.Path == "/v1/spaces" && r.Method == http.MethodGet:
 		s.listSpaces(w, r, identity)
+	case strings.HasPrefix(r.URL.Path, "/v1/spaces/"):
+		s.notes(w, r, identity)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "route not found")
 	}
@@ -565,10 +567,8 @@ func (s *Server) spaceAudience(w http.ResponseWriter, auth authContext, e Envelo
 		s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", e.ID)
 		return nil, nil, false
 	}
-	space, exists := snapshot.Spaces[e.SpaceID]
-	sender, listed := snapshot.Agents[auth.agent.ID]
-	grant, member := spaceGrant(snapshot, space, sender)
-	if !exists || !listed || sender.Disabled || sender.TenantID != auth.agent.TenantID || !member {
+	space, grant, member := spaceMember(snapshot, auth, e.SpaceID)
+	if !member {
 		s.rejectSendWithAuditCode(w, auth.agent, "space_not_found", "not_member", "space was not found", e.ID)
 		return nil, nil, false
 	}
@@ -579,16 +579,34 @@ func (s *Server) spaceAudience(w http.ResponseWriter, auth authContext, e Envelo
 	if !s.kindAllowed(w, auth, e) {
 		return nil, nil, false
 	}
-	audience := []string{}
+	audience := spaceReaders(snapshot, space, auth.agent.ID)
+	return audience, map[string]any{"space_id": space.ID, "recipients": audience, "registry_sha256": snapshot.SHA256}, true
+}
+
+// spaceMember returns the caller's membership in a space from one registry
+// snapshot. ok is false when the space is unknown, belongs to another tenant,
+// or the caller is not an active member; callers answer all of these alike.
+func spaceMember(snapshot RegistrySnapshot, auth authContext, spaceID string) (RegistrySpace, SpaceGrant, bool) {
+	space, exists := snapshot.Spaces[spaceID]
+	agent, listed := snapshot.Agents[auth.agent.ID]
+	grant, member := spaceGrant(snapshot, space, agent)
+	return space, grant, exists && listed && !agent.Disabled && agent.TenantID == auth.agent.TenantID && member
+}
+
+// spaceReaders lists, sorted, the members of space that hold read and can
+// collect a delivery now: enabled, in the space's tenant, and with an active
+// key. exclude, the sender or author, is left out.
+func spaceReaders(snapshot RegistrySnapshot, space RegistrySpace, exclude string) []string {
+	readers := []string{}
 	for _, m := range space.Members {
 		agent, known := snapshot.Agents[m.Agent]
-		if m.Agent == auth.agent.ID || !slices.Contains(m.Grants, GrantRead) || !known || agent.Disabled || agent.TenantID != space.TenantID || !hasActiveKey(agent) {
+		if m.Agent == exclude || !slices.Contains(m.Grants, GrantRead) || !known || agent.Disabled || agent.TenantID != space.TenantID || !hasActiveKey(agent) {
 			continue
 		}
-		audience = append(audience, m.Agent)
+		readers = append(readers, m.Agent)
 	}
-	slices.Sort(audience)
-	return audience, map[string]any{"space_id": space.ID, "recipients": audience, "registry_sha256": snapshot.SHA256}, true
+	slices.Sort(readers)
+	return readers
 }
 
 func (s *Server) kindAllowed(w http.ResponseWriter, auth authContext, e Envelope) bool {
@@ -753,17 +771,12 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
 		return
 	}
-	authorStatus := map[string]string{}
+	statuses := map[string]string{}
 	for i := range messages {
-		sender := messages[i].SenderID
-		status, known := authorStatus[sender]
-		if !known {
-			if _, revoked, err := s.revocation(sender, messages[i].TenantID); err == nil && revoked {
-				status = AuthorStatusRevoked
-			}
-			authorStatus[sender] = status
+		if messages[i].Type == NoticeType {
+			continue // A notice is server-authored and has no sender.
 		}
-		messages[i].AuthorStatus = status
+		messages[i].AuthorStatus = s.authorStatus(messages[i].SenderID, messages[i].TenantID, statuses)
 	}
 	writeJSON(w, http.StatusOK, PollResponse{Messages: messages})
 }
