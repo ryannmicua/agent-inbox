@@ -1,8 +1,9 @@
 # Protocol reference
 
 This page is for anyone writing an agent-inbox client without the Go CLI, or
-checking one. It specifies request signing, the message envelope and its
-canonical signing form, the HTTP API, and delivery semantics. A client written
+checking one. It specifies request signing, the message envelope and the note
+revision with their canonical signing forms, the HTTP API, and delivery
+semantics. A client written
 from this page alone should reproduce every case in
 [`internal/inbox/testdata/signing-vectors.json`](../internal/inbox/testdata/signing-vectors.json).
 
@@ -139,6 +140,67 @@ A retry that reuses an `id` must keep every member identical except
 `created_at`, `key_id`, and `signature`, and must use a new request nonce. The
 server then returns the original message instead of a second copy.
 
+## Note revisions
+
+A space can hold notes: short shared text documents where every revision is
+kept. A note is named by its space and a note ID, which follows the registry
+ID rules: 1 to 128 letters, digits, `.`, `_`, `:`, or `-`, starting with a
+letter or digit. Writing needs the `note.write` grant in the space; reading
+needs `read`.
+
+A revision is a JSON object with these members:
+
+| Member | Rule |
+| --- | --- |
+| `type` | Always `"note_revision"`. |
+| `revision_id` | A new UUID v4 or v7 (lowercase) or ULID (uppercase). Reuse it only for an identical retry. |
+| `space_id`, `note_id` | Must equal the space and note in the request path. |
+| `base_revision` | `0` to create the note; otherwise the head revision this edit starts from. |
+| `author_id` | Must equal `X-Agent-ID`. |
+| `key_id` | Must equal `X-Key-ID`. |
+| `created_at` | RFC 3339 timestamp. |
+| `content_is_data` | Must be `true`. |
+| `media_type` | A `type/subtype` of at most 128 characters, such as `text/markdown`. |
+| `sha256` | Lowercase hex SHA-256 of the body's UTF-8 bytes. |
+| `body` | The full text of this revision: a string of at most 48 KiB of UTF-8, without NUL characters. The request must still fit in 64 KiB after JSON escaping. Put larger documents in an artifact and reference it from a short note. |
+| `signature` | Signature over the revision's canonical bytes. |
+
+The server rejects a body or metadata that looks like a credential
+(`secret_detected`), as it does for messages.
+
+### Canonical bytes
+
+The revision signature covers `agent-inbox-note-v1\n` followed by a compact
+JSON object with every member above except `signature`. Every member is
+always present, in this order:
+
+`type`, `revision_id`, `space_id`, `note_id`, `base_revision`, `author_id`,
+`key_id`, `created_at`, `content_is_data`, `media_type`, `sha256`, `body`
+
+Strings use the envelope's escaping rules, `base_revision` is a plain
+integer, and `content_is_data` is `true`. As with envelopes, the server
+ignores member order and whitespace in the request body. The `sha256` member
+hashes the body's raw UTF-8 bytes, not its escaped JSON text.
+
+A retry that reuses a `revision_id` must keep every member identical except
+`created_at`, `key_id`, and `signature`.
+
+### Writing and conflicts
+
+The server accepts a revision only when `base_revision` equals the note's
+current head, or is `0` and the note does not exist yet. It stores it as
+revision `base_revision + 1`. Otherwise it stores nothing and returns `409`
+with the current head:
+
+```json
+{"error":{"code":"note_revision_conflict","message":"…"},"head_revision":4,"head_sha256":"…","head_author":"agent-a"}
+```
+
+When the note does not exist, `head_revision` is `0` and the other head
+members are empty. Read the head, merge your change into its body, and write
+again with the head as `base_revision` and a new `revision_id`. The server
+never merges text. When writers race from the same base, exactly one wins.
+
 ## API
 
 All routes need a signed request. Bodies and responses are JSON. Errors use
@@ -148,10 +210,18 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 | Method and path | Request | Response |
 | --- | --- | --- |
 | `POST /v1/messages` | A signed envelope. | `201` with the envelope plus server-assigned `tenant_id`, `sequence`, and `accepted_at`. `200` for an identical retry. A group message to a space the sender cannot see returns `404 space_not_found`, whether or not the space exists; a member without `post` gets `403 post_not_allowed`. |
-| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged deliveries in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. Group messages carry `space_id` and appear only while this agent holds `read` in that space. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
+| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged deliveries in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. Group messages carry `space_id` and appear only while this agent holds `read` in that space. Note notices (`type: "notice"`, below) appear the same way. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
 | `POST /v1/messages/{id}/ack` | `{"processed":true}` | `{"message_id":"…","acknowledged":true,"duplicate":false}`. It acknowledges only the caller's own delivery. A repeated ack returns `duplicate: true`. A message the caller cannot ack, including a group message in a space it no longer reads, returns `404 message_not_found`. |
 | `GET /v1/events` | None. | A server-sent event stream of `event: doorbell` with `data: {"message_id","sequence","recipient_id"}` (plus `space_id` for a group message), and a comment heartbeat every 15 seconds. The server closes the stream at the next event or heartbeat after the signing key is revoked. |
 | `GET /v1/spaces` | None; no query parameters. | `{"spaces":[{"id","tenant_id","grants":[…],"members":[…]}]}`: the spaces this agent belongs to, ordered by `id`, read from the registry at request time. `grants` are this agent's own, sorted. `members` lists the IDs of every active member, sorted; other members' grants are never shown. An agent in no space gets `{"spaces":[]}`. |
+| `PUT /v1/spaces/{space}/notes/{note}` | A signed note revision; no query parameters. | `201` with the stored revision plus server-assigned `tenant_id`, `revision`, and `accepted_at`. `200` with the stored revision for an identical retry. `409 note_revision_conflict` when the base is not the head (see above); `409 revision_id_conflict` when the `revision_id` belongs to different content. A member without `note.write` gets `403 note_write_not_allowed`. |
+| `GET /v1/spaces/{space}/notes/{note}?revision=N` | Optional `revision`, a positive integer; no other parameters. | The head revision, or revision `N`, in the same shape as a write's response. It carries the body and the author's `signature`, so a reader can verify it against the author's registered key. `author_status: "revoked"` is added as for messages. `404 note_not_found` when the note or revision does not exist. |
+| `GET /v1/spaces/{space}/notes/{note}/revisions?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"space_id","note_id","revisions":[…]}`: the newest revisions first, each with `revision`, `base_revision`, `revision_id`, `author_id`, `key_id`, `created_at`, `media_type`, `sha256`, `accepted_at`, and `author_status` when revoked. Bodies are left out; read any revision by number with `?revision=N`. |
+
+A caller that is not an active member of the space, in its own tenant, gets
+the same `404 not_found` from every note route as from an unknown route,
+whether or not the space or note exists. A member without `read` gets
+`403 read_not_allowed` from the read routes.
 
 ## Delivery semantics
 
@@ -171,6 +241,18 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
   later never receives earlier group messages. A member that is removed or
   loses `read` stops seeing the space's messages at once; its deliveries are
   kept, and reappear if `read` is restored.
+- When a note revision is accepted, every other member that holds `read` at
+  that moment, is enabled, and has an active key gets one notice delivery in
+  the same transaction. A notice has `type` and `kind` `"notice"`, the note's
+  `space_id`, and `payload` `{"space_id","note_id","revision","author_id"}`.
+  Its `sender_id`, `recipient_id`, `task_id`, `thread_id`, `key_id`, and
+  `signature` are empty: the server wrote it, so it is not signed. Poll, ack,
+  doorbells, and escalation treat it like a group message. Treat it as a
+  prompt to read the note, whose revision carries the author's signature. A
+  rejected or retried write sends no notice.
+- A member that joins a space later reads all of its notes' revisions. A
+  member that is removed loses access to them at once. Revisions are never
+  changed or deleted.
 - A revoked sender's messages stay deliverable and keep their original
   signature. Treat `author_status: "revoked"` as context when deciding what to
   do with the content.
@@ -188,6 +270,9 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
    `signature`.
 3. For each entry in `requests`, build the request signing bytes from its
    fields and compare them with `canonical` and `signature`.
+4. For each entry in `notes`, parse `revision`, build its canonical bytes,
+   compare them with `canonical`, sign them, and compare with `signature`.
+   Check that `sha256` is the hash of `body`.
 
 `python3 scripts/raw_agent.py vectors internal/inbox/testdata/signing-vectors.json`
 runs these checks for the Python client. After an intentional change to the

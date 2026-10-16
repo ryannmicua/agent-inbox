@@ -94,6 +94,71 @@ func VerifyEnvelope(e Envelope, public ed25519.PublicKey) bool {
 	return ed25519.Verify(public, data, sig)
 }
 
+type canonicalNoteRevision struct {
+	Type          string `json:"type"`
+	RevisionID    string `json:"revision_id"`
+	SpaceID       string `json:"space_id"`
+	NoteID        string `json:"note_id"`
+	BaseRevision  int64  `json:"base_revision"`
+	AuthorID      string `json:"author_id"`
+	KeyID         string `json:"key_id"`
+	CreatedAt     string `json:"created_at"`
+	ContentIsData bool   `json:"content_is_data"`
+	MediaType     string `json:"media_type"`
+	SHA256        string `json:"sha256"`
+	Body          string `json:"body"`
+}
+
+// NoteRevisionSigningBytes returns the bytes a note revision's signature
+// covers. Every member is always present, in this order, with the same string
+// escaping as envelopes.
+func NoteRevisionSigningBytes(n NoteRevision) ([]byte, error) {
+	encoded, err := json.Marshal(canonicalNoteRevision{
+		Type: n.Type, RevisionID: n.RevisionID, SpaceID: n.SpaceID, NoteID: n.NoteID,
+		BaseRevision: n.BaseRevision, AuthorID: n.AuthorID, KeyID: n.KeyID, CreatedAt: n.CreatedAt,
+		ContentIsData: n.ContentIsData, MediaType: n.MediaType, SHA256: n.SHA256, Body: n.Body,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte("agent-inbox-note-v1\n"), encoded...), nil
+}
+
+// noteRetryBytes is what a retry of a revision must repeat exactly: everything
+// signed except created_at and key_id.
+func noteRetryBytes(n NoteRevision) ([]byte, error) {
+	n.CreatedAt = ""
+	n.KeyID = ""
+	return NoteRevisionSigningBytes(n)
+}
+
+func SignNoteRevision(n *NoteRevision, private ed25519.PrivateKey) error {
+	data, err := NoteRevisionSigningBytes(*n)
+	if err != nil {
+		return err
+	}
+	n.Signature = encodeSignature(ed25519.Sign(private, data))
+	return nil
+}
+
+func VerifyNoteRevision(n NoteRevision, public ed25519.PublicKey) bool {
+	sig, err := decodeSignature(n.Signature)
+	if err != nil {
+		return false
+	}
+	data, err := NoteRevisionSigningBytes(n)
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(public, data, sig)
+}
+
+// NoteBodySHA256 is the lowercase hex SHA-256 of a note body's UTF-8 bytes.
+func NoteBodySHA256(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
 func RequestSigningBytes(agentID, keyID, method, requestURI, timestamp, nonce string, body []byte) []byte {
 	digest := sha256.Sum256(body)
 	return []byte(fmt.Sprintf("agent-inbox-request-v1\n%s\n%s\n%s\n%s\n%s\n%s\n%s",

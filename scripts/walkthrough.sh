@@ -2,8 +2,9 @@
 # Replay the two-runtime walkthrough: a bot using the Go CLI and a bot using
 # the standalone Python client exchange an instruction with a file reference,
 # poll and acknowledge while offline, reply with a correlated result, list
-# the spaces the operator granted them, and exchange a group message in a
-# space, each acknowledging only its own delivery.
+# the spaces the operator granted them, exchange a group message in a
+# space, each acknowledging only its own delivery, and edit a shared note from
+# the same revision, where the second write conflicts and is merged.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
 #                                   replay, edit the Python bot's space grants
@@ -12,8 +13,9 @@
 #   scripts/walkthrough.sh remote   replay against an existing server; set
 #                                   INBOX_SERVER, CLI_BOT, CLI_KEY, RAW_BOT, RAW_KEY,
 #                                   and optionally WALKTHROUGH_SPACE: both bots
-#                                   must then hold read and post there, and
-#                                   they exchange a group message in it
+#                                   must then hold read, post and note.write
+#                                   there; they exchange a group message in it
+#                                   and edit its note release-plan
 #
 # Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
 # skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
@@ -101,8 +103,9 @@ else
   done
 fi
 
-cli() { local command="$1"; shift; "$cli_bin" "$command" --server "$INBOX_SERVER" --agent "$CLI_BOT" --key "$CLI_KEY" "$@"; }
-raw() { local command="$1"; shift; "${raw_agent[@]}" "$command" --server "$INBOX_SERVER" --agent "$RAW_BOT" --key "$RAW_KEY" "$@"; }
+# cli and raw run one command as each bot; "note get|put|log" is one command.
+cli() { local command=("$1"); shift; [[ "${command[0]}" != note ]] || { command+=("$1"); shift; }; "$cli_bin" "${command[@]}" --server "$INBOX_SERVER" --agent "$CLI_BOT" --key "$CLI_KEY" "$@"; }
+raw() { local command=("$1"); shift; [[ "${command[0]}" != note ]] || { command+=("$1"); shift; }; "${raw_agent[@]}" "${command[@]}" --server "$INBOX_SERVER" --agent "$RAW_BOT" --key "$RAW_KEY" "$@"; }
 
 step "Python client matches the published signing vectors"
 "${raw_agent[@]}" vectors internal/inbox/testdata/signing-vectors.json
@@ -187,6 +190,56 @@ print("audit: send accepted, audience %s at registry %s" % (d["recipients"], d["
   [[ "$(json_field messages.0.id <<< "$returned")" == "$group_result_id" && "$(json_field messages.0.reply_to <<< "$returned")" == "$group_id" ]] || { echo "unexpected poll: $returned" >&2; exit 1; }
   echo "$CLI_BOT received result $group_result_id in space $(json_field messages.0.space_id <<< "$returned")"
   cli ack --message "$group_result_id"
+
+  note=(--space "$WALKTHROUGH_SPACE" --note release-plan)
+  step "Both bots read the note release-plan, then edit it from the same revision"
+  if head="$(cli note get "${note[@]}" 2>"$tmp_dir/note.err")"; then
+    base="$(json_field revision <<< "$head")"
+  else
+    grep -q note_not_found "$tmp_dir/note.err" || { cat "$tmp_dir/note.err" >&2; exit 1; }
+    base=0
+  fi
+  echo "both bots start from revision $base (0: the note does not exist yet)"
+  printf '# Release plan\n\n- %s: ship v1 <beta> & tag it\n' "$CLI_BOT" > "$tmp_dir/plan-cli.md"
+  printf '# Release plan\n\n- %s: draft the release notes\n' "$RAW_BOT" > "$tmp_dir/plan-raw.md"
+  cli_revision="$(json_field revision <<< "$(cli note put "${note[@]}" --base "$base" --file "$tmp_dir/plan-cli.md")")"
+  echo "$CLI_BOT (Go CLI) wrote revision $cli_revision on base $base"
+  if raw note put "${note[@]}" --base "$base" --file "$tmp_dir/plan-raw.md" 2>"$tmp_dir/conflict.txt"; then
+    echo "a write on a stale base was accepted" >&2; exit 1
+  fi
+  conflict="$(sed -n 's/^raw_agent.py: server returned HTTP 409: //p' "$tmp_dir/conflict.txt")"
+  [[ "$(json_field error.code <<< "$conflict")" == note_revision_conflict && "$(json_field head_revision <<< "$conflict")" == "$cli_revision" ]] || { cat "$tmp_dir/conflict.txt" >&2; exit 1; }
+  echo "$RAW_BOT (Python) on base $base: 409 note_revision_conflict, head is revision $cli_revision by $(json_field head_author <<< "$conflict"); nothing stored"
+
+  step "$RAW_BOT reads the new head, merges its line, and writes again"
+  raw note get "${note[@]}" | python3 -c 'import json,sys
+sys.stdout.write(json.load(sys.stdin)["body"] + "- %s: draft the release notes\n" % sys.argv[1])' "$RAW_BOT" > "$tmp_dir/plan-merged.md"
+  raw_revision="$(json_field revision <<< "$(raw note put "${note[@]}" --base "$cli_revision" --file "$tmp_dir/plan-merged.md")")"
+  echo "$RAW_BOT wrote revision $raw_revision on base $cli_revision"
+  cli note log "${note[@]}" --limit 2 | python3 -c 'import json,sys
+want = [(int(sys.argv[1]), sys.argv[2], int(sys.argv[3])), (int(sys.argv[3]), sys.argv[4], int(sys.argv[5]))]
+log = [(r["revision"], r["author_id"], r["base_revision"]) for r in json.load(sys.stdin)["revisions"]]
+assert log == want, log
+for revision, author, base in log:
+    print("history: revision %d by %s on base %d" % (revision, author, base))' "$raw_revision" "$RAW_BOT" "$cli_revision" "$CLI_BOT" "$base"
+  echo "--- release-plan @$raw_revision"
+  cli note get "${note[@]}" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["body"])'
+
+  step "Each bot got one notice of the other's revision, and acknowledges it"
+  for bot in raw cli; do
+    if [[ "$bot" == raw ]]; then who="$RAW_BOT" want="$cli_revision"; else who="$CLI_BOT" want="$raw_revision"; fi
+    polled="$("$bot" poll)"
+    [[ "$(json_field messages.0.type <<< "$polled")" == notice && "$(json_field messages.0.payload.note_id <<< "$polled")" == release-plan && "$(json_field messages.0.payload.revision <<< "$polled")" == "$want" ]] || { echo "unexpected poll: $polled" >&2; exit 1; }
+    echo "$who: notice of revision $want by $(json_field messages.0.payload.author_id <<< "$polled")"
+    "$bot" ack --message "$(json_field messages.0.id <<< "$polled")" >/dev/null
+    [[ "$("$bot" poll)" == '{"messages":[]}' ]] || { echo "acknowledged notice was delivered again" >&2; exit 1; }
+  done
+  if [[ "$mode" == local ]]; then
+    "$tmp_dir/inboxd" audit --limit 100 | python3 -c 'import json,sys
+row = next(e for e in json.load(sys.stdin) if e["action"] == "note.revision" and e["outcome"] == "rejected")
+assert row["code"] == "revision_conflict" and "body" not in row["detail"], row
+print("audit: note.revision rejected revision_conflict by %s, base %d against head %d" % (row["actor_id"], row["detail"]["base_revision"], row["detail"]["head_revision"]))'
+  fi
 fi
 
 if [[ "$mode" == local ]]; then
@@ -207,6 +260,9 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   [[ "$(raw spaces)" == '{"spaces":[]}' ]] || { echo "removed member still lists the space" >&2; exit 1; }
   [[ "$(raw poll)" == '{"messages":[]}' ]] || { echo "removed member still sees the space's messages" >&2; exit 1; }
   echo "$RAW_BOT, removed from release-notes, no longer sees $later_id"
+  if raw note get --space release-notes --note release-plan 2>"$tmp_dir/refused.txt"; then echo "removed member still reads the note" >&2; exit 1; fi
+  grep -q '"not_found"' "$tmp_dir/refused.txt" || { cat "$tmp_dir/refused.txt" >&2; exit 1; }
+  echo "$RAW_BOT, removed, reading the note: not_found"
   echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
   echo "$CLI_BOT in release-notes: $(cli spaces | space_grants release-notes)"
   audit_rows | python3 -c 'import json,sys
@@ -243,6 +299,9 @@ sys.exit(0 if changes[:2] == want else "registry.changed did not record the memb
   [[ "$(json_field messages.0.id <<< "$flagged")" == "$authored_id" && "$(json_field messages.0.author_status <<< "$flagged")" == revoked ]] || { echo "unexpected poll: $flagged" >&2; exit 1; }
   echo "message $authored_id from $(json_field messages.0.sender_id <<< "$flagged"): author_status=revoked"
   cli ack --message "$authored_id"
+  noted="$(cli note get --space release-notes --note release-plan)"
+  [[ "$(json_field author_id <<< "$noted")" == "$RAW_BOT" && "$(json_field author_status <<< "$noted")" == revoked ]] || { echo "unexpected note: $noted" >&2; exit 1; }
+  echo "note release-plan @$(json_field revision <<< "$noted") by $RAW_BOT is kept: author_status=revoked"
 
   step "The pending work for $RAW_BOT is dispositioned instead of escalated"
   for _ in $(seq 1 30); do
@@ -261,8 +320,9 @@ sys.exit(0 if changes[:2] == want else "registry.changed did not record the memb
   audit_rows | python3 -c 'import json,sys
 for e in reversed(json.load(sys.stdin)):
     d = e.get("detail") or {}
-    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "space_id", "recipients", "memberships_changed") if d.get(k)}
-    print(e["sequence"], e["action"], e.get("actor_id",""), e.get("subject_id","")[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
+    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "space_id", "recipients", "memberships_changed", "base_revision", "head_revision") if d.get(k) not in (None, [], "")}
+    subject = e.get("subject_id", "")
+    print(e["sequence"], e["action"], e.get("actor_id",""), subject if "/" in subject else subject[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
 fi
 
 step "Walkthrough passed ($mode)"

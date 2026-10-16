@@ -26,12 +26,21 @@ type SigningVectors struct {
 	PublicKey      string           `json:"public_key_base64"`
 	Envelopes      []EnvelopeVector `json:"envelopes"`
 	Requests       []RequestVector  `json:"requests"`
+	Notes          []NoteVector     `json:"notes"`
 }
 
 type EnvelopeVector struct {
 	Name      string          `json:"name"`
 	Note      string          `json:"note"`
 	Envelope  json.RawMessage `json:"envelope"`
+	Canonical string          `json:"canonical"`
+	Signature string          `json:"signature"`
+}
+
+type NoteVector struct {
+	Name      string          `json:"name"`
+	Note      string          `json:"note"`
+	Revision  json.RawMessage `json:"revision"`
 	Canonical string          `json:"canonical"`
 	Signature string          `json:"signature"`
 }
@@ -89,6 +98,27 @@ func vectorEnvelopeCases() []envelopeCase {
 	}
 }
 
+type noteCase struct {
+	name, note string
+	revision   NoteRevision
+}
+
+func vectorNoteCases() []noteCase {
+	base := func(id string, baseRevision int64, mediaType, body string) NoteRevision {
+		return NoteRevision{
+			Type: NoteRevisionType, RevisionID: id, SpaceID: "vector-space", NoteID: "release-plan", BaseRevision: baseRevision,
+			AuthorID: "vector-bot", KeyID: "primary", CreatedAt: "2026-10-15T12:00:00Z", ContentIsData: true,
+			MediaType: mediaType, SHA256: NoteBodySHA256(body), Body: body,
+		}
+	}
+	return []noteCase{
+		{"note-create", "base_revision 0 creates the note. The body is one JSON string with Go's escaping: newlines as \\n, <, > and & as \\u003c, \\u003e and \\u0026, non-ASCII raw. sha256 hashes the body's raw UTF-8 bytes, not the escaped text.",
+			base("0192f0c4-7d2e-7a10-8c3b-5d6e7f809b01", 0, "text/markdown", "# Release plan\n\n- ship <v1> & tag\n- café notes\n")},
+		{"note-revision", "A later revision names the head it was written against. Every member is always present, even an empty body.",
+			base("0192f0c4-7d2e-7a10-8c3b-5d6e7f809b02", 3, "text/plain", "")},
+	}
+}
+
 func vectorRequestCases() []RequestVector {
 	return []RequestVector{
 		{Name: "poll", AgentID: "vector-bot", KeyID: "primary", Method: http.MethodGet, Path: "/v1/messages?limit=100", Timestamp: "1792065600", Nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Body: ""},
@@ -124,6 +154,17 @@ func buildSigningVectors(t *testing.T) []byte {
 		r.Canonical = string(canonical)
 		r.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(private, canonical))
 		out.Requests = append(out.Requests, r)
+	}
+	for _, c := range vectorNoteCases() {
+		n := c.revision
+		if err := SignNoteRevision(&n, private); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		canonical, err := NoteRevisionSigningBytes(n)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		out.Notes = append(out.Notes, NoteVector{Name: c.name, Note: c.note, Revision: marshalNoHTMLEscape(t, n), Canonical: string(canonical), Signature: n.Signature})
 	}
 	return marshalNoHTMLEscapeIndent(t, out)
 }
@@ -179,8 +220,8 @@ func TestSigningVectors(t *testing.T) {
 	if len(keyFile) != ed25519.PrivateKeySize || !bytes.Equal(keyFile[32:], public) {
 		t.Fatal("private_key_file must be seed followed by public key")
 	}
-	if len(vectors.Envelopes) < 6 || len(vectors.Requests) < 2 {
-		t.Fatalf("vector file is missing cases: %d envelopes, %d requests", len(vectors.Envelopes), len(vectors.Requests))
+	if len(vectors.Envelopes) < 6 || len(vectors.Requests) < 2 || len(vectors.Notes) < 2 {
+		t.Fatalf("vector file is missing cases: %d envelopes, %d requests, %d notes", len(vectors.Envelopes), len(vectors.Requests), len(vectors.Notes))
 	}
 	for _, v := range vectors.Envelopes {
 		var e Envelope
@@ -200,6 +241,19 @@ func TestSigningVectors(t *testing.T) {
 		sig, _ := base64.StdEncoding.DecodeString(r.Signature)
 		if string(canonical) != r.Canonical || !ed25519.Verify(ed25519.PublicKey(public), canonical, sig) {
 			t.Fatalf("%s: request vector does not verify", r.Name)
+		}
+	}
+	for _, v := range vectors.Notes {
+		var n NoteRevision
+		if err := json.Unmarshal(v.Revision, &n); err != nil {
+			t.Fatalf("%s: %v", v.Name, err)
+		}
+		canonical, err := NoteRevisionSigningBytes(n)
+		if err != nil || string(canonical) != v.Canonical {
+			t.Fatalf("%s: canonical bytes differ: %v\n got %q\nwant %q", v.Name, err, canonical, v.Canonical)
+		}
+		if n.Signature != v.Signature || !VerifyNoteRevision(n, ed25519.PublicKey(public)) || n.SHA256 != NoteBodySHA256(n.Body) {
+			t.Fatalf("%s: note vector does not verify", v.Name)
 		}
 	}
 }

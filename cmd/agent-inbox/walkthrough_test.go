@@ -204,6 +204,16 @@ func docCanonical(env map[string]any) []byte {
 	return []byte("agent-inbox-envelope-v1\n{" + strings.Join(parts, ",") + "}")
 }
 
+// docNoteCanonical builds the canonical note revision bytes from a decoded
+// revision object, following the documented member order.
+func docNoteCanonical(rev map[string]any) []byte {
+	var parts []string
+	for _, name := range []string{"type", "revision_id", "space_id", "note_id", "base_revision", "author_id", "key_id", "created_at", "content_is_data", "media_type", "sha256", "body"} {
+		parts = append(parts, docString(name)+":"+docValue(rev[name]))
+	}
+	return []byte("agent-inbox-note-v1\n{" + strings.Join(parts, ",") + "}")
+}
+
 func decodeJSON(t *testing.T, data []byte) map[string]any {
 	t.Helper()
 	var out map[string]any
@@ -256,6 +266,19 @@ func TestDocumentedSignerMatchesVectors(t *testing.T) {
 		canonical := docRequestBytes(r["agent_id"].(string), r["key_id"].(string), r["method"].(string), r["path"].(string), r["timestamp"].(string), r["nonce"].(string), []byte(r["body"].(string)))
 		if string(canonical) != r["canonical"] || base64.StdEncoding.EncodeToString(ed25519.Sign(key, canonical)) != r["signature"] {
 			t.Fatalf("%s: documented request signing differs", r["name"])
+		}
+	}
+	notes, _ := vectors["notes"].([]any)
+	if len(notes) == 0 {
+		t.Fatal("vector file has no note revisions")
+	}
+	for _, item := range notes {
+		v := item.(map[string]any)
+		rev := v["revision"].(map[string]any)
+		canonical := docNoteCanonical(rev)
+		digest := sha256.Sum256([]byte(rev["body"].(string)))
+		if string(canonical) != v["canonical"] || base64.StdEncoding.EncodeToString(ed25519.Sign(key, canonical)) != v["signature"] || hex.EncodeToString(digest[:]) != rev["sha256"] {
+			t.Fatalf("%s: documented note signing differs\n got %q\nwant %q", v["name"], canonical, v["canonical"])
 		}
 	}
 }

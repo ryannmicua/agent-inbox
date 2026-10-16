@@ -197,5 +197,49 @@
       "canonical": "agent-inbox-request-v1\nvector-bot\nprimary\nPOST\n/v1/messages/0192f0c4-7d2e-7a10-8c3b-5d6e7f809a1b/ack\n1792065601\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nc9e654e8902aa47de7edcd7ab902ed16ef68b2d1beb54a4644aada70c1964b49",
       "signature": "xv40hG+Gh+4vXjBoc9g9QIvdge1NpQxpmDPnFbNUpd8m2tpIYYNuFr9MuYhDLOyWlKiQqYQRklEqlHOB0l2SDw=="
     }
+  ],
+  "notes": [
+    {
+      "name": "note-create",
+      "note": "base_revision 0 creates the note. The body is one JSON string with Go's escaping: newlines as \\n, <, > and & as \\u003c, \\u003e and \\u0026, non-ASCII raw. sha256 hashes the body's raw UTF-8 bytes, not the escaped text.",
+      "revision": {
+        "type": "note_revision",
+        "revision_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809b01",
+        "space_id": "vector-space",
+        "note_id": "release-plan",
+        "base_revision": 0,
+        "author_id": "vector-bot",
+        "key_id": "primary",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "media_type": "text/markdown",
+        "sha256": "9bf4cebe021ffcb031f5664f4bb132ec65c7ce3721f4d014405100d2aa47483a",
+        "body": "# Release plan\n\n- ship <v1> & tag\n- café notes\n",
+        "signature": "KOITq9Lj8mvr0cGPk2p4Zyox55LGMj9X5rFq/MhhJreihr+TrZDb2wnxwmmlwEX3uK/kb+9RxKHbUH6yVzw8Bg=="
+      },
+      "canonical": "agent-inbox-note-v1\n{\"type\":\"note_revision\",\"revision_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809b01\",\"space_id\":\"vector-space\",\"note_id\":\"release-plan\",\"base_revision\":0,\"author_id\":\"vector-bot\",\"key_id\":\"primary\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"media_type\":\"text/markdown\",\"sha256\":\"9bf4cebe021ffcb031f5664f4bb132ec65c7ce3721f4d014405100d2aa47483a\",\"body\":\"# Release plan\\n\\n- ship \\u003cv1\\u003e \\u0026 tag\\n- café notes\\n\"}",
+      "signature": "KOITq9Lj8mvr0cGPk2p4Zyox55LGMj9X5rFq/MhhJreihr+TrZDb2wnxwmmlwEX3uK/kb+9RxKHbUH6yVzw8Bg=="
+    },
+    {
+      "name": "note-revision",
+      "note": "A later revision names the head it was written against. Every member is always present, even an empty body.",
+      "revision": {
+        "type": "note_revision",
+        "revision_id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809b02",
+        "space_id": "vector-space",
+        "note_id": "release-plan",
+        "base_revision": 3,
+        "author_id": "vector-bot",
+        "key_id": "primary",
+        "created_at": "2026-10-15T12:00:00Z",
+        "content_is_data": true,
+        "media_type": "text/plain",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body": "",
+        "signature": "JEqWFdjoMr+Z8ApB9nHdN8pGxJP6tS2Gsb+rH1moz83OJ581Dozn++vSLHwFem2SwNF04+UeOG4vk1pi9U95Cw=="
+      },
+      "canonical": "agent-inbox-note-v1\n{\"type\":\"note_revision\",\"revision_id\":\"0192f0c4-7d2e-7a10-8c3b-5d6e7f809b02\",\"space_id\":\"vector-space\",\"note_id\":\"release-plan\",\"base_revision\":3,\"author_id\":\"vector-bot\",\"key_id\":\"primary\",\"created_at\":\"2026-10-15T12:00:00Z\",\"content_is_data\":true,\"media_type\":\"text/plain\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"body\":\"\"}",
+      "signature": "JEqWFdjoMr+Z8ApB9nHdN8pGxJP6tS2Gsb+rH1moz83OJ581Dozn++vSLHwFem2SwNF04+UeOG4vk1pi9U95Cw=="
+    }
   ]
 }

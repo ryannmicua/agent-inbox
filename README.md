@@ -30,7 +30,7 @@ a prompt to poll, never proof of delivery.
   configuration, backup and restore, upgrades, monitoring, audit, and
   troubleshooting.
 - [Agent quickstart](docs/agents.md): key generation, signed send, poll, ack,
-  and doorbell commands.
+  doorbell, space, and shared note commands.
 - [Protocol reference](docs/protocol.md): request and envelope signing, the
   HTTP API, and delivery semantics for clients written without the CLI, with
   published signing test vectors.
@@ -38,8 +38,8 @@ a prompt to poll, never proof of delivery.
 The default registry is empty. Add and review agents before exposing the
 service. For local validation, run `make test` and `make compose-smoke`.
 `make walkthrough` replays a full exchange between a Go CLI bot and a
-standalone Python bot, including revocation; it needs the Python
-`cryptography` package.
+standalone Python bot, including a note edit conflict and revocation; it
+needs the Python `cryptography` package.
 
 ## Build
 

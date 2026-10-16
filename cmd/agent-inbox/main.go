@@ -35,16 +35,16 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if args[0] == "artifact-ref" {
 		return runArtifactRef(args[1:], stdout, stderr)
 	}
+	if args[0] == "note" {
+		return runNote(args[1:], stdout, stderr)
+	}
 	command := args[0]
 	if command != "send" && command != "poll" && command != "ack" && command != "wait" && command != "spaces" {
 		return fmt.Errorf("unknown command %q (run agent-inbox help)", args[0])
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	server := flags.String("server", envOr("INBOX_SERVER", "https://inbox.example.com"), "inbox server URL")
-	agent := flags.String("agent", os.Getenv("INBOX_AGENT"), "registered agent id")
-	keyPath := flags.String("key", os.Getenv("INBOX_KEY"), "base64 private key file")
-	keyID := flags.String("key-id", envOr("INBOX_KEY_ID", "primary"), "registered signing key id")
+	newClient := clientFlags(flags)
 	to := flags.String("to", "", "explicit recipient agent id")
 	space := flags.String("space", "", "space id: send to every member holding read (instead of --to)")
 	kind := flags.String("kind", "", "message kind")
@@ -66,14 +66,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	if *agent == "" || *keyPath == "" {
-		return errors.New("--agent and --key (or INBOX_AGENT and INBOX_KEY) are required")
-	}
-	private, err := inbox.LoadPrivateKey(*keyPath)
+	client, err := newClient()
 	if err != nil {
-		return fmt.Errorf("load signing key: %w", err)
+		return err
 	}
-	client := &inbox.Client{Server: *server, Agent: *agent, KeyID: *keyID, Private: ed25519.PrivateKey(private)}
 	ctx := context.Background()
 	switch command {
 	case "send":
@@ -131,6 +127,25 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// clientFlags registers the flags every API command shares and returns a
+// function that builds the signing client once the flags are parsed.
+func clientFlags(flags *flag.FlagSet) func() (*inbox.Client, error) {
+	server := flags.String("server", envOr("INBOX_SERVER", "https://inbox.example.com"), "inbox server URL")
+	agent := flags.String("agent", os.Getenv("INBOX_AGENT"), "registered agent id")
+	keyPath := flags.String("key", os.Getenv("INBOX_KEY"), "base64 private key file")
+	keyID := flags.String("key-id", envOr("INBOX_KEY_ID", "primary"), "registered signing key id")
+	return func() (*inbox.Client, error) {
+		if *agent == "" || *keyPath == "" {
+			return nil, errors.New("--agent and --key (or INBOX_AGENT and INBOX_KEY) are required")
+		}
+		private, err := inbox.LoadPrivateKey(*keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load signing key: %w", err)
+		}
+		return &inbox.Client{Server: *server, Agent: *agent, KeyID: *keyID, Private: ed25519.PrivateKey(private)}, nil
+	}
 }
 
 func retryableNetworkError(err error) bool {
@@ -269,6 +284,12 @@ Commands:
   ack --message UUID
   wait                                   (listen for doorbell prompts)
   spaces                                 (list your spaces and your grants in each)
+  note get --space ID --note ID [--revision N]
+                                         (read a note's head, or one revision)
+  note put --space ID --note ID --base N --file FILE [--media-type TYPE]
+                                         (write a revision; --base 0 creates the note)
+  note log --space ID --note ID [--limit N]
+                                         (list revisions, newest first)
   artifact-ref --file PATH --uri URI [--media-type TYPE]
                                          (print an --artifact value with sha256 and size)
 

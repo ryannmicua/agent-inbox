@@ -96,6 +96,17 @@ type Store interface {
 	// audit record in one transaction, only if the recorded hash still equals
 	// the given previous hash. It reports whether this call recorded the change.
 	RecordRegistryChange(context.Context, RegistryChange) (bool, error)
+	// PutNoteRevision stores a revision whose base is the note's head as
+	// head+1, with its audit row and notice deliveries, in one transaction. An
+	// identical retry returns the stored revision; a stale base returns
+	// *NoteConflictError and stores nothing.
+	PutNoteRevision(context.Context, NoteWrite) (NoteWriteResult, error)
+	// GetNoteRevision returns one revision of a note, or its head when
+	// revision is 0, or ErrNoteNotFound.
+	GetNoteRevision(ctx context.Context, tenant, space, note string, revision int64) (StoredNoteRevision, error)
+	// ListNoteRevisions returns a note's revisions newest first, or
+	// ErrNoteNotFound.
+	ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error)
 	Close() error
 }
 
@@ -259,6 +270,34 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		)`,
 		sqliteDeliveriesTable,
 		`CREATE INDEX IF NOT EXISTS deliveries_recipient ON deliveries(recipient_id, tenant_id, acknowledged_at)`,
+		`CREATE TABLE IF NOT EXISTS notes (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			note_id TEXT NOT NULL,
+			head_revision INTEGER NOT NULL,
+			created_by TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY(tenant_id, space_id, note_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS note_revisions (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			note_id TEXT NOT NULL,
+			revision INTEGER NOT NULL,
+			base_revision INTEGER NOT NULL,
+			revision_id TEXT NOT NULL UNIQUE,
+			author_id TEXT NOT NULL,
+			key_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			media_type TEXT NOT NULL,
+			sha256 TEXT NOT NULL,
+			body TEXT NOT NULL,
+			signature TEXT NOT NULL,
+			accepted_at TEXT NOT NULL,
+			PRIMARY KEY(tenant_id, space_id, note_id, revision)
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS note_revisions_no_update BEFORE UPDATE ON note_revisions BEGIN SELECT RAISE(ABORT, 'note revisions are append-only'); END`,
+		`CREATE TRIGGER IF NOT EXISTS note_revisions_no_delete BEFORE DELETE ON note_revisions BEGIN SELECT RAISE(ABORT, 'note revisions are append-only'); END`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -548,9 +587,12 @@ func (s *SQLiteStore) AppendAudit(ctx context.Context, record AuditRecord) error
 	return insertAudit(ctx, s.db, record, time.Now().UTC())
 }
 
-func insertAudit(ctx context.Context, exec interface {
+// sqlExecer is a database or transaction that can run a statement.
+type sqlExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, record AuditRecord, now time.Time) error {
+}
+
+func insertAudit(ctx context.Context, exec sqlExecer, record AuditRecord, now time.Time) error {
 	detail := record.Detail
 	if detail == nil {
 		detail = map[string]any{}
@@ -736,6 +778,18 @@ func (s *SQLiteStore) RecordRegistryChange(ctx context.Context, change RegistryC
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+func (s *SQLiteStore) PutNoteRevision(ctx context.Context, w NoteWrite) (NoteWriteResult, error) {
+	return sqliteNotes.put(ctx, s.db, w)
+}
+
+func (s *SQLiteStore) GetNoteRevision(ctx context.Context, tenant, space, note string, revision int64) (StoredNoteRevision, error) {
+	return sqliteNotes.get(ctx, s.db, tenant, space, note, revision)
+}
+
+func (s *SQLiteStore) ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error) {
+	return sqliteNotes.list(ctx, s.db, tenant, space, note, limit)
 }
 
 type rowScanner interface{ Scan(...any) error }
