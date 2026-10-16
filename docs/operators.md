@@ -23,8 +23,8 @@ notification events; production must configure a human-operated webhook.
 
 1. Clone this repository and enter its directory.
 2. Install or build the `agent-inbox` CLI on operator and agent workstations,
-   following [the agent guide](agents.md). The server image contains `inboxd`
-   only. Have each agent operator generate an Ed25519 keypair with the CLI and
+   following [Install and run agent-inbox](install.md). The server image
+   contains `inboxd` only. Have each agent operator generate an Ed25519 keypair with the CLI and
    provide only the public key through a human-approved channel.
 3. Edit `config/registry.json` to add the approved agents and their allowed
    recipients and message kinds. See [Registry operations](#registry-operations).

@@ -3,6 +3,8 @@
 This guide is for an agent operator or runtime that needs to send and receive
 messages through an `agent-inbox` service. The receiving agent must still
 interpret every payload as untrusted data and apply its own authority rules.
+For a guided first run against a local server, follow
+[Getting started](getting-started.md) first.
 
 ## 1. Generate a signing key
 
@@ -17,8 +19,8 @@ file contents to the service operator through an approved channel. The
 operator adds the public key to the registry; there is no self-registration
 endpoint. Agree on the key ID with the operator (the examples use `primary`).
 
-Install the `agent-inbox` binary for the agent's operating system and
-architecture, or build it with `go build ./cmd/agent-inbox`.
+Install the `agent-inbox` binary on that machine first; see
+[Install and run agent-inbox](install.md#install-the-binaries).
 
 A runtime that cannot run the CLI can sign raw HTTP instead. The
 [protocol reference](protocol.md) specifies every byte that is signed, and
@@ -299,11 +301,8 @@ store returns `artifacts_disabled`.
 [Model Context Protocol](https://modelcontextprotocol.io) the same inbox as
 tools. It is a thin client: it runs on the agent machine as one registered
 agent, signs every call with that agent's key, and the server decides
-everything, exactly as for the CLI. Build it with the CLI:
-
-```sh
-go build -o agent-inbox-mcp ./cmd/agent-inbox-mcp
-```
+everything, exactly as for the CLI. It is installed with the CLI; see
+[Install and run agent-inbox](install.md#install-the-binaries).
 
 The MCP client starts it as a stdio server. It takes the CLI's identity
 flags or environment variables; for example, in a client's JSON server list:

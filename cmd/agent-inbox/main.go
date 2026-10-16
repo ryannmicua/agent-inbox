@@ -28,6 +28,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		usage(stdout)
 		return nil
 	}
+	if args[0] == "version" || args[0] == "--version" {
+		_, err := fmt.Fprintln(stdout, "agent-inbox", inbox.BuildVersion())
+		return err
+	}
 	if args[0] == "keygen" {
 		return runKeygen(args[1:], stdout)
 	}
@@ -287,6 +291,7 @@ Commands:
                                          (upload a file to a space; prints its artifact_ref)
   artifact get (--space ID --sha256 HASH | --uri inbox-artifact://ID/HASH) --out PATH
                                          (download, verify sha256 and size, then write PATH)
+  version                                (print the build version)
 
 Each API command requires --agent and --key, or INBOX_AGENT and INBOX_KEY.
 The doorbell only prompts; poll for durable delivery and acknowledge after processing.`)

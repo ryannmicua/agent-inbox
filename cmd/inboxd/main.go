@@ -38,6 +38,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runAudit(args[1:], stdout, stderr)
 		case "backup":
 			return runBackup(args[1:], stdout, stderr)
+		case "version", "--version":
+			_, err := fmt.Fprintln(stdout, "inboxd", inbox.BuildVersion())
+			return err
 		case "help", "--help", "-h":
 			usage(stdout)
 			return nil
@@ -359,5 +362,6 @@ _SECRET_ACCESS_KEY, _SESSION_TOKEN, and _MAX_BYTES for artifact uploads.
 Operator commands:
   inboxd healthcheck
   inboxd audit --db PATH [--limit 100]
-  inboxd backup --db PATH --out NEW_PATH`)
+  inboxd backup --db PATH --out NEW_PATH
+  inboxd version`)
 }

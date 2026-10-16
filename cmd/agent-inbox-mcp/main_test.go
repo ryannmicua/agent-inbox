@@ -583,3 +583,13 @@ func publicKey(t *testing.T, keyPath string) []byte {
 	}
 	return private[32:]
 }
+
+func TestVersionNeedsNoIdentity(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := run(context.Background(), []string{"--version"}, strings.NewReader(""), &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stdout.String(), "agent-inbox-mcp "+inbox.BuildVersion()+"\n"; got != want {
+		t.Fatalf("--version printed %q, want %q", got, want)
+	}
+}
