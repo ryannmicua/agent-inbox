@@ -492,7 +492,7 @@ func TestLostResponseRetryPrecedesCurrentEligibilityChecks(t *testing.T) {
 			if apiErr != nil || status != http.StatusOK || got.Sequence != first.Sequence {
 				t.Fatalf("retry was rejected after eligibility changed: HTTP %d %+v message=%+v", status, apiErr, got)
 			}
-			messages, err := s.store.ListMessages(context.Background(), "agent-b", "tenant-one", 100)
+			messages, err := s.store.ListMessages(context.Background(), "agent-b", "tenant-one", nil, 100)
 			if err != nil || len(messages) != 1 || messages[0].ID != envelope.ID {
 				t.Fatalf("retry created another message: %+v", messages)
 			}
@@ -1062,10 +1062,10 @@ func TestEscalationTransitionSkipsMessageAcknowledgedAfterCandidateRead(t *testi
 	if err != nil || len(candidates) != 1 || candidates[0].MessageID != e.ID {
 		t.Fatalf("dispatcher did not load an escalation candidate before ack: %+v err=%v", candidates, err)
 	}
-	if duplicate, err := s.store.Acknowledge(ctx, e.ID, "agent-b", "tenant-one"); err != nil || duplicate {
+	if duplicate, err := s.store.Acknowledge(ctx, e.ID, "agent-b", "tenant-one", nil); err != nil || duplicate {
 		t.Fatalf("recipient acknowledgement failed: duplicate=%t err=%v", duplicate, err)
 	}
-	marked, err := s.store.MarkEscalated(ctx, e.ID, dueAt)
+	marked, err := s.store.MarkEscalated(ctx, e.ID, "agent-b", dueAt)
 	if err != nil || marked {
 		t.Fatalf("escalation transition accepted an acknowledged message: marked=%t err=%v", marked, err)
 	}
@@ -1262,7 +1262,7 @@ type markNotifiedErrorStore struct {
 	err error
 }
 
-func (s markNotifiedErrorStore) MarkNotified(context.Context, string, time.Time) error {
+func (s markNotifiedErrorStore) MarkNotified(context.Context, string, string, time.Time) error {
 	return s.err
 }
 
@@ -1364,8 +1364,11 @@ func TestStoredDuplicatePayloadMembersAreRejectedOnRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.Exec(`INSERT INTO deliveries(message_id, recipient_id, tenant_id) VALUES(?, ?, ?)`, envelope.ID, envelope.RecipientID, "tenant-one"); err != nil {
+		t.Fatal(err)
+	}
 
-	if _, err := store.ListMessages(context.Background(), envelope.RecipientID, "tenant-one", 10); err == nil || !strings.Contains(err.Error(), `duplicate JSON object member "mode"`) {
+	if _, err := store.ListMessages(context.Background(), envelope.RecipientID, "tenant-one", nil, 10); err == nil || !strings.Contains(err.Error(), `duplicate JSON object member "mode"`) {
 		t.Fatalf("message polling accepted an ambiguous legacy payload: %v", err)
 	}
 	if _, err := store.GetMessage(context.Background(), envelope.ID, "tenant-one"); err == nil || !strings.Contains(err.Error(), `duplicate JSON object member "mode"`) {
@@ -1575,7 +1578,7 @@ func TestLegacyStoredMessageRemainsRetryableAckableAndReplyable(t *testing.T) {
 	if err := SignEnvelope(&instruction, s.agents["agent-a"].private); err != nil {
 		t.Fatal(err)
 	}
-	stored, duplicate, err := s.store.CreateMessage(context.Background(), instruction, "tenant-one")
+	stored, duplicate, err := s.store.CreateMessage(context.Background(), instruction, "tenant-one", []string{instruction.RecipientID}, nil)
 	if err != nil || duplicate {
 		t.Fatalf("could not create legacy stored-message fixture: duplicate=%t err=%v", duplicate, err)
 	}
@@ -1750,7 +1753,7 @@ func TestWALOnlineBackupAndAppendOnlyAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer copyStore.Close()
-	messages, err := copyStore.ListMessages(context.Background(), "agent-b", "tenant-one", 10)
+	messages, err := copyStore.ListMessages(context.Background(), "agent-b", "tenant-one", nil, 10)
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("backup did not contain committed message: len=%d err=%v", len(messages), err)
 	}

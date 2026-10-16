@@ -444,14 +444,14 @@ func TestPreSliceDatabaseMigratesToNotificationDisposition(t *testing.T) {
 		if state, err := store.RegistryState(ctx); err != nil || state.SHA256 != "" {
 			t.Fatalf("migrated database has unexpected registry state %q: %v", state.SHA256, err)
 		}
-		marked, err := store.MarkRecipientRevoked(ctx, "pre-slice-message", "unknown_recipient", time.Now())
+		marked, err := store.MarkRecipientRevoked(ctx, "pre-slice-message", "agent-b", "unknown_recipient", time.Now())
 		if err != nil || !marked {
 			t.Fatalf("pre-slice message could not be dispositioned: marked=%t err=%v", marked, err)
 		}
 		if due, err := store.DueNotifications(ctx, time.Now(), time.Second, 3); err != nil || len(due) != 0 {
 			t.Fatalf("dispositioned message is still due: %+v err=%v", due, err)
 		}
-		if marked, err := store.MarkEscalated(ctx, "pre-slice-message", time.Now()); err != nil || marked {
+		if marked, err := store.MarkEscalated(ctx, "pre-slice-message", "agent-b", time.Now()); err != nil || marked {
 			t.Fatalf("dispositioned message was escalated: marked=%t err=%v", marked, err)
 		}
 	}

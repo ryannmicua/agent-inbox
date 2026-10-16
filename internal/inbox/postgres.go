@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -111,6 +112,20 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			observed_at TIMESTAMPTZ NOT NULL
 		)`,
 		`ALTER TABLE registry_state ADD COLUMN IF NOT EXISTS spaces_json TEXT`,
+		`ALTER TABLE messages ADD COLUMN IF NOT EXISTS space_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS deliveries (
+			message_id TEXT NOT NULL REFERENCES messages(id),
+			recipient_id TEXT NOT NULL,
+			tenant_id TEXT NOT NULL,
+			acknowledged_at TIMESTAMPTZ,
+			disposition TEXT,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_notified_at TIMESTAMPTZ,
+			escalated_at TIMESTAMPTZ,
+			PRIMARY KEY(message_id, recipient_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS deliveries_recipient ON deliveries(recipient_id, tenant_id, acknowledged_at)`,
+		deliveryBackfill,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -141,10 +156,11 @@ func (s *PostgresStore) GetMessage(ctx context.Context, id, tenant string) (Deli
 
 func (s *PostgresStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
 	return scanMessage(s.db.QueryRowContext(ctx,
-		`SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = $1 AND tenant_id = $2 AND recipient_id = $3`, id, tenant, recipient))
+		`SELECT m.envelope_json, m.tenant_id, m.sequence, m.accepted_at, d.acknowledged_at FROM messages m
+		JOIN deliveries d ON d.message_id = m.id AND d.recipient_id = $3 WHERE m.id = $1 AND m.tenant_id = $2`, id, tenant, recipient))
 }
 
-func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
+func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant string, recipients []string, auditDetail map[string]any) (DeliveredMessage, bool, error) {
 	encoded, err := json.Marshal(e)
 	if err != nil {
 		return DeliveredMessage{}, false, err
@@ -169,10 +185,10 @@ func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant st
 	}
 
 	var sequence int64
-	err = tx.QueryRowContext(ctx, `INSERT INTO messages(id, sender_id, recipient_id, tenant_id, kind, task_id, thread_id, reply_to, envelope_json, accepted_at)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	err = tx.QueryRowContext(ctx, `INSERT INTO messages(id, sender_id, recipient_id, space_id, tenant_id, kind, task_id, thread_id, reply_to, envelope_json, accepted_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT(id) DO NOTHING RETURNING sequence`,
-		e.ID, e.SenderID, e.RecipientID, tenant, e.Kind, e.TaskID, e.ThreadID, e.ReplyTo, string(encoded), now).Scan(&sequence)
+		e.ID, e.SenderID, e.RecipientID, e.SpaceID, tenant, e.Kind, e.TaskID, e.ThreadID, e.ReplyTo, string(encoded), now).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) {
 		message, found, duplicateErr := s.duplicate(ctx, tx, e, tenant, canonical, now)
 		if duplicateErr != nil {
@@ -189,10 +205,12 @@ func (s *PostgresStore) CreateMessage(ctx context.Context, e Envelope, tenant st
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO notification_state(message_id) VALUES($1)`, e.ID); err != nil {
-		return DeliveredMessage{}, false, err
+	for _, recipient := range recipients {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(message_id, recipient_id, tenant_id) VALUES($1, $2, $3)`, e.ID, recipient, tenant); err != nil {
+			return DeliveredMessage{}, false, err
+		}
 	}
-	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "send", ActorID: e.SenderID, SubjectID: e.ID, TenantID: tenant, Outcome: "accepted"}, now); err != nil {
+	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "send", ActorID: e.SenderID, SubjectID: e.ID, TenantID: tenant, Outcome: "accepted", Detail: auditDetail}, now); err != nil {
 		return DeliveredMessage{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -232,9 +250,14 @@ func (s *PostgresStore) duplicate(ctx context.Context, tx *sql.Tx, e Envelope, t
 	return message, true, nil
 }
 
-func (s *PostgresStore) ListMessages(ctx context.Context, recipient, tenant string, limit int) ([]DeliveredMessage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages
-		WHERE recipient_id = $1 AND tenant_id = $2 AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT $3`, recipient, tenant, limit)
+func (s *PostgresStore) ListMessages(ctx context.Context, recipient, tenant string, readableSpaces []string, limit int) ([]DeliveredMessage, error) {
+	spaceFilter, spaceArgs := readableSpaceFilter(readableSpaces, func(i int) string { return fmt.Sprintf("$%d", i+3) })
+	args := append([]any{recipient, tenant}, spaceArgs...)
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT m.envelope_json, m.tenant_id, m.sequence, m.accepted_at, d.acknowledged_at
+		FROM deliveries d JOIN messages m ON m.id = d.message_id
+		WHERE d.recipient_id = $1 AND d.tenant_id = $2 AND d.acknowledged_at IS NULL AND %s
+		ORDER BY m.sequence ASC LIMIT $%d`, spaceFilter, len(args)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -250,15 +273,14 @@ func (s *PostgresStore) ListMessages(ctx context.Context, recipient, tenant stri
 	return messages, rows.Err()
 }
 
-func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant string) (bool, error) {
+func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant string, readableSpaces []string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, messageTenant string
-	var acknowledged any
-	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&recipient, &messageTenant, &acknowledged)
+	var messageTenant, space string
+	err = tx.QueryRowContext(ctx, `SELECT tenant_id, space_id FROM messages WHERE id = $1`, id).Scan(&messageTenant, &space)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
@@ -268,13 +290,29 @@ func (s *PostgresStore) Acknowledge(ctx context.Context, id, agent, tenant strin
 	if messageTenant != tenant {
 		return false, ErrWrongTenant
 	}
-	if recipient != agent {
+	var acknowledged any
+	err = tx.QueryRowContext(ctx, `SELECT acknowledged_at FROM deliveries WHERE message_id = $1 AND recipient_id = $2 FOR UPDATE`, id, agent).Scan(&acknowledged)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrNotRecipient
+	}
+	if err != nil {
+		return false, err
+	}
+	if space != "" && !slices.Contains(readableSpaces, space) {
+		return false, ErrNotMember
 	}
 	duplicate := acknowledged != nil
 	if !duplicate {
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = $1 WHERE id = $2`, time.Now().UTC(), id); err != nil {
+		now := time.Now().UTC()
+		if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET acknowledged_at = $1 WHERE message_id = $2 AND recipient_id = $3`, now, id, agent); err != nil {
 			return false, err
+		}
+		// A direct message keeps its legacy acknowledgement in step, so an
+		// older release run after a rollback does not deliver it again.
+		if space == "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = $1 WHERE id = $2`, now, id); err != nil {
+				return false, err
+			}
 		}
 	}
 	outcome, code := "accepted", ""
@@ -339,10 +377,10 @@ func (s *PostgresStore) AuditEntries(ctx context.Context, limit int) ([]AuditEnt
 
 func (s *PostgresStore) DueNotifications(ctx context.Context, now time.Time, retry time.Duration, maxAttempts int) ([]NotificationCandidate, error) {
 	cutoff := now.UTC().Add(-retry)
-	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at
-		FROM messages m JOIN notification_state n ON n.message_id = m.id
-		WHERE m.acknowledged_at IS NULL AND n.disposition IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= $1)
-		AND (n.attempts < $2 OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id, d.recipient_id, d.tenant_id, m.space_id, m.sequence, d.attempts, d.escalated_at
+		FROM deliveries d JOIN messages m ON m.id = d.message_id
+		WHERE d.acknowledged_at IS NULL AND d.disposition IS NULL AND (d.last_notified_at IS NULL OR d.last_notified_at <= $1)
+		AND (d.attempts < $2 OR d.escalated_at IS NULL) ORDER BY m.sequence ASC, d.recipient_id ASC`, cutoff, maxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +389,7 @@ func (s *PostgresStore) DueNotifications(ctx context.Context, now time.Time, ret
 	for rows.Next() {
 		var candidate NotificationCandidate
 		var escalated any
-		if err := rows.Scan(&candidate.MessageID, &candidate.Recipient, &candidate.TenantID, &candidate.Sequence, &candidate.Attempts, &escalated); err != nil {
+		if err := rows.Scan(&candidate.MessageID, &candidate.Recipient, &candidate.TenantID, &candidate.SpaceID, &candidate.Sequence, &candidate.Attempts, &escalated); err != nil {
 			return nil, err
 		}
 		candidate.Escalated = escalated != nil
@@ -360,12 +398,12 @@ func (s *PostgresStore) DueNotifications(ctx context.Context, now time.Time, ret
 	return candidates, rows.Err()
 }
 
-func (s *PostgresStore) MarkNotified(ctx context.Context, id string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE notification_state SET attempts = attempts + 1, last_notified_at = $1 WHERE message_id = $2`, now.UTC(), id)
+func (s *PostgresStore) MarkNotified(ctx context.Context, id, recipient string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, last_notified_at = $1 WHERE message_id = $2 AND recipient_id = $3`, now.UTC(), id, recipient)
 	return err
 }
 
-func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.Time) (bool, error) {
+func (s *PostgresStore) MarkEscalated(ctx context.Context, id, recipient string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -373,15 +411,14 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 	defer tx.Rollback()
 	var tenant string
 	var acknowledged any
-	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&tenant, &acknowledged); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM deliveries WHERE message_id = $1 AND recipient_id = $2 FOR UPDATE`, id, recipient).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
 	if acknowledged != nil {
 		return false, tx.Commit()
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = $1
-		WHERE message_id = $2 AND escalated_at IS NULL AND disposition IS NULL
-		AND EXISTS (SELECT 1 FROM messages WHERE id = $2 AND acknowledged_at IS NULL)`, now.UTC(), id)
+	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET escalated_at = $1
+		WHERE message_id = $2 AND recipient_id = $3 AND escalated_at IS NULL AND disposition IS NULL AND acknowledged_at IS NULL`, now.UTC(), id, recipient)
 	if err != nil {
 		return false, err
 	}
@@ -392,7 +429,7 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 	if updated == 0 {
 		return false, tx.Commit()
 	}
-	if err := insertPostgresAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted"}, now); err != nil {
+	if err := insertPostgresAudit(ctx, tx, escalationAudit(id, recipient, tenant), now); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -401,22 +438,22 @@ func (s *PostgresStore) MarkEscalated(ctx context.Context, id string, now time.T
 	return true, nil
 }
 
-func (s *PostgresStore) MarkRecipientRevoked(ctx context.Context, id, reason string, now time.Time) (bool, error) {
+func (s *PostgresStore) MarkRecipientRevoked(ctx context.Context, id, recipient, reason string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, tenant string
+	var tenant string
 	var acknowledged any
-	if err := tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = $1 FOR UPDATE`, id).Scan(&recipient, &tenant, &acknowledged); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM deliveries WHERE message_id = $1 AND recipient_id = $2 FOR UPDATE`, id, recipient).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
 	if acknowledged != nil {
 		return false, tx.Commit()
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET disposition = $1
-		WHERE message_id = $2 AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id)
+	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET disposition = $1
+		WHERE message_id = $2 AND recipient_id = $3 AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id, recipient)
 	if err != nil {
 		return false, err
 	}

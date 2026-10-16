@@ -20,6 +20,7 @@ type canonicalEnvelope struct {
 	ReplyTo           string            `json:"reply_to,omitempty"`
 	SenderID          string            `json:"sender_id"`
 	RecipientID       string            `json:"recipient_id"`
+	SpaceID           string            `json:"space_id,omitempty"`
 	KeyID             string            `json:"key_id"`
 	Kind              string            `json:"kind"`
 	CreatedAt         string            `json:"created_at"`
@@ -54,7 +55,7 @@ func EnvelopeSigningBytes(e Envelope) ([]byte, error) {
 	}
 	canon := canonicalEnvelope{
 		Type: e.Type, ID: e.ID, TaskID: e.TaskID, ThreadID: e.ThreadID,
-		ReplyTo: e.ReplyTo, SenderID: e.SenderID, RecipientID: e.RecipientID,
+		ReplyTo: e.ReplyTo, SenderID: e.SenderID, RecipientID: e.RecipientID, SpaceID: e.SpaceID,
 		KeyID: e.KeyID, Kind: e.Kind, CreatedAt: e.CreatedAt,
 		AssertedAuthority: e.AssertedAuthority, ContentIsData: e.ContentIsData,
 		Payload: payload, Artifacts: artifacts, Provenance: e.Provenance,

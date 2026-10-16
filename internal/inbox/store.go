@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 var (
 	ErrMessageNotFound = errors.New("message not found")
 	ErrNotRecipient    = errors.New("agent is not the message recipient")
+	ErrNotMember       = errors.New("agent no longer reads the message's space")
 	ErrWrongTenant     = errors.New("message belongs to another tenant")
 	ErrMessageConflict = errors.New("message id already exists with different content")
 	ErrReplay          = errors.New("request nonce already used")
@@ -48,10 +50,13 @@ type AuditEntry struct {
 	Detail    map[string]any `json:"detail,omitempty"`
 }
 
+// NotificationCandidate is one unacknowledged delivery: a message and one of
+// its recipients. SpaceID is set for a group message.
 type NotificationCandidate struct {
 	MessageID string
 	Recipient string
 	TenantID  string
+	SpaceID   string
 	Sequence  int64
 	Attempts  int
 	Escalated bool
@@ -62,19 +67,28 @@ type Store interface {
 	Ping(context.Context) error
 	RecordNonce(context.Context, string, string, time.Time) error
 	GetMessage(context.Context, string, string) (DeliveredMessage, error)
+	// GetReplyTarget returns a message in the tenant that was delivered to the
+	// given recipient.
 	GetReplyTarget(context.Context, string, string, string) (DeliveredMessage, error)
-	CreateMessage(context.Context, Envelope, string) (DeliveredMessage, bool, error)
-	ListMessages(context.Context, string, string, int) ([]DeliveredMessage, error)
-	Acknowledge(context.Context, string, string, string) (bool, error)
+	// CreateMessage stores a new message, one delivery per recipient, and its
+	// send accepted audit row (with the given detail) in one transaction. An
+	// identical retry returns the stored message and true.
+	CreateMessage(ctx context.Context, e Envelope, tenant string, recipients []string, auditDetail map[string]any) (DeliveredMessage, bool, error)
+	// ListMessages returns the recipient's unacknowledged deliveries in sequence
+	// order. Group messages appear only for spaces in readableSpaces.
+	ListMessages(ctx context.Context, recipient, tenant string, readableSpaces []string, limit int) ([]DeliveredMessage, error)
+	// Acknowledge marks only the caller's own delivery. A group message whose
+	// space is not in readableSpaces returns ErrNotMember.
+	Acknowledge(ctx context.Context, id, agent, tenant string, readableSpaces []string) (bool, error)
 	AppendAudit(context.Context, AuditRecord) error
 	AuditEntries(context.Context, int) ([]AuditEntry, error)
 	DueNotifications(context.Context, time.Time, time.Duration, int) ([]NotificationCandidate, error)
-	MarkNotified(context.Context, string, time.Time) error
-	MarkEscalated(context.Context, string, time.Time) (bool, error)
-	// MarkRecipientRevoked stops doorbells for an unacknowledged message whose
+	MarkNotified(ctx context.Context, messageID, recipient string, now time.Time) error
+	MarkEscalated(ctx context.Context, messageID, recipient string, now time.Time) (bool, error)
+	// MarkRecipientRevoked stops doorbells for an unacknowledged delivery whose
 	// recipient can no longer collect it and audits that once. It reports
 	// whether this call made the transition.
-	MarkRecipientRevoked(context.Context, string, string, time.Time) (bool, error)
+	MarkRecipientRevoked(ctx context.Context, messageID, recipient, reason string, now time.Time) (bool, error)
 	// RegistryState returns the last registry state recorded by
 	// RecordRegistryChange, or an empty hash when none has been recorded.
 	RegistryState(context.Context) (RecordedRegistry, error)
@@ -243,11 +257,16 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			agents_json TEXT NOT NULL,
 			observed_at TEXT NOT NULL
 		)`,
+		sqliteDeliveriesTable,
+		`CREATE INDEX IF NOT EXISTS deliveries_recipient ON deliveries(recipient_id, tenant_id, acknowledged_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize sqlite schema: %w", err)
 		}
+	}
+	if err := addSQLiteColumn(ctx, s.db, "messages", "space_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add message space: %w", err)
 	}
 	if err := addSQLiteColumn(ctx, s.db, "notification_state", "disposition", "TEXT"); err != nil {
 		return fmt.Errorf("add notification disposition: %w", err)
@@ -260,8 +279,39 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			return fmt.Errorf("remove obsolete acknowledgement field %s: %w", column, err)
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, deliveryBackfill); err != nil {
+		return fmt.Errorf("backfill deliveries: %w", err)
+	}
 	return nil
 }
+
+// sqliteDeliveriesTable holds one row per message and recipient: the
+// recipient's own acknowledgement and doorbell state. It supersedes
+// messages.acknowledged_at and notification_state, which stay for rollback.
+const sqliteDeliveriesTable = `CREATE TABLE IF NOT EXISTS deliveries (
+	message_id TEXT NOT NULL REFERENCES messages(id),
+	recipient_id TEXT NOT NULL,
+	tenant_id TEXT NOT NULL,
+	acknowledged_at TEXT,
+	disposition TEXT,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	last_notified_at TEXT,
+	escalated_at TEXT,
+	PRIMARY KEY(message_id, recipient_id)
+)`
+
+// deliveryBackfill gives every direct message written before deliveries
+// existed its one delivery, carrying over its acknowledgement and doorbell
+// state. It runs at every startup: existing deliveries are kept, and only an
+// acknowledgement recorded on the message (by an older release after a
+// rollback) is copied onto a still-pending delivery. The statement is valid
+// on SQLite and PostgreSQL.
+const deliveryBackfill = `INSERT INTO deliveries(message_id, recipient_id, tenant_id, acknowledged_at, disposition, attempts, last_notified_at, escalated_at)
+	SELECT m.id, m.recipient_id, m.tenant_id, m.acknowledged_at, n.disposition, COALESCE(n.attempts, 0), n.last_notified_at, n.escalated_at
+	FROM messages m LEFT JOIN notification_state n ON n.message_id = m.id
+	WHERE m.recipient_id <> ''
+	ON CONFLICT(message_id, recipient_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at
+	WHERE deliveries.acknowledged_at IS NULL AND excluded.acknowledged_at IS NOT NULL`
 
 func dropSQLiteColumn(ctx context.Context, db *sql.DB, table, column string) error {
 	found, err := sqliteColumnExists(ctx, db, table, column)
@@ -329,10 +379,10 @@ func (s *SQLiteStore) GetMessage(ctx context.Context, id, tenant string) (Delive
 }
 
 func (s *SQLiteStore) GetReplyTarget(ctx context.Context, id, tenant, recipient string) (DeliveredMessage, error) {
-	return scanMessage(s.db.QueryRowContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE id = ? AND tenant_id = ? AND recipient_id = ?`, id, tenant, recipient))
+	return scanMessage(s.db.QueryRowContext(ctx, `SELECT m.envelope_json, m.tenant_id, m.sequence, m.accepted_at, d.acknowledged_at FROM messages m JOIN deliveries d ON d.message_id = m.id AND d.recipient_id = ? WHERE m.id = ? AND m.tenant_id = ?`, recipient, id, tenant))
 }
 
-func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string) (DeliveredMessage, bool, error) {
+func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant string, recipients []string, auditDetail map[string]any) (DeliveredMessage, bool, error) {
 	encoded, err := json.Marshal(e)
 	if err != nil {
 		return DeliveredMessage{}, false, err
@@ -377,8 +427,8 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 		return DeliveredMessage{}, false, err
 	}
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO messages(id, sender_id, recipient_id, tenant_id, kind, task_id, thread_id, reply_to, envelope_json, accepted_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.SenderID, e.RecipientID, tenant, e.Kind, e.TaskID, e.ThreadID, e.ReplyTo, string(encoded), now.Format(time.RFC3339Nano))
+		`INSERT INTO messages(id, sender_id, recipient_id, space_id, tenant_id, kind, task_id, thread_id, reply_to, envelope_json, accepted_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.SenderID, e.RecipientID, e.SpaceID, tenant, e.Kind, e.TaskID, e.ThreadID, e.ReplyTo, string(encoded), now.Format(time.RFC3339Nano))
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
@@ -386,10 +436,12 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	if err != nil {
 		return DeliveredMessage{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO notification_state(message_id) VALUES(?)`, e.ID); err != nil {
-		return DeliveredMessage{}, false, err
+	for _, recipient := range recipients {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(message_id, recipient_id, tenant_id) VALUES(?, ?, ?)`, e.ID, recipient, tenant); err != nil {
+			return DeliveredMessage{}, false, err
+		}
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "send", ActorID: e.SenderID, SubjectID: e.ID, TenantID: tenant, Outcome: "accepted"}, now); err != nil {
+	if err := insertAudit(ctx, tx, AuditRecord{Action: "send", ActorID: e.SenderID, SubjectID: e.ID, TenantID: tenant, Outcome: "accepted", Detail: auditDetail}, now); err != nil {
 		return DeliveredMessage{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -398,8 +450,14 @@ func (s *SQLiteStore) CreateMessage(ctx context.Context, e Envelope, tenant stri
 	return DeliveredMessage{Envelope: e, TenantID: tenant, Sequence: sequence, AcceptedAt: now}, false, nil
 }
 
-func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string, limit int) ([]DeliveredMessage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT envelope_json, tenant_id, sequence, accepted_at, acknowledged_at FROM messages WHERE recipient_id = ? AND tenant_id = ? AND acknowledged_at IS NULL ORDER BY sequence ASC LIMIT ?`, recipient, tenant, limit)
+func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string, readableSpaces []string, limit int) ([]DeliveredMessage, error) {
+	spaceFilter, spaceArgs := readableSpaceFilter(readableSpaces, func(int) string { return "?" })
+	args := append([]any{recipient, tenant}, spaceArgs...)
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT m.envelope_json, m.tenant_id, m.sequence, m.accepted_at, d.acknowledged_at
+		FROM deliveries d JOIN messages m ON m.id = d.message_id
+		WHERE d.recipient_id = ? AND d.tenant_id = ? AND d.acknowledged_at IS NULL AND `+spaceFilter+`
+		ORDER BY m.sequence ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -415,15 +473,30 @@ func (s *SQLiteStore) ListMessages(ctx context.Context, recipient, tenant string
 	return messages, rows.Err()
 }
 
-func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string) (bool, error) {
+// readableSpaceFilter limits a query on messages m to direct messages and
+// group messages in the given spaces. placeholder(i) renders the i-th
+// (zero-based) space argument.
+func readableSpaceFilter(spaces []string, placeholder func(int) string) (string, []any) {
+	if len(spaces) == 0 {
+		return "m.space_id = ''", nil
+	}
+	marks := make([]string, len(spaces))
+	args := make([]any, len(spaces))
+	for i, space := range spaces {
+		marks[i] = placeholder(i)
+		args[i] = space
+	}
+	return "(m.space_id = '' OR m.space_id IN (" + strings.Join(marks, ", ") + "))", args
+}
+
+func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string, readableSpaces []string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, messageTenant string
-	var acknowledged sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &messageTenant, &acknowledged)
+	var messageTenant, space string
+	err = tx.QueryRowContext(ctx, `SELECT tenant_id, space_id FROM messages WHERE id = ?`, id).Scan(&messageTenant, &space)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrMessageNotFound
 	}
@@ -433,14 +506,29 @@ func (s *SQLiteStore) Acknowledge(ctx context.Context, id, agent, tenant string)
 	if messageTenant != tenant {
 		return false, ErrWrongTenant
 	}
-	if recipient != agent {
+	var acknowledged sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT acknowledged_at FROM deliveries WHERE message_id = ? AND recipient_id = ?`, id, agent).Scan(&acknowledged)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrNotRecipient
+	}
+	if err != nil {
+		return false, err
+	}
+	if space != "" && !slices.Contains(readableSpaces, space) {
+		return false, ErrNotMember
 	}
 	duplicate := acknowledged.Valid
 	if !duplicate {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET acknowledged_at = ? WHERE message_id = ? AND recipient_id = ?`, now, id, agent); err != nil {
 			return false, err
+		}
+		// A direct message keeps its legacy acknowledgement in step, so an
+		// older release run after a rollback does not deliver it again.
+		if space == "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET acknowledged_at = ? WHERE id = ?`, now, id); err != nil {
+				return false, err
+			}
 		}
 	}
 	outcome, code := "accepted", ""
@@ -503,7 +591,10 @@ func (s *SQLiteStore) AuditEntries(ctx context.Context, limit int) ([]AuditEntry
 
 func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry time.Duration, maxAttempts int) ([]NotificationCandidate, error) {
 	cutoff := now.UTC().Add(-retry).Format(time.RFC3339Nano)
-	rows, err := s.db.QueryContext(ctx, `SELECT m.id, m.recipient_id, m.tenant_id, m.sequence, n.attempts, n.escalated_at FROM messages m JOIN notification_state n ON n.message_id = m.id WHERE m.acknowledged_at IS NULL AND n.disposition IS NULL AND (n.last_notified_at IS NULL OR n.last_notified_at <= ?) AND (n.attempts < ? OR n.escalated_at IS NULL) ORDER BY m.sequence ASC`, cutoff, maxAttempts)
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id, d.recipient_id, d.tenant_id, m.space_id, m.sequence, d.attempts, d.escalated_at
+		FROM deliveries d JOIN messages m ON m.id = d.message_id
+		WHERE d.acknowledged_at IS NULL AND d.disposition IS NULL AND (d.last_notified_at IS NULL OR d.last_notified_at <= ?)
+		AND (d.attempts < ? OR d.escalated_at IS NULL) ORDER BY m.sequence ASC, d.recipient_id ASC`, cutoff, maxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +603,7 @@ func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry
 	for rows.Next() {
 		var c NotificationCandidate
 		var escalated sql.NullString
-		if err := rows.Scan(&c.MessageID, &c.Recipient, &c.TenantID, &c.Sequence, &c.Attempts, &escalated); err != nil {
+		if err := rows.Scan(&c.MessageID, &c.Recipient, &c.TenantID, &c.SpaceID, &c.Sequence, &c.Attempts, &escalated); err != nil {
 			return nil, err
 		}
 		c.Escalated = escalated.Valid
@@ -521,12 +612,12 @@ func (s *SQLiteStore) DueNotifications(ctx context.Context, now time.Time, retry
 	return out, rows.Err()
 }
 
-func (s *SQLiteStore) MarkNotified(ctx context.Context, id string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE notification_state SET attempts = attempts + 1, last_notified_at = ? WHERE message_id = ?`, now.UTC().Format(time.RFC3339Nano), id)
+func (s *SQLiteStore) MarkNotified(ctx context.Context, id, recipient string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, last_notified_at = ? WHERE message_id = ? AND recipient_id = ?`, now.UTC().Format(time.RFC3339Nano), id, recipient)
 	return err
 }
 
-func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Time) (bool, error) {
+func (s *SQLiteStore) MarkEscalated(ctx context.Context, id, recipient string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -534,15 +625,14 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 	defer tx.Rollback()
 	var tenant string
 	var acknowledged sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&tenant, &acknowledged); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM deliveries WHERE message_id = ? AND recipient_id = ?`, id, recipient).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
 	if acknowledged.Valid {
 		return false, tx.Commit()
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET escalated_at = ?
-		WHERE message_id = ? AND escalated_at IS NULL AND disposition IS NULL
-		AND EXISTS (SELECT 1 FROM messages WHERE id = ? AND acknowledged_at IS NULL)`, now.UTC().Format(time.RFC3339Nano), id, id)
+	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET escalated_at = ?
+		WHERE message_id = ? AND recipient_id = ? AND escalated_at IS NULL AND disposition IS NULL AND acknowledged_at IS NULL`, now.UTC().Format(time.RFC3339Nano), id, recipient)
 	if err != nil {
 		return false, err
 	}
@@ -553,7 +643,7 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 	if updated == 0 {
 		return false, tx.Commit()
 	}
-	if err := insertAudit(ctx, tx, AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted"}, now); err != nil {
+	if err := insertAudit(ctx, tx, escalationAudit(id, recipient, tenant), now); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -562,22 +652,22 @@ func (s *SQLiteStore) MarkEscalated(ctx context.Context, id string, now time.Tim
 	return true, nil
 }
 
-func (s *SQLiteStore) MarkRecipientRevoked(ctx context.Context, id, reason string, now time.Time) (bool, error) {
+func (s *SQLiteStore) MarkRecipientRevoked(ctx context.Context, id, recipient, reason string, now time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	var recipient, tenant string
+	var tenant string
 	var acknowledged sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT recipient_id, tenant_id, acknowledged_at FROM messages WHERE id = ?`, id).Scan(&recipient, &tenant, &acknowledged); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id, acknowledged_at FROM deliveries WHERE message_id = ? AND recipient_id = ?`, id, recipient).Scan(&tenant, &acknowledged); err != nil {
 		return false, err
 	}
 	if acknowledged.Valid {
 		return false, tx.Commit()
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE notification_state SET disposition = ?
-		WHERE message_id = ? AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id)
+	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET disposition = ?
+		WHERE message_id = ? AND recipient_id = ? AND disposition IS NULL AND escalated_at IS NULL`, DispositionRecipientRevoked, id, recipient)
 	if err != nil {
 		return false, err
 	}
@@ -596,6 +686,10 @@ func (s *SQLiteStore) MarkRecipientRevoked(ctx context.Context, id, reason strin
 
 func recipientRevokedAudit(id, recipient, tenant, reason string) AuditRecord {
 	return AuditRecord{Action: "delivery.recipient_revoked", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted", Code: reason, Detail: map[string]any{"recipient_id": recipient}}
+}
+
+func escalationAudit(id, recipient, tenant string) AuditRecord {
+	return AuditRecord{Action: "message.unacknowledged_escalation", ActorID: "system", SubjectID: id, TenantID: tenant, Outcome: "attempted", Detail: map[string]any{"recipient_id": recipient}}
 }
 
 func (s *SQLiteStore) RegistryState(ctx context.Context) (RecordedRegistry, error) {

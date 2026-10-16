@@ -170,7 +170,13 @@ func docCanonical(env map[string]any) []byte {
 	if str("reply_to") != "" {
 		add("reply_to", docString(str("reply_to")))
 	}
-	for _, name := range []string{"sender_id", "recipient_id", "key_id", "kind", "created_at"} {
+	for _, name := range []string{"sender_id", "recipient_id"} {
+		add(name, docString(str(name)))
+	}
+	if str("space_id") != "" {
+		add("space_id", docString(str("space_id")))
+	}
+	for _, name := range []string{"key_id", "kind", "created_at"} {
 		add(name, docString(str(name)))
 	}
 	if str("asserted_authority") != "" {
@@ -278,10 +284,13 @@ func TestWalkthroughTwoRuntimes(t *testing.T) {
 	}
 	registryPath := filepath.Join(dir, "registry.json")
 	writeRegistry := func(rawDisabled bool) {
-		registry := inbox.Registry{Version: 1, Agents: []inbox.RegistryAgent{
+		registry := inbox.Registry{Version: 2, Agents: []inbox.RegistryAgent{
 			{ID: "cli-bot", TenantID: "walkthrough", PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: publicKey("cli-bot")}}, AllowedRecipients: []string{"raw-bot"}, AllowedKinds: []string{"instruction", "result"}},
 			{ID: "raw-bot", TenantID: "walkthrough", Disabled: rawDisabled, PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: publicKey("raw-bot")}}, AllowedRecipients: []string{"cli-bot"}, AllowedKinds: []string{"instruction", "result"}},
-		}}
+		}, Spaces: []inbox.RegistrySpace{{ID: "release-notes", TenantID: "walkthrough", Members: []inbox.RegistrySpaceMember{
+			{Agent: "cli-bot", Grants: []string{"read", "post"}},
+			{Agent: "raw-bot", Grants: []string{"read", "post"}},
+		}}}}
 		data, err := json.Marshal(registry)
 		if err != nil {
 			t.Fatal(err)
@@ -404,7 +413,45 @@ func TestWalkthroughTwoRuntimes(t *testing.T) {
 		t.Fatalf("empty inbox poll --wait returned %q, %v", out, err)
 	}
 
-	// Step 6: the operator disables the raw bot. Its poll, ack, and doorbell
+	// Step 6: the CLI bot posts to the shared space; the raw bot verifies,
+	// acknowledges its own delivery, and answers in the space.
+	sent, err = cli("send", "--space", "release-notes", "--kind", "instruction", "--payload", `{"ask":"post your section"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := decodeJSON(t, []byte(sent))
+	_, polled = raw.do(t, http.MethodGet, "/v1/messages?limit=100", nil)
+	if len(messages(polled)) != 1 {
+		t.Fatalf("raw bot did not receive the group message: %v", polled)
+	}
+	received = messages(polled)[0].(map[string]any)
+	signature, _ = base64.StdEncoding.DecodeString(received["signature"].(string))
+	if received["id"] != group["id"] || received["space_id"] != "release-notes" || !ed25519.Verify(ed25519.PublicKey(cliPublic), docCanonical(received), signature) {
+		t.Fatalf("group message did not verify with the documented canonical form: %v", received)
+	}
+	if status, acked := raw.do(t, http.MethodPost, "/v1/messages/"+group["id"].(string)+"/ack", []byte(`{"processed":true}`)); status != http.StatusOK || acked["duplicate"] != false {
+		t.Fatalf("raw group ack returned HTTP %d %v", status, acked)
+	}
+	status, accepted = raw.send(t, map[string]any{
+		"type": "message", "id": "0192f0c4-7d2e-7a10-8c3b-5d6e7f809b02", "task_id": group["task_id"], "thread_id": group["thread_id"],
+		"reply_to": group["id"], "sender_id": "raw-bot", "recipient_id": "", "space_id": "release-notes", "key_id": "primary", "kind": "result",
+		"created_at": time.Now().UTC().Format(time.RFC3339), "content_is_data": true, "payload": map[string]any{"section": "done"}, "artifacts": []any{},
+	})
+	if status != http.StatusCreated || accepted["space_id"] != "release-notes" {
+		t.Fatalf("raw group result was rejected: HTTP %d %v", status, accepted)
+	}
+	out, err = cli("poll")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := messages(decodeJSON(t, []byte(out))); len(result) != 1 || result[0].(map[string]any)["space_id"] != "release-notes" {
+		t.Fatalf("CLI bot did not receive the group result: %s", out)
+	}
+	if _, err := cli("ack", "--message", "0192f0c4-7d2e-7a10-8c3b-5d6e7f809b02"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 7: the operator disables the raw bot. Its poll, ack, and doorbell
 	// stream are refused, and messages to it are rejected.
 	writeRegistry(true)
 	for _, request := range []struct{ method, path, body string }{

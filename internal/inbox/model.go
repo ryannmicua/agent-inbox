@@ -29,7 +29,8 @@ type Artifact struct {
 }
 
 // Envelope is the sender-authored A2A-style message. Tenant and ordering are
-// deliberately absent: the server derives both.
+// deliberately absent: the server derives both. Exactly one of RecipientID and
+// SpaceID is set; SpaceID addresses every member of a space holding read.
 type Envelope struct {
 	Type              string            `json:"type"`
 	ID                string            `json:"id"`
@@ -38,6 +39,7 @@ type Envelope struct {
 	ReplyTo           string            `json:"reply_to,omitempty"`
 	SenderID          string            `json:"sender_id"`
 	RecipientID       string            `json:"recipient_id"`
+	SpaceID           string            `json:"space_id,omitempty"`
 	KeyID             string            `json:"key_id"`
 	Kind              string            `json:"kind"`
 	CreatedAt         string            `json:"created_at"`
@@ -96,6 +98,7 @@ type DoorbellEvent struct {
 	MessageID string `json:"message_id"`
 	Sequence  int64  `json:"sequence"`
 	Recipient string `json:"recipient_id"`
+	SpaceID   string `json:"space_id,omitempty"`
 }
 
 type APIError struct {

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Replay the two-runtime walkthrough: a bot using the Go CLI and a bot using
 # the standalone Python client exchange an instruction with a file reference,
-# poll and acknowledge while offline, reply with a correlated result, and list
-# the spaces the operator granted them.
+# poll and acknowledge while offline, reply with a correlated result, list
+# the spaces the operator granted them, and exchange a group message in a
+# space, each acknowledging only its own delivery.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
-#                                   replay, edit the Python bot's space grants,
-#                                   then revoke it and show what the audit
-#                                   records about it
+#                                   replay, edit the Python bot's space grants
+#                                   and remove it from the space, then revoke
+#                                   it and show what the audit records
 #   scripts/walkthrough.sh remote   replay against an existing server; set
 #                                   INBOX_SERVER, CLI_BOT, CLI_KEY, RAW_BOT, RAW_KEY,
-#                                   and optionally WALKTHROUGH_SPACE to require
-#                                   that both bots are members of that space
+#                                   and optionally WALKTHROUGH_SPACE: both bots
+#                                   must then hold read and post there, and
+#                                   they exchange a group message in it
 #
 # Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
 # skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
@@ -158,6 +160,35 @@ else
   echo "$RAW_BOT: $raw_spaces"
 fi
 
+if [[ -n "${WALKTHROUGH_SPACE:-}" ]]; then
+  step "$CLI_BOT posts one group message to $WALKTHROUGH_SPACE; each member gets its own delivery"
+  group="$(cli send --space "$WALKTHROUGH_SPACE" --kind instruction --payload '{"ask":"post your section of the release plan"}')"
+  group_id="$(json_field id <<< "$group")"
+  echo "accepted group instruction $group_id in space $(json_field space_id <<< "$group")"
+  polled="$(raw poll)"
+  [[ "$(json_field messages.0.id <<< "$polled")" == "$group_id" && "$(json_field messages.0.space_id <<< "$polled")" == "$WALKTHROUGH_SPACE" ]] || { echo "unexpected poll: $polled" >&2; exit 1; }
+  echo "$RAW_BOT received $group_id from space $WALKTHROUGH_SPACE"
+  [[ "$(cli poll)" == '{"messages":[]}' ]] || { echo "the sender received its own group message" >&2; exit 1; }
+  echo "$CLI_BOT, the sender, holds no delivery of its own message"
+  raw ack --message "$group_id"
+  [[ "$(raw poll)" == '{"messages":[]}' ]] || { echo "acknowledged group message was delivered again" >&2; exit 1; }
+  if [[ "$mode" == local ]]; then
+    "$tmp_dir/inboxd" audit --limit 100 | python3 -c 'import json,sys
+row = next(e for e in json.load(sys.stdin) if e["action"] == "send" and e["subject_id"] == sys.argv[1] and e["outcome"] == "accepted")
+d = row["detail"]
+assert d["space_id"] == "release-notes" and d["recipients"] == ["raw-bot"] and len(d["registry_sha256"]) == 64, d
+print("audit: send accepted, audience %s at registry %s" % (d["recipients"], d["registry_sha256"][:12]))' "$group_id"
+  fi
+
+  step "$RAW_BOT answers in the space with a correlated result"
+  group_result="$(raw send --space "$WALKTHROUGH_SPACE" --kind result --task "$(json_field task_id <<< "$group")" --thread "$(json_field thread_id <<< "$group")" --reply-to "$group_id" --payload '{"section":"notes drafted"}')"
+  group_result_id="$(json_field id <<< "$group_result")"
+  returned="$(cli poll --wait 30s)"
+  [[ "$(json_field messages.0.id <<< "$returned")" == "$group_result_id" && "$(json_field messages.0.reply_to <<< "$returned")" == "$group_id" ]] || { echo "unexpected poll: $returned" >&2; exit 1; }
+  echo "$CLI_BOT received result $group_result_id in space $(json_field messages.0.space_id <<< "$returned")"
+  cli ack --message "$group_result_id"
+fi
+
 if [[ "$mode" == local ]]; then
   audit_rows() { "$tmp_dir/inboxd" audit --limit 100; }
   audit_has() { audit_rows | python3 -c 'import json,sys
@@ -168,8 +199,14 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   write_registry false '["read"]'
   [[ "$(raw spaces | space_grants release-notes)" == "read (members cli-bot,raw-bot)" ]] || { echo "grant edit did not apply" >&2; exit 1; }
   echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
+  later="$(cli send --space release-notes --kind instruction --payload '{"ask":"one more section"}')"
+  later_id="$(json_field id <<< "$later")"
+  [[ "$(json_field messages.0.id <<< "$(raw poll)")" == "$later_id" ]] || { echo "read-only member did not receive the group message" >&2; exit 1; }
+  echo "$RAW_BOT, holding read only, received group message $later_id"
   write_registry false ''
   [[ "$(raw spaces)" == '{"spaces":[]}' ]] || { echo "removed member still lists the space" >&2; exit 1; }
+  [[ "$(raw poll)" == '{"messages":[]}' ]] || { echo "removed member still sees the space's messages" >&2; exit 1; }
+  echo "$RAW_BOT, removed from release-notes, no longer sees $later_id"
   echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
   echo "$CLI_BOT in release-notes: $(cli spaces | space_grants release-notes)"
   audit_rows | python3 -c 'import json,sys
@@ -178,6 +215,12 @@ want = [{"space": "release-notes", "agent": "raw-bot", "old_grants": ["read"], "
         {"space": "release-notes", "agent": "raw-bot", "old_grants": ["artifact.get", "note.write", "post", "read"], "new_grants": ["read"]}]
 sys.exit(0 if changes[:2] == want else "registry.changed did not record the membership edits: %s" % changes)'
   echo "registry.changed recorded both membership edits"
+  for _ in $(seq 1 30); do
+    audit_has delivery.recipient_revoked attempted not_member && break
+    sleep 0.5
+  done
+  audit_has delivery.recipient_revoked attempted not_member || { echo "the removed member's delivery was not dispositioned" >&2; exit 1; }
+  echo "audit: delivery.recipient_revoked not_member for $later_id; the delivery row is kept"
 
   step "Work is left pending in both directions"
   pending="$(cli send --to "$RAW_BOT" --kind instruction --payload '{"task":"never collected"}')"
@@ -210,7 +253,7 @@ sys.exit(0 if changes[:2] == want else "registry.changed did not record the memb
   if audit_has message.unacknowledged_escalation attempted ""; then echo "revoked recipient's work escalated as unacknowledged" >&2; exit 1; fi
   for _ in $(seq 1 10); do grep -q '"delivery.recipient_revoked"' "$tmp_dir/notifications.log" && break; sleep 0.2; done
   grep -q '"delivery.recipient_revoked"' "$tmp_dir/notifications.log" || { echo "operator webhook missed delivery.recipient_revoked" >&2; exit 1; }
-  echo "webhook: $(grep -o '{"code".*"delivery.recipient_revoked"[^}]*}' "$tmp_dir/notifications.log" | head -1)"
+  echo "webhook: $(grep -o '{"code":"unknown_recipient".*"delivery.recipient_revoked"[^}]*}' "$tmp_dir/notifications.log" | head -1)"
   audit_has registry.changed recorded "" || { echo "registry change was not audited" >&2; exit 1; }
   audit_has auth.revoked_credential rejected agent_disabled || { echo "revoked credential use was not audited" >&2; exit 1; }
 
@@ -218,7 +261,7 @@ sys.exit(0 if changes[:2] == want else "registry.changed did not record the memb
   audit_rows | python3 -c 'import json,sys
 for e in reversed(json.load(sys.stdin)):
     d = e.get("detail") or {}
-    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "memberships_changed") if d.get(k)}
+    extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "space_id", "recipients", "memberships_changed") if d.get(k)}
     print(e["sequence"], e["action"], e.get("actor_id",""), e.get("subject_id","")[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
 fi
 

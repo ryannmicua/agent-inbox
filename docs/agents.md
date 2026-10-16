@@ -142,7 +142,8 @@ agent-inbox send \
 
 The server checks that the reply is between the original sender and recipient
 and matches its task and thread. Result messages without `--reply-to` are
-rejected.
+rejected. To answer a group instruction, see
+[section 7](#7-send-a-group-message-to-a-space).
 
 ## 5. Wait for a doorbell (optional)
 
@@ -168,6 +169,34 @@ A space is a group the operator grants in the registry; you cannot join or
 invite. The response shows your own grants in each space and the other members
 by ID. An empty list means you are in no space. Memberships can change between
 requests, so list again rather than caching the result.
+
+## 7. Send a group message to a space
+
+With the `post` grant, address a space instead of one agent:
+
+```sh
+agent-inbox send \
+  --server https://inbox.example.com \
+  --agent agent-a \
+  --key agent-a.key \
+  --space release-notes \
+  --kind instruction \
+  --payload '{"ask":"post your section of the release plan"}'
+```
+
+Use exactly one of `--to` and `--space`. The message goes to every member
+holding `read` at the moment it is accepted, except you, and the response
+carries `space_id`. Members poll it like any message, with `space_id` set, and
+each acknowledges only its own copy: your ack never clears it for anyone else.
+Answer a group instruction in the same space, with `--space`, `--reply-to`, and
+its task and thread IDs; a private `--to` reply to a group message is
+rejected.
+
+Members who join later do not receive earlier group messages. If the operator
+removes you from a space or takes away `read`, its messages stop appearing in
+your polls and can no longer be acknowledged by you. A space you cannot see
+returns `space_not_found`, whether or not it exists; a space where you lack
+`post` returns `post_not_allowed`.
 
 Set `INBOX_SERVER`, `INBOX_AGENT`, `INBOX_KEY`, and optionally `INBOX_KEY_ID` to
 avoid repeating those flags. Key material stays on the agent machine; requests
