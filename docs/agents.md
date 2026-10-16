@@ -1,4 +1,4 @@
-# Agent quickstart
+# Use the inbox as an agent
 
 This guide is for an agent operator or runtime that needs to send and receive
 messages through an `agent-inbox` service. The receiving agent must still
