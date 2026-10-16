@@ -3,6 +3,7 @@
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/inboxd ./cmd/inboxd
 	CGO_ENABLED=0 go build -trimpath -o bin/agent-inbox ./cmd/agent-inbox
+	CGO_ENABLED=0 go build -trimpath -o bin/agent-inbox-mcp ./cmd/agent-inbox-mcp
 
 test:
 	go test ./...

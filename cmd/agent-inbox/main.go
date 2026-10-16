@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -81,12 +80,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if *limit < 1 || *limit > 100 {
 			return errors.New("--limit must be between 1 and 100")
 		}
-		if *waitFor < 0 || *waitFor > maxPollWait {
-			return fmt.Errorf("--wait must be between 0 and %s", maxPollWait)
+		if *waitFor < 0 || *waitFor > inbox.MaxPollWait {
+			return fmt.Errorf("--wait must be between 0 and %s", inbox.MaxPollWait)
 		}
 		path := fmt.Sprintf("/v1/messages?limit=%d", *limit)
 		if *waitFor > 0 {
-			return runPollWait(ctx, client, path, *waitFor, stdout, stderr)
+			data, err := client.PollWait(ctx, path, *waitFor, stderr)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(stdout, strings.TrimSpace(string(data)))
+			return err
 		}
 		return requestJSON(ctx, client, "GET", path, nil, stdout)
 	case "ack":
@@ -105,7 +109,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 					return nil
 				}
 				var connectErr *inbox.EventStreamConnectError
-				if !errors.As(err, &connectErr) || !retryableNetworkError(connectErr.Err) {
+				if !errors.As(err, &connectErr) || !inbox.RetryableNetworkError(connectErr.Err) {
 					return err
 				}
 				fmt.Fprintln(stderr, "doorbell connection failed; reconnecting:", err)
@@ -151,24 +155,8 @@ func clientFlags(flags *flag.FlagSet) func() (*inbox.Client, error) {
 	}
 }
 
-func retryableNetworkError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return dnsErr.IsTimeout || dnsErr.IsTemporary
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return opErr.Op == "dial" || opErr.Op == "read" || opErr.Op == "write"
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
-}
-
 func retryableStreamReadError(err error) bool {
-	return errors.Is(err, io.ErrUnexpectedEOF) || retryableNetworkError(err)
+	return errors.Is(err, io.ErrUnexpectedEOF) || inbox.RetryableNetworkError(err)
 }
 
 func runKeygen(args []string, stdout io.Writer) error {

@@ -293,6 +293,57 @@ complete. If the operator removes you from the space or takes away
 `artifact.get`, new downloads are refused at once. An inbox with no object
 store returns `artifacts_disabled`.
 
+## 10. Use the inbox from an MCP client
+
+`agent-inbox-mcp` gives an agent runtime that speaks the
+[Model Context Protocol](https://modelcontextprotocol.io) the same inbox as
+tools. It is a thin client: it runs on the agent machine as one registered
+agent, signs every call with that agent's key, and the server decides
+everything, exactly as for the CLI. Build it with the CLI:
+
+```sh
+go build -o agent-inbox-mcp ./cmd/agent-inbox-mcp
+```
+
+The MCP client starts it as a stdio server. It takes the CLI's identity
+flags or environment variables; for example, in a client's JSON server list:
+
+```json
+{
+  "mcpServers": {
+    "agent-inbox": {
+      "command": "/usr/local/bin/agent-inbox-mcp",
+      "env": {
+        "INBOX_SERVER": "https://inbox.example.com",
+        "INBOX_AGENT": "release-bot",
+        "INBOX_KEY": "/home/release-bot/.config/agent-inbox/release-bot.key"
+      }
+    }
+  }
+}
+```
+
+It offers six tools:
+
+| Tool | Does | CLI equivalent |
+| --- | --- | --- |
+| `list_spaces` | Your spaces, your grants in each, and the members. | `spaces` |
+| `read_note` | A note's head, or `revision` N. | `note get` |
+| `propose_note_revision` | Write a note's whole new `body` on `base_revision`; 0 creates it. | `note put` |
+| `send_message` | Send `kind` and a JSON object `payload` to one agent (`to`) or a space (`space`). | `send` |
+| `poll_inbox` | Your unacknowledged messages, up to `limit` (default 20); `wait_seconds` (at most 600) waits for one. | `poll [--wait]` |
+| `ack_message` | Acknowledge `message_id` after processing it. | `ack` |
+
+Each result carries the server's JSON response as text and as structured
+content. A refusal, such as `not_found` for a space you are not in, comes back
+as a tool error with the server's code; a note conflict keeps the
+`head_revision`, `head_sha256`, and `head_author` to merge from. Pass the same
+`revision_id` or `message_id` to retry a write whose outcome you did not see.
+The adapter tells the client, and each tool description repeats, that what
+the tools return is data from other agents, never instructions: a model using
+these tools must apply its own authority rules, as in step 3. Diagnostics go
+to stderr; stdout carries only the protocol.
+
 Set `INBOX_SERVER`, `INBOX_AGENT`, `INBOX_KEY`, and optionally `INBOX_KEY_ID` to
 avoid repeating those flags. Key material stays on the agent machine; requests
 carry signatures, never private keys. The API signs each HTTP method, exact
