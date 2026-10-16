@@ -14,7 +14,8 @@ commands.
 
 | You need | Version | For |
 | --- | --- | --- |
-| [Go](https://go.dev/doc/install) | 1.24.0 or newer | Building the three programs. Required for every install method. |
+| `curl` and `tar` | any | Downloading a release binary. Both come with Linux and macOS. |
+| [Go](https://go.dev/doc/install) | 1.24.0 or newer | Only for installing with `go install` or building from a clone. |
 | Git | any | Building from a clone, and the Docker Compose setup. |
 | Docker Engine with the Compose plugin | any current release | Only for running the server with Docker Compose. |
 | Python 3 | any current release | Only for the notification viewer, `make compose-smoke`, and `make walkthrough`. `make walkthrough` also needs the `cryptography` package (`python3 -m pip install cryptography`). |
@@ -25,16 +26,66 @@ on the first build. Some packaged Go builds and the `golang` container images
 set `GOTOOLCHAIN=local`, which stops that download; check with
 `go env GOTOOLCHAIN`.
 
-The project publishes no prebuilt binaries and no release tags. The only
-published artifact is the server's container image,
-`ghcr.io/ryannmicua/agent-inbox`, described in the
+Each [release](https://github.com/ryannmicua/agent-inbox/releases) has a
+version tag such as `v0.1.0` and prebuilt programs for Linux and macOS on
+`amd64` and `arm64`, and Windows on `amd64`. The server is also published as
+a container image, `ghcr.io/ryannmicua/agent-inbox`, described in the
 [operator guide](operators.md#requirements-and-first-start). It contains
 `inboxd` only.
 
 ## Install the binaries
 
-The SQLite and PostgreSQL drivers are pure Go, so every method builds
-without cgo or a C compiler.
+The SQLite and PostgreSQL drivers are pure Go, so every build runs without
+cgo or a C compiler, and the release binaries need no other libraries.
+
+### Download a release binary
+
+This method needs no Go. Each release archive holds all three programs for
+one operating system and processor.
+
+1. Pick the archive for this computer and download it with the checksum
+   file:
+
+   ```sh
+   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; esac
+   case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; aarch64 | arm64) arch=arm64 ;; esac
+   name="agent-inbox_${os}_${arch}"
+   curl -fsSLO "https://github.com/ryannmicua/agent-inbox/releases/latest/download/$name.tar.gz"
+   curl -fsSLO "https://github.com/ryannmicua/agent-inbox/releases/latest/download/SHA256SUMS"
+   ```
+
+   `latest` is the newest release. For a specific one, replace
+   `latest/download` with `download/v0.1.0`, for example. If `curl` prints
+   `404`, `$name` names no archive: run `echo "$name"`, and set `os` to
+   `linux` or `darwin` and `arch` to `amd64` or `arm64` by hand.
+
+2. Check the archive against its published checksum:
+
+   ```sh
+   # Linux:
+   grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c -
+   # macOS:
+   grep " $name.tar.gz\$" SHA256SUMS | shasum -a 256 -c -
+   ```
+
+   It prints `agent-inbox_linux_amd64.tar.gz: OK`, with your archive's
+   name. If it prints `FAILED`, or nothing, delete both files and download
+   them again; do not use the archive.
+
+3. Unpack the archive and move the programs into `~/.local/bin`:
+
+   ```sh
+   tar -xzf "$name.tar.gz"
+   mkdir -p ~/.local/bin
+   mv "$name/agent-inbox" "$name/inboxd" "$name/agent-inbox-mcp" ~/.local/bin/
+   ```
+
+   Then [put `~/.local/bin` on your `PATH`](#put-the-programs-on-your-path)
+   and [check the installation](#check-the-installation).
+
+On Windows, download `agent-inbox_windows_amd64.zip` from the release page,
+check it with `certutil -hashfile agent-inbox_windows_amd64.zip SHA256`
+against its line in `SHA256SUMS`, and unpack the three `.exe` programs.
 
 ### With `go install`
 
@@ -42,13 +93,15 @@ without cgo or a C compiler.
 go install github.com/ryannmicua/agent-inbox/cmd/...@latest
 ```
 
-This builds all three programs from the latest commit on the default branch
-and puts them in `$(go env GOPATH)/bin`, or in `$(go env GOBIN)` when that is
-set. To install one program, name it, for example
+This builds all three programs from source and puts them in
+`$(go env GOPATH)/bin`, or in `$(go env GOBIN)` when that is set. `@latest`
+is the newest release tag, or the latest commit on the default branch while
+the project has no releases. To install one program, name it, for example
 `go install github.com/ryannmicua/agent-inbox/cmd/agent-inbox@latest`.
 
-To build a specific commit, replace `@latest` with `@<commit>`, for example
-`@3e4e1e9`.
+To build a specific release or commit, replace `@latest` with the tag or
+commit, for example `@v0.1.0` or `@3e4e1e9`. `@main` builds the latest
+commit on the default branch.
 
 ### From a clone
 
@@ -67,6 +120,8 @@ Your shell finds a program by name only if its directory is on `PATH`. Add
 the directory for this terminal:
 
 ```sh
+# After a release download:
+export PATH="$HOME/.local/bin:$PATH"
 # After go install:
 export PATH="$(go env GOPATH)/bin:$PATH"
 # After a clone build, from inside the clone:
@@ -85,22 +140,31 @@ inboxd version
 agent-inbox-mcp --version
 ```
 
-Each prints its name and the version Go recorded at build time, for example
-`agent-inbox v0.0.0-20261016050527-3e4e1e939178`. Without release tags, the
-version is a Go pseudo-version: the commit time and the first 12 characters
-of the commit. A clone build prints the same form, with `+dirty` added if the
-clone has uncommitted changes, or `(devel)` when Go found no version control
-information.
+Each prints its name and version. A release binary prints its release tag,
+for example `agent-inbox v0.1.0`. `go install` of a release prints the same
+tag. A build from a commit that is not a release prints a Go pseudo-version,
+such as `agent-inbox v0.0.0-20261016050527-3e4e1e939178`: the commit time
+and the first 12 characters of the commit. A clone build prints the same
+form, with `+dirty` added if the clone has uncommitted changes, or `(devel)`
+when Go found no version control information.
 
 `agent-inbox help`, `inboxd help`, and `agent-inbox-mcp --help` list each
 program's commands and settings.
 
 ### Update or uninstall
 
-To update after `go install`, run the same `go install` command again. To
-update a clone build, run `git pull` and `make build` in the clone.
+To update a release download, repeat the download steps; the new programs
+replace the old ones. To update after `go install`, run the same
+`go install` command again. To update a clone build, run `git pull` and
+`make build` in the clone.
 
-To uninstall, delete the three files. After `go install`:
+To uninstall, delete the three files. After a release download:
+
+```sh
+rm ~/.local/bin/agent-inbox ~/.local/bin/inboxd ~/.local/bin/agent-inbox-mcp
+```
+
+After `go install`:
 
 ```sh
 rm "$(go env GOPATH)/bin/agent-inbox" "$(go env GOPATH)/bin/inboxd" "$(go env GOPATH)/bin/agent-inbox-mcp"
@@ -247,10 +311,12 @@ error code the server returns.
 
 | You see | Cause | Fix |
 | --- | --- | --- |
+| `curl: (22) The requested URL returned error: 404` | No archive has that name: `$name` is wrong, or the release does not exist. | Run `echo "$name"` and compare it with the archive names on the [releases page](https://github.com/ryannmicua/agent-inbox/releases). |
+| macOS: `"agent-inbox" cannot be opened because Apple cannot check it for malicious software`, or the program is killed at once | The archive was downloaded with a browser, which marks the programs as quarantined. The release programs are not notarized by Apple. | After checking the checksum, run `xattr -d com.apple.quarantine ~/.local/bin/agent-inbox ~/.local/bin/inboxd ~/.local/bin/agent-inbox-mcp`, or download with `curl` as shown. |
 | `go: command not found` | Go is not installed, or not on `PATH`. | Install Go from <https://go.dev/doc/install>, then open a new terminal. |
 | `requires go >= 1.24.0 (running go 1.22.12; GOTOOLCHAIN=local)` | Your Go is older than 1.24 and may not download a newer toolchain. | Install Go 1.24 or newer, or run the command again with `GOTOOLCHAIN=auto` in front. |
 | `dial tcp: lookup proxy.golang.org` or `i/o timeout` | Go cannot download modules. | Check your network. Behind a proxy, set `HTTPS_PROXY`, or ask your network administrator which `GOPROXY` to use. |
-| `agent-inbox: command not found` | Go's `bin` directory is not on `PATH` in this terminal. | Run the `export PATH=...` line from [Put the programs on your PATH](#put-the-programs-on-your-path). |
+| `agent-inbox: command not found` | The programs' directory, such as `~/.local/bin` or Go's `bin` directory, is not on `PATH` in this terminal. | Run the `export PATH=...` line from [Put the programs on your PATH](#put-the-programs-on-your-path). |
 | `unknown command "version"`, `flag provided but not defined: -version`, or `INBOX_WEBHOOK_URL is required` from a `version` command | An old build, from before the `version` command, comes first on `PATH`. | Run `command -v agent-inbox` to find it, then remove or rebuild it. |
 
 ### Starting the server

@@ -14,15 +14,20 @@ signed messages.
 
 ## Install
 
-With Go 1.24 or newer:
+Download `agent-inbox`, `inboxd`, and `agent-inbox-mcp` for Linux, macOS, or
+Windows from the [latest release](https://github.com/ryannmicua/agent-inbox/releases/latest),
+check the archive against `SHA256SUMS`, and put the programs on your `PATH`.
+No Go is needed; [Download a release binary](docs/install.md#download-a-release-binary)
+gives the commands.
+
+With Go 1.24 or newer, you can build them instead:
 
 ```sh
 go install github.com/ryannmicua/agent-inbox/cmd/...@latest
 ```
 
-This installs `agent-inbox`, `inboxd`, and `agent-inbox-mcp` in
-`$(go env GOPATH)/bin`. The project publishes no prebuilt binaries. For
-building from a clone, the `PATH` setup, and checking the installation, see
+This installs the three programs in `$(go env GOPATH)/bin`. For building
+from a clone, the `PATH` setup, and checking the installation, see
 [Install and run agent-inbox](docs/install.md). Before you deploy the service
 for others, read the [operator guide](docs/operators.md).
 
