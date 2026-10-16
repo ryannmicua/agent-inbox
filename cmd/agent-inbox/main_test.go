@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -210,7 +212,7 @@ func TestSendWithULIDDefaultsTaskAndThreadToMessageID(t *testing.T) {
 	}, io.Discard, io.Discard); err != nil {
 		t.Fatalf("send with ULID and omitted task/thread failed: %v", err)
 	}
-	messages, err := store.ListMessages(context.Background(), "agent-b", "tenant-one", 10)
+	messages, err := store.ListMessages(context.Background(), "agent-b", "tenant-one", nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,5 +291,64 @@ func TestSpacesCommandListsCallerSpaces(t *testing.T) {
 	}
 	if err := run([]string{"spaces", "--server", server.URL, "--agent", "agent-b", "--key", privateKey, "extra"}, io.Discard, io.Discard); err == nil {
 		t.Fatal("spaces accepted unexpected arguments")
+	}
+}
+
+func TestSendSpaceAddressesEveryReader(t *testing.T) {
+	store, err := inbox.OpenSQLite(filepath.Join(t.TempDir(), "inbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	publicA, privateA, err := inbox.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicB, _, err := inbox.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := inbox.Registry{Version: 2, Agents: []inbox.RegistryAgent{
+		{ID: "agent-a", TenantID: "tenant-one", PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: base64.StdEncoding.EncodeToString(publicA)}}, AllowedRecipients: []string{}, AllowedKinds: []string{"instruction"}},
+		{ID: "agent-b", TenantID: "tenant-one", PublicKeys: []inbox.RegistryKey{{ID: "primary", PublicKey: base64.StdEncoding.EncodeToString(publicB)}}, AllowedRecipients: []string{}, AllowedKinds: []string{"instruction"}},
+	}, Spaces: []inbox.RegistrySpace{{ID: "release-notes", TenantID: "tenant-one", Members: []inbox.RegistrySpaceMember{
+		{Agent: "agent-a", Grants: []string{"read", "post"}},
+		{Agent: "agent-b", Grants: []string{"read"}},
+	}}}}
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	registryData, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, registryData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := inbox.NewServer(store, inbox.FileRegistry{Path: registryPath}, notifierFunc(func(context.Context, inbox.Notification) error { return nil }), inbox.DefaultServerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(service)
+	defer server.Close()
+	privateKey := filepath.Join(t.TempDir(), "agent.key")
+	if err := os.WriteFile(privateKey, []byte(base64.StdEncoding.EncodeToString(privateA)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"send", "--server", server.URL, "--agent", "agent-a", "--key", privateKey, "--kind", "instruction"}
+	for _, address := range [][]string{{}, {"--to", "agent-b", "--space", "release-notes"}} {
+		if err := run(append(slices.Clone(base), address...), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "exactly one of --to or --space") {
+			t.Fatalf("send %v was not refused for its addressing: %v", address, err)
+		}
+	}
+	var stdout bytes.Buffer
+	if err := run(append(slices.Clone(base), "--space", "release-notes", "--payload", `{"ask":"review"}`), &stdout, io.Discard); err != nil {
+		t.Fatalf("send --space failed: %v", err)
+	}
+	var sent inbox.SendResponse
+	if err := json.Unmarshal(stdout.Bytes(), &sent); err != nil || sent.SpaceID != "release-notes" || sent.RecipientID != "" {
+		t.Fatalf("send --space printed %q (%v)", stdout.String(), err)
+	}
+	messages, err := store.ListMessages(context.Background(), "agent-b", "tenant-one", []string{"release-notes"}, 10)
+	if err != nil || len(messages) != 1 || messages[0].ID != sent.ID || messages[0].SpaceID != "release-notes" {
+		t.Fatalf("reader did not receive the group message: %+v (%v)", messages, err)
 	}
 }

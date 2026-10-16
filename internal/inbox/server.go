@@ -466,34 +466,18 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 			return
 		}
 	}
-	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
-		s.rejectRecipient(w, auth.agent, "recipient_not_allowed", messageID)
-		return
-	}
-	recipient, err := s.registry.Agent(e.RecipientID)
-	if err != nil {
-		if errors.Is(err, ErrUnknownAgent) {
-			s.rejectRecipient(w, auth.agent, "unknown_recipient", messageID)
-		} else {
-			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", messageID)
+	var recipients []string
+	var auditDetail map[string]any
+	if e.SpaceID != "" {
+		var ok bool
+		if recipients, auditDetail, ok = s.spaceAudience(w, auth, e); !ok {
+			return
 		}
-		return
-	}
-	if !contains(recipient.PublicKeys, func(k RegistryKey) bool { return !k.Disabled }) {
-		s.rejectRecipient(w, auth.agent, "recipient_key_unavailable", messageID)
-		return
-	}
-	if e.Kind != "instruction" && e.Kind != "result" {
-		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only", messageID)
-		return
-	}
-	if !containsString(auth.agent.AllowedKinds, e.Kind) {
-		s.rejectSend(w, auth.agent, "kind_not_allowed", "sender is not allowed to send this message kind", messageID)
-		return
-	}
-	if recipient.TenantID != auth.agent.TenantID {
-		s.rejectRecipient(w, auth.agent, "wrong_tenant", messageID)
-		return
+	} else {
+		if !s.directRecipientAllowed(w, auth, e) {
+			return
+		}
+		recipients = []string{e.RecipientID}
 	}
 	if e.ReplyTo != "" {
 		original, err := s.store.GetReplyTarget(r.Context(), e.ReplyTo, auth.agent.TenantID, auth.agent.ID)
@@ -506,7 +490,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 			}
 			return
 		}
-		if original.SenderID != e.RecipientID || original.RecipientID != e.SenderID || (e.Kind == "result" && original.Kind != "instruction") || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
+		if !replyCorrelates(original, e) {
 			s.rejectReply(w, auth.agent, "reply_correlation_mismatch", messageID)
 			return
 		}
@@ -514,7 +498,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		s.rejectSend(w, auth.agent, "reply_to_required", "result messages must reference the instruction they answer", messageID)
 		return
 	}
-	message, duplicate, err := s.store.CreateMessage(r.Context(), e, auth.agent.TenantID)
+	message, duplicate, err := s.store.CreateMessage(r.Context(), e, auth.agent.TenantID, recipients, auditDetail)
 	if err != nil {
 		if errors.Is(err, ErrMessageConflict) {
 			s.rejectSend(w, auth.agent, "message_id_conflict", "message id already exists with different signed content", messageID)
@@ -525,8 +509,10 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		return
 	}
 	if !duplicate {
-		s.ring(message)
-		s.notify(Notification{Event: "message.accepted", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: e.ID, SenderID: e.SenderID, RecipientID: e.RecipientID, TenantID: auth.agent.TenantID, Kind: e.Kind})
+		for _, recipient := range recipients {
+			s.ring(message, recipient)
+		}
+		s.notify(Notification{Event: "message.accepted", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: e.ID, SenderID: e.SenderID, RecipientID: e.RecipientID, SpaceID: e.SpaceID, TenantID: auth.agent.TenantID, Kind: e.Kind})
 	}
 	status := http.StatusCreated
 	if duplicate {
@@ -536,6 +522,102 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		Envelope: message.Envelope, TenantID: message.TenantID,
 		Sequence: message.Sequence, AcceptedAt: message.AcceptedAt,
 	})
+}
+
+// directRecipientAllowed applies the registry checks for a message addressed
+// to one agent, rejecting the send when one fails.
+func (s *Server) directRecipientAllowed(w http.ResponseWriter, auth authContext, e Envelope) bool {
+	if !containsString(auth.agent.AllowedRecipients, e.RecipientID) {
+		s.rejectRecipient(w, auth.agent, "recipient_not_allowed", e.ID)
+		return false
+	}
+	recipient, err := s.registry.Agent(e.RecipientID)
+	if err != nil {
+		if errors.Is(err, ErrUnknownAgent) {
+			s.rejectRecipient(w, auth.agent, "unknown_recipient", e.ID)
+		} else {
+			s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", e.ID)
+		}
+		return false
+	}
+	if !hasActiveKey(recipient) {
+		s.rejectRecipient(w, auth.agent, "recipient_key_unavailable", e.ID)
+		return false
+	}
+	if !s.kindAllowed(w, auth, e) {
+		return false
+	}
+	if recipient.TenantID != auth.agent.TenantID {
+		s.rejectRecipient(w, auth.agent, "wrong_tenant", e.ID)
+		return false
+	}
+	return true
+}
+
+// spaceAudience checks that the sender may post to the message's space and
+// returns its audience: every active member holding read at this moment,
+// sender excluded, plus the send audit detail that records it. The audience
+// comes from one registry read, whose hash the detail names, so later grant
+// changes cannot rewrite who a message went to.
+func (s *Server) spaceAudience(w http.ResponseWriter, auth authContext, e Envelope) ([]string, map[string]any, bool) {
+	snapshot, err := s.registry.Snapshot()
+	if err != nil {
+		s.rejectSend(w, auth.agent, "registry_unavailable", "agent registry could not be loaded", e.ID)
+		return nil, nil, false
+	}
+	space, exists := snapshot.Spaces[e.SpaceID]
+	sender, listed := snapshot.Agents[auth.agent.ID]
+	grant, member := spaceGrant(snapshot, space, sender)
+	if !exists || !listed || sender.Disabled || sender.TenantID != auth.agent.TenantID || !member {
+		s.rejectSendWithAuditCode(w, auth.agent, "space_not_found", "not_member", "space was not found", e.ID)
+		return nil, nil, false
+	}
+	if !grant.Has(GrantPost) {
+		s.rejectSendWithAuditCode(w, auth.agent, "post_not_allowed", "post_not_granted", "sender does not hold post in this space", e.ID)
+		return nil, nil, false
+	}
+	if !s.kindAllowed(w, auth, e) {
+		return nil, nil, false
+	}
+	audience := []string{}
+	for _, m := range space.Members {
+		agent, known := snapshot.Agents[m.Agent]
+		if m.Agent == auth.agent.ID || !slices.Contains(m.Grants, GrantRead) || !known || agent.Disabled || agent.TenantID != space.TenantID || !hasActiveKey(agent) {
+			continue
+		}
+		audience = append(audience, m.Agent)
+	}
+	slices.Sort(audience)
+	return audience, map[string]any{"space_id": space.ID, "recipients": audience, "registry_sha256": snapshot.SHA256}, true
+}
+
+func (s *Server) kindAllowed(w http.ResponseWriter, auth authContext, e Envelope) bool {
+	if e.Kind != "instruction" && e.Kind != "result" {
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "this pilot accepts instruction and result messages only", e.ID)
+		return false
+	}
+	if !containsString(auth.agent.AllowedKinds, e.Kind) {
+		s.rejectSend(w, auth.agent, "kind_not_allowed", "sender is not allowed to send this message kind", e.ID)
+		return false
+	}
+	return true
+}
+
+// replyCorrelates reports whether e answers original: same task and thread, a
+// result answers an instruction, and the reply goes back where the original
+// came from, to its sender directly or to the same space.
+func replyCorrelates(original DeliveredMessage, e Envelope) bool {
+	if (e.Kind == "result" && original.Kind != "instruction") || original.ThreadID != e.ThreadID || original.TaskID != e.TaskID {
+		return false
+	}
+	if e.SpaceID != "" {
+		return original.SpaceID == e.SpaceID
+	}
+	return original.SpaceID == "" && original.SenderID == e.RecipientID && original.RecipientID == e.SenderID
+}
+
+func hasActiveKey(agent RegistryAgent) bool {
+	return contains(agent.PublicKeys, func(k RegistryKey) bool { return !k.Disabled })
 }
 
 type validationError struct{ code, message string }
@@ -563,8 +645,13 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 	if e.KeyID != auth.keyID {
 		return &validationError{"key_mismatch", "message key_id must match the authenticated signing key"}
 	}
-	if e.RecipientID == "" {
-		return &validationError{"recipient_required", "recipient_id must be explicitly addressed"}
+	switch {
+	case e.RecipientID != "" && e.SpaceID != "":
+		return &validationError{"space_recipient_conflict", "set exactly one of recipient_id or space_id"}
+	case e.RecipientID == "" && e.SpaceID == "":
+		return &validationError{"recipient_required", "recipient_id or space_id must be explicitly addressed"}
+	case e.SpaceID != "" && !registryIDPattern.MatchString(e.SpaceID):
+		return &validationError{"invalid_space_id", "space_id must be a registry space ID"}
 	}
 	if !KindAllowed(e.Kind) {
 		return &validationError{"invalid_kind", "kind must be instruction, result, finding, status, or ack"}
@@ -622,8 +709,10 @@ func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAg
 	s.notify(Notification{Event: "message.rejected", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: messageID, SenderID: agent.ID, TenantID: agent.TenantID, Code: code})
 	status := http.StatusBadRequest
 	switch code {
-	case "secret_detected", "recipient_not_allowed", "kind_not_allowed":
+	case "secret_detected", "recipient_not_allowed", "kind_not_allowed", "post_not_allowed":
 		status = http.StatusForbidden
+	case "space_not_found":
+		status = http.StatusNotFound
 	case "message_id_conflict":
 		status = http.StatusConflict
 	case "registry_unavailable", "storage_unavailable":
@@ -654,7 +743,12 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		}
 		limit = parsed
 	}
-	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, auth.agent.TenantID, limit)
+	readable, err := s.readableSpaces(auth.agent)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "registry_unavailable", "space grants could not be read")
+		return
+	}
+	messages, err := s.store.ListMessages(r.Context(), auth.agent.ID, auth.agent.TenantID, readable, limit)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "messages could not be read")
 		return
@@ -672,6 +766,23 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, auth authContext) 
 		messages[i].AuthorStatus = status
 	}
 	writeJSON(w, http.StatusOK, PollResponse{Messages: messages})
+}
+
+// readableSpaces lists the spaces whose group messages the agent may read at
+// request time. A member removed from a space, or left without read, stops
+// seeing its deliveries; the rows are kept.
+func (s *Server) readableSpaces(agent RegistryAgent) ([]string, error) {
+	grants, err := s.registry.SpaceGrants(agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	spaces := []string{}
+	for _, grant := range grants {
+		if grant.TenantID == agent.TenantID && grant.Has(GrantRead) {
+			spaces = append(spaces, grant.SpaceID)
+		}
+	}
+	return spaces, nil
 }
 
 // listSpaces returns the caller's own memberships, read from the registry at
@@ -707,9 +818,16 @@ func (s *Server) ack(w http.ResponseWriter, r *http.Request, auth authContext) {
 		s.rejectAck(w, auth.agent, "processing_required", "acknowledgement must assert processed=true", http.StatusBadRequest)
 		return
 	}
-	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID)
+	readable, err := s.readableSpaces(auth.agent)
+	if err != nil {
+		s.rejectAck(w, auth.agent, "ack_failed", "message could not be acknowledged", http.StatusServiceUnavailable)
+		return
+	}
+	duplicate, err := s.store.Acknowledge(r.Context(), parts[2], auth.agent.ID, auth.agent.TenantID, readable)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrNotMember):
+			s.rejectAckWithAuditCode(w, auth.agent, "message_not_found", "not_member", "message was not found", http.StatusNotFound)
 		case errors.Is(err, ErrMessageNotFound):
 			s.rejectAckWithAuditCode(w, auth.agent, "message_not_found", "message_not_found", "message was not found", http.StatusNotFound)
 		case errors.Is(err, ErrNotRecipient):
@@ -859,47 +977,69 @@ func (s *Server) dispatchDue(ctx context.Context) {
 		if c.Escalated {
 			continue
 		}
-		if reason, revoked, err := s.revocation(c.Recipient, c.TenantID); err == nil && revoked {
-			marked, err := s.store.MarkRecipientRevoked(ctx, c.MessageID, reason, s.now())
+		reason, revoked, err := s.deliveryRevocation(c)
+		if err == nil && revoked {
+			marked, err := s.store.MarkRecipientRevoked(ctx, c.MessageID, c.Recipient, reason, s.now())
 			if err != nil {
-				log.Printf("record revoked recipient for %s: %v", c.MessageID, err)
+				log.Printf("record revoked recipient %s for %s: %v", c.Recipient, c.MessageID, err)
 				continue
 			}
 			if marked {
-				s.notify(Notification{Event: "delivery.recipient_revoked", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID, Code: reason})
+				s.notify(Notification{Event: "delivery.recipient_revoked", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, SpaceID: c.SpaceID, TenantID: c.TenantID, Code: reason})
 			}
 			continue
 		}
 		if c.Attempts < s.config.MaxDoorbellAttempts {
-			if err := s.store.MarkNotified(ctx, c.MessageID, s.now()); err != nil {
-				log.Printf("record notification attempt for %s: %v", c.MessageID, err)
+			if err := s.store.MarkNotified(ctx, c.MessageID, c.Recipient, s.now()); err != nil {
+				log.Printf("record notification attempt for %s to %s: %v", c.MessageID, c.Recipient, err)
 				continue
 			}
 			if s.assignedToTenant(c.Recipient, c.TenantID) {
-				s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient})
+				s.hub.publish(c.Recipient, DoorbellEvent{MessageID: c.MessageID, Sequence: c.Sequence, Recipient: c.Recipient, SpaceID: c.SpaceID})
 			}
 			continue
 		}
-		marked, err := s.store.MarkEscalated(ctx, c.MessageID, s.now())
+		marked, err := s.store.MarkEscalated(ctx, c.MessageID, c.Recipient, s.now())
 		if err != nil {
-			log.Printf("record escalation for %s: %v", c.MessageID, err)
+			log.Printf("record escalation for %s to %s: %v", c.MessageID, c.Recipient, err)
 			continue
 		}
 		if marked {
-			s.notify(Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, TenantID: c.TenantID})
+			s.notify(Notification{Event: "message.unacknowledged_escalation", OccurredAt: s.now().UTC().Format(time.RFC3339Nano), MessageID: c.MessageID, RecipientID: c.Recipient, SpaceID: c.SpaceID, TenantID: c.TenantID})
 		}
 	}
 }
 
-func (s *Server) ring(message DeliveredMessage) {
-	if !s.assignedToTenant(message.RecipientID, message.TenantID) {
+func (s *Server) ring(message DeliveredMessage, recipient string) {
+	if !s.assignedToTenant(recipient, message.TenantID) {
 		return
 	}
-	if err := s.store.MarkNotified(context.Background(), message.ID, s.now()); err != nil {
-		log.Printf("record initial doorbell for %s: %v", message.ID, err)
+	if err := s.store.MarkNotified(context.Background(), message.ID, recipient, s.now()); err != nil {
+		log.Printf("record initial doorbell for %s to %s: %v", message.ID, recipient, err)
 		return
 	}
-	s.hub.publish(message.RecipientID, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: message.RecipientID})
+	s.hub.publish(recipient, DoorbellEvent{MessageID: message.ID, Sequence: message.Sequence, Recipient: recipient, SpaceID: message.SpaceID})
+}
+
+// deliveryRevocation reports whether a delivery's recipient can no longer
+// collect it: the recipient is revoked or, for a group message, no longer
+// holds read in the space (reason not_member). A registry read failure is
+// returned as an error, never as a revocation.
+func (s *Server) deliveryRevocation(c NotificationCandidate) (string, bool, error) {
+	reason, revoked, err := s.revocation(c.Recipient, c.TenantID)
+	if err != nil || revoked || c.SpaceID == "" {
+		return reason, revoked, err
+	}
+	grant, err := s.registry.Grant(c.SpaceID, c.Recipient)
+	switch {
+	case errors.Is(err, ErrSpaceNotFound):
+		return "not_member", true, nil
+	case err != nil:
+		return "", false, err
+	case !grant.Has(GrantRead):
+		return "not_member", true, nil
+	}
+	return "", false, nil
 }
 
 // revocation reports whether an agent can no longer act in a tenant: it was

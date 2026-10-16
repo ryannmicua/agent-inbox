@@ -46,6 +46,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	keyPath := flags.String("key", os.Getenv("INBOX_KEY"), "base64 private key file")
 	keyID := flags.String("key-id", envOr("INBOX_KEY_ID", "primary"), "registered signing key id")
 	to := flags.String("to", "", "explicit recipient agent id")
+	space := flags.String("space", "", "space id: send to every member holding read (instead of --to)")
 	kind := flags.String("kind", "", "message kind")
 	payloadText := flags.String("payload", "", "JSON payload (default {})")
 	payloadFile := flags.String("payload-file", "", "read JSON payload from file")
@@ -76,7 +77,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	ctx := context.Background()
 	switch command {
 	case "send":
-		return runSend(ctx, client, *to, *kind, *payloadText, *payloadFile, *taskID, *threadID, *replyTo, *messageID, *authority, artifacts, stdout)
+		return runSend(ctx, client, *to, *space, *kind, *payloadText, *payloadFile, *taskID, *threadID, *replyTo, *messageID, *authority, artifacts, stdout)
 	case "poll":
 		if *limit < 1 || *limit > 100 {
 			return errors.New("--limit must be between 1 and 100")
@@ -167,9 +168,9 @@ func runKeygen(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runSend(ctx context.Context, client *inbox.Client, recipient, kind, payloadText, payloadFile, task, thread, replyTo, id, authority string, artifactValues []string, stdout io.Writer) error {
-	if recipient == "" || kind == "" {
-		return errors.New("send requires --to and --kind; recipient is never guessed")
+func runSend(ctx context.Context, client *inbox.Client, recipient, space, kind, payloadText, payloadFile, task, thread, replyTo, id, authority string, artifactValues []string, stdout io.Writer) error {
+	if (recipient == "") == (space == "") || kind == "" {
+		return errors.New("send requires --kind and exactly one of --to or --space; recipient is never guessed")
 	}
 	if payloadText != "" && payloadFile != "" {
 		return errors.New("choose either --payload or --payload-file")
@@ -219,7 +220,7 @@ func runSend(ctx context.Context, client *inbox.Client, recipient, kind, payload
 		}
 		artifacts = append(artifacts, inbox.Artifact{URI: parts[0], MediaType: parts[1], SHA256: parts[2], Size: size})
 	}
-	envelope := inbox.Envelope{Type: inbox.EnvelopeType, ID: id, TaskID: task, ThreadID: thread, ReplyTo: replyTo, SenderID: client.Agent, RecipientID: recipient, KeyID: client.KeyID, Kind: kind, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), AssertedAuthority: authority, ContentIsData: true, Payload: payload, Artifacts: artifacts}
+	envelope := inbox.Envelope{Type: inbox.EnvelopeType, ID: id, TaskID: task, ThreadID: thread, ReplyTo: replyTo, SenderID: client.Agent, RecipientID: recipient, SpaceID: space, KeyID: client.KeyID, Kind: kind, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), AssertedAuthority: authority, ContentIsData: true, Payload: payload, Artifacts: artifacts}
 	if err := inbox.SignEnvelope(&envelope, client.Private); err != nil {
 		return err
 	}
@@ -263,6 +264,7 @@ func usage(w io.Writer) {
 Commands:
   keygen --private-key PATH --public-key PATH
   send --server URL --agent ID --key PATH --to ID --kind instruction|result --payload-file FILE
+  send ... --space ID --kind instruction|result   (group message to every member holding read)
   poll [--limit N] [--wait DURATION]     (--wait returns early when a message arrives)
   ack --message UUID
   wait                                   (listen for doorbell prompts)

@@ -67,9 +67,10 @@ A message is a JSON object with these members:
 | `type` | Always `"message"`. |
 | `id` | A new UUID v4 or v7 (lowercase) or ULID (uppercase). Reuse it only for an identical retry. |
 | `task_id`, `thread_id` | For a new instruction, new IDs in the same formats. A result copies both from the instruction it answers. |
-| `reply_to` | Results only: the ID of the instruction being answered. Otherwise omit it. |
+| `reply_to` | Results only: the ID of the instruction being answered. Otherwise omit it. A direct instruction is answered to its sender; a group instruction is answered in its space. |
 | `sender_id` | Must equal `X-Agent-ID`. |
-| `recipient_id` | One explicitly addressed agent ID. |
+| `recipient_id` | One explicitly addressed agent ID, or `""` for a group message. |
+| `space_id` | Group messages only: the space whose members receive it. Omit it for a direct message. Exactly one of `recipient_id` and `space_id` is non-empty. |
 | `key_id` | Must equal `X-Key-ID`. |
 | `kind` | `instruction` or `result`. The registry must allow it for the sender. |
 | `created_at` | RFC 3339 timestamp. |
@@ -90,10 +91,15 @@ compact JSON object. The object has exactly these members, in this order:
 
 1. `type`, `id`, `task_id`, `thread_id`
 2. `reply_to`, only when it is non-empty
-3. `sender_id`, `recipient_id`, `key_id`, `kind`, `created_at`
-4. `asserted_authority`, only when it is non-empty
-5. `content_is_data`, `payload`, `artifacts`
-6. `provenance`, only when it has at least one member
+3. `sender_id`, `recipient_id` (always present, `""` for a group message)
+4. `space_id`, only when it is non-empty
+5. `key_id`, `kind`, `created_at`
+6. `asserted_authority`, only when it is non-empty
+7. `content_is_data`, `payload`, `artifacts`
+8. `provenance`, only when it has at least one member
+
+A direct message never contains `space_id`, so its canonical bytes are the same
+as before group messages existed and the published vectors still apply.
 
 `signature` is never part of the canonical bytes. The server ignores the
 member order and whitespace of the request body, and rebuilds the canonical
@@ -141,10 +147,10 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `POST /v1/messages` | A signed envelope. | `201` with the envelope plus server-assigned `tenant_id`, `sequence`, and `accepted_at`. `200` for an identical retry. |
-| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged messages in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
-| `POST /v1/messages/{id}/ack` | `{"processed":true}` | `{"message_id":"…","acknowledged":true,"duplicate":false}`. A repeated ack returns `duplicate: true`. A message the caller cannot ack returns `404 message_not_found`. |
-| `GET /v1/events` | None. | A server-sent event stream of `event: doorbell` with `data: {"message_id","sequence","recipient_id"}`, plus a comment heartbeat every 15 seconds. The server closes the stream at the next event or heartbeat after the signing key is revoked. |
+| `POST /v1/messages` | A signed envelope. | `201` with the envelope plus server-assigned `tenant_id`, `sequence`, and `accepted_at`. `200` for an identical retry. A group message to a space the sender cannot see returns `404 space_not_found`, whether or not the space exists; a member without `post` gets `403 post_not_allowed`. |
+| `GET /v1/messages?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"messages":[…]}`: this agent's unacknowledged deliveries in sequence order, each an envelope plus `tenant_id`, `sequence`, and `accepted_at`. Group messages carry `space_id` and appear only while this agent holds `read` in that space. `author_status: "revoked"` is added when the sender has since been disabled, removed, moved to another tenant, or left without an active key; it is absent while the sender is active and is outside the signed envelope. |
+| `POST /v1/messages/{id}/ack` | `{"processed":true}` | `{"message_id":"…","acknowledged":true,"duplicate":false}`. It acknowledges only the caller's own delivery. A repeated ack returns `duplicate: true`. A message the caller cannot ack, including a group message in a space it no longer reads, returns `404 message_not_found`. |
+| `GET /v1/events` | None. | A server-sent event stream of `event: doorbell` with `data: {"message_id","sequence","recipient_id"}` (plus `space_id` for a group message), and a comment heartbeat every 15 seconds. The server closes the stream at the next event or heartbeat after the signing key is revoked. |
 | `GET /v1/spaces` | None; no query parameters. | `{"spaces":[{"id","tenant_id","grants":[…],"members":[…]}]}`: the spaces this agent belongs to, ordered by `id`, read from the registry at request time. `grants` are this agent's own, sorted. `members` lists the IDs of every active member, sorted; other members' grants are never shown. An agent in no space gets `{"spaces":[]}`. |
 
 ## Delivery semantics
@@ -158,6 +164,13 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
   escalation to the operator's webhook. If its recipient is revoked first, the
   doorbells stop and the operator gets one `delivery.recipient_revoked` event
   instead. The message is not deleted.
+- A group message (`space_id` set) goes to every member that holds `read` in
+  the space when it is accepted, except the sender. The sender needs `post`.
+  Each member gets its own delivery, doorbells, acknowledgement, and
+  escalation; one member's ack leaves the others pending. A member that joins
+  later never receives earlier group messages. A member that is removed or
+  loses `read` stops seeing the space's messages at once; its deliveries are
+  kept, and reappear if `read` is restored.
 - A revoked sender's messages stay deliverable and keep their original
   signature. Treat `author_status: "revoked"` as context when deciding what to
   do with the content.

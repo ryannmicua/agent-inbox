@@ -8,7 +8,7 @@ Commands (flags fall back to INBOX_SERVER, INBOX_AGENT, INBOX_KEY, INBOX_KEY_ID)
   raw_agent.py vectors FILE
   raw_agent.py poll [--limit N]
   raw_agent.py ack --message ID
-  raw_agent.py send --to ID --kind instruction|result --payload JSON
+  raw_agent.py send (--to ID | --space ID) --kind instruction|result --payload JSON
                     [--id ID] [--task ID] [--thread ID] [--reply-to ID]
                     [--artifact URI|TYPE|SHA256|SIZE]...
 """
@@ -93,7 +93,11 @@ def canonical_object(env):
     members = [(name, encode_string(env.get(name, ""))) for name in ("type", "id", "task_id", "thread_id")]
     if env.get("reply_to"):
         members.append(("reply_to", encode_string(env["reply_to"])))
-    for name in ("sender_id", "recipient_id", "key_id", "kind", "created_at"):
+    for name in ("sender_id", "recipient_id"):
+        members.append((name, encode_string(env.get(name, ""))))
+    if env.get("space_id"):
+        members.append(("space_id", encode_string(env["space_id"])))
+    for name in ("key_id", "kind", "created_at"):
         members.append((name, encode_string(env.get(name, ""))))
     if env.get("asserted_authority"):
         members.append(("asserted_authority", encode_string(env["asserted_authority"])))
@@ -178,7 +182,8 @@ def cmd_send(args):
         "thread_id": thread,
         "reply_to": args.reply_to,
         "sender_id": args.agent,
-        "recipient_id": args.to,
+        "recipient_id": args.to or "",
+        "space_id": args.space or "",
         "key_id": args.key_id,
         "kind": args.kind,
         "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -235,7 +240,9 @@ def main(argv):
         elif name == "ack":
             p.add_argument("--message", required=True)
         elif name == "send":
-            p.add_argument("--to", required=True)
+            address = p.add_mutually_exclusive_group(required=True)
+            address.add_argument("--to")
+            address.add_argument("--space")
             p.add_argument("--kind", required=True)
             p.add_argument("--payload", default="{}")
             p.add_argument("--id")

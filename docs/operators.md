@@ -113,7 +113,7 @@ For example, the raw password `p/a?b#c%d` needs this server URL:
 `postgres://agent_inbox:p%2Fa%3Fb%23c%25d@postgres:5432/agent_inbox?sslmode=disable`.
 
 Each webhook event includes its event name, timestamp, message ID, agent IDs,
-tenant, kind, or rejection code as applicable. It never includes message
+space ID for a group message, tenant, kind, or rejection code as applicable. It never includes message
 payloads or key material. Events include `message.accepted`,
 `message.acknowledged`, `message.rejected`,
 `message.unacknowledged_escalation`, and `delivery.recipient_revoked`. Webhook delivery is best-effort and each
@@ -191,9 +191,10 @@ The grants form a closed set. Each later space feature checks exactly one:
 | `artifact.put` | Requesting an upload grant for a file. |
 | `artifact.get` | Requesting a download grant for a file. |
 
-In this release a membership is visible through `GET /v1/spaces` and
-`agent-inbox spaces`; group messages, notes, and files arrive in later
-releases and will check these grants.
+A membership is visible through `GET /v1/spaces` and `agent-inbox spaces`.
+Group messages check `read` and `post` (see
+[Group messages](#group-messages)); notes and files arrive in later releases
+and will check the other grants.
 
 Loading rejects the whole file, and every request then fails closed, when:
 
@@ -204,12 +205,40 @@ Loading rejects the whole file, and every request then fails closed, when:
 
 A member may be a disabled agent; it keeps its entry but gets no access until
 it is re-enabled. Space IDs are a separate namespace from agent IDs: a space
-may share an ID with an agent, and a space is never a message recipient.
+may share an ID with an agent. A group message names its space in `space_id`;
+a space is never addressed through `recipient_id`.
 
 Membership is read from the registry at request time, like keys, so an edit
 applies to the next request without a restart. Removing a member or a grant
 takes effect immediately. Each edit is recorded in the
 [registry change audit](#registry-change-audit) with the membership diff.
+
+#### Group messages
+
+A member holding `post` can send one message to a space (`agent-inbox send
+--space ID`). The registry's `allowed_recipients` does not apply to it; the
+sender's `allowed_kinds` does.
+
+- **Audience.** In the same transaction as the message, the server writes one
+  delivery for each member that holds `read` at that moment, is enabled, and
+  has an active key, excluding the sender. The `send accepted` audit row
+  records `{"space_id","recipients","registry_sha256"}`, so the audience stays
+  on record whatever the registry says later.
+- **Late joiners** never receive group messages sent before they joined.
+- **Removed members.** A member removed from the space, or left without
+  `read`, stops seeing its group messages at once: they leave its polls and its
+  acks return `message_not_found` (audit code `not_member`). Its pending
+  deliveries stop ringing and get one `delivery.recipient_revoked` with code
+  `not_member`. The delivery rows are kept for audit; restoring `read` makes
+  them visible again, without resuming doorbells.
+- **Per-member state.** Each delivery has its own acknowledgement, doorbell
+  attempts, and escalation. `ack accepted` names the member as actor and the
+  message as subject. `message.unacknowledged_escalation` is sent once per
+  unacknowledged delivery and carries `recipient_id` in its audit detail and
+  webhook event.
+- A sender cannot tell a missing space from one it does not belong to: both
+  return `space_not_found` (audit code `not_member`). A member without `post`
+  gets `post_not_allowed` (audit code `post_not_granted`).
 
 ### Add an agent
 
@@ -260,10 +289,12 @@ The revocation leaves these records:
   unlisted agents or keys, or with signatures that do not verify, stay out of
   the audit log and appear only in the periodic server log's aggregate counts
   by reason.
-- `delivery.recipient_revoked` for each unacknowledged message whose recipient
-  was disabled, removed, moved to another tenant, or left without an active key.
-  At its next scheduled retry the message stops ringing, gets one audit row
-  (code `unknown_recipient`, `wrong_tenant`, or `recipient_key_unavailable`)
+- `delivery.recipient_revoked` for each unacknowledged delivery whose recipient
+  was disabled, removed, moved to another tenant, or left without an active key,
+  and for each group delivery whose recipient left the space or lost `read`.
+  At its next scheduled retry the delivery stops ringing, gets one audit row
+  (code `unknown_recipient`, `wrong_tenant`, `recipient_key_unavailable`, or
+  `not_member`) with the `recipient_id` in its detail
   and one webhook event, and never escalates as merely unacknowledged. This
   means "this work will not be picked up", not "a bot is slow". Nothing is
   deleted: if the agent is restored, its poll still returns the message and it
@@ -320,7 +351,7 @@ The signed nonce is stored with a uniqueness constraint and the timestamp must
 be within the configured skew. Each message has a second signature. Message
 signing bytes are `agent-inbox-envelope-v1\n` followed by compact JSON of the sender-authored
 fields, in the order `type`, `id`, `task_id`, `thread_id`, optional `reply_to`,
-`sender_id`, `recipient_id`, `key_id`, `kind`, `created_at`, optional
+`sender_id`, `recipient_id`, optional `space_id`, `key_id`, `kind`, `created_at`, optional
 `asserted_authority`, `content_is_data`, `payload`, `artifacts`, and optional
 `provenance`. The `signature`, server tenant, sequence, acceptance time, and
 acknowledgement state are excluded. Object keys in payload and provenance are sorted by
@@ -334,8 +365,10 @@ from the same sender with the same message ID returns the original sequence
 when the server-derived tenant and all sender-authored envelope fields match,
 except `created_at`, `key_id`, and the resulting message signature. Reusing
 that ID with any other change is a conflict. Each retry still needs a valid
-message signature and a fresh signed-request nonce. A result must cite the
-original message and match its sender, recipient, task, and thread. A transport
+message signature and a fresh signed-request nonce. A result must cite a
+message delivered to its sender and match its task and thread; it answers a
+direct message to that message's sender, and a group message in the same
+space. A transport
 failure means delivery is unknown, not that an agent is dead.
 
 New message IDs must be UUID v4, UUID v7, or ULID. Previously stored UUID IDs
@@ -350,9 +383,9 @@ The signed JSON API is:
 
 | Method and path | Behavior |
 | --- | --- |
-| `POST /v1/messages` | Submit a signed envelope to its explicit `recipient_id`. |
-| `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged inbox in sequence order. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
-| `POST /v1/messages/{id}/ack` | Acknowledge a message after processing with `{"processed":true}`; the server records the acknowledgement time. |
+| `POST /v1/messages` | Submit a signed envelope to its explicit `recipient_id`, or to the members of its `space_id`. |
+| `GET /v1/messages?limit=N` | Poll the authenticated agent's unacknowledged deliveries in sequence order, including group messages in spaces where it holds `read`. The optional limit is bounded; no cursor or acknowledgement-history mode is available. |
+| `POST /v1/messages/{id}/ack` | Acknowledge the caller's own delivery after processing with `{"processed":true}`; the server records the acknowledgement time. |
 | `GET /v1/events` | Open an authenticated SSE doorbell stream for the current agent. |
 
 The service marks every HTTP response `Cache-Control: no-store`; SSE responses
@@ -446,6 +479,21 @@ and stay on the normal doorbell schedule. The first start after upgrading
 records one baseline `registry.changed` row. An older binary ignores the new
 column and table, but it would resume doorbells and escalation for
 dispositioned messages.
+Group delivery adds a `deliveries` table, keyed by message and recipient, and
+a `messages.space_id` column (empty for direct messages) on both backends. A
+delivery holds its recipient's acknowledgement, doorbell attempts, escalation,
+and disposition; `messages.acknowledged_at` and `notification_state` no
+longer decide delivery. Every start backfills one delivery for each direct message that
+has none, copying its acknowledgement and doorbell state, so the first start
+after upgrading converts existing work in place and later starts change
+nothing. The backfill takes one statement over the messages table; on a large
+database expect a longer first start. To recover, roll back to the previous
+image: it ignores the new table and column, still delivers and acknowledges
+direct messages (acks of direct messages are also written to
+`messages.acknowledged_at` for this reason), and never sees group messages.
+Doorbell retries for messages accepted after the upgrade do not resume under
+the older image. On the next upgrade, the backfill copies acknowledgements the
+older image recorded onto still-pending deliveries.
 Registry spaces add a nullable `registry_state.spaces_json` column on both
 backends. A database upgraded from an earlier release has no recorded spaces,
 so its first `registry.changed` row after a space is added lists that space in
@@ -507,9 +555,13 @@ TLS-terminating proxy when requests cross an untrusted network.
 | `wrong_tenant` (audit only) | The sender and recipient have different registry tenants. The client receives `recipient_not_allowed`; review the human-approved assignment. |
 | `secret_detected` | A payload, provenance field, or artifact reference matched a common key/token/private-key pattern. Remove the secret and rotate it if it was exposed elsewhere. |
 | `unsupported_query_parameter` | Poll accepts only `limit`. Remove old cursor or history parameters and poll the inbox again. |
-| `reply_to_required` / `invalid_reply_to` | A result must refer to a message addressed to its sender and reuse its task and thread IDs. The client response does not reveal whether a reference is missing, inaccessible, or mis-correlated; inspect the audit record for the internal reason. |
+| `reply_to_required` / `invalid_reply_to` | A result must refer to a message delivered to its sender and reuse its task and thread IDs; a group message is answered in its own space. The client response does not reveal whether a reference is missing, inaccessible, or mis-correlated; inspect the audit record for the internal reason. |
+| `recipient_required` / `space_recipient_conflict` | A message needs exactly one of `recipient_id` and `space_id`. |
+| `invalid_space_id` | `space_id` is not a valid registry ID. |
+| `space_not_found` | The space does not exist, belongs to another tenant, or the sender is not a member. The client response hides which; the audit code is `not_member`. |
+| `post_not_allowed` | The sender is a member without the `post` grant (audit code `post_not_granted`). |
 | `message_id_conflict` | The ID already belongs to different content. Generate a new message ID; use an existing ID only for an identical retry. |
-| `message_not_found` | The acknowledgement target is missing or not accessible to this agent. The client response hides which condition applies; inspect the audit record for the internal reason. |
+| `message_not_found` | The acknowledgement target is missing or not accessible to this agent, including a group message in a space where it no longer holds `read` (audit code `not_member`). The client response hides which condition applies; inspect the audit record for the internal reason. |
 | `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |
 
@@ -564,17 +616,19 @@ acknowledgements to finish, then take an online SQLite snapshot with the
 and verifying the snapshot. Start the PostgreSQL Compose profile once to create
 its empty schema, then stop its server before import. Use `sqlite3` and `psql`
 clients on the operator machine; `INBOX_DATABASE_URL` must be reachable from
-that machine. Export/import the five data tables in dependency order:
+that machine. Export/import the six data tables in dependency order:
 
 ```sh
 sqlite3 -header -csv agent-inbox-backup.db \
-  'SELECT sequence,id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at FROM messages ORDER BY sequence' > messages.csv
+  'SELECT sequence,id,sender_id,recipient_id,space_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at FROM messages ORDER BY sequence' > messages.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT agent_id,nonce,created_at FROM request_nonces' > request_nonces.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json FROM audit_log ORDER BY sequence' > audit_log.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT message_id,attempts,last_notified_at,escalated_at,disposition FROM notification_state' > notification_state.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT message_id,recipient_id,tenant_id,acknowledged_at,disposition,attempts,last_notified_at,escalated_at FROM deliveries' > deliveries.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT id,sha256,agents_json,spaces_json,observed_at FROM registry_state' > registry_state.csv
 ```
@@ -592,10 +646,11 @@ characters in it. Then import:
 
 ```sh
 psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
-\copy messages(sequence,id,sender_id,recipient_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at) FROM 'messages.csv' CSV HEADER
+\copy messages(sequence,id,sender_id,recipient_id,space_id,tenant_id,kind,task_id,thread_id,reply_to,envelope_json,accepted_at,acknowledged_at) FROM 'messages.csv' CSV HEADER
 \copy request_nonces(agent_id,nonce,created_at) FROM 'request_nonces.csv' CSV HEADER
 \copy audit_log(sequence,occurred_at,action,actor_id,subject_id,tenant_id,outcome,code,detail_json) FROM 'audit_log.csv' CSV HEADER
 \copy notification_state(message_id,attempts,last_notified_at,escalated_at,disposition) FROM 'notification_state.csv' CSV HEADER
+\copy deliveries(message_id,recipient_id,tenant_id,acknowledged_at,disposition,attempts,last_notified_at,escalated_at) FROM 'deliveries.csv' CSV HEADER
 \copy registry_state(id,sha256,agents_json,spaces_json,observed_at) FROM 'registry_state.csv' CSV HEADER
 SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
 SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
@@ -604,7 +659,7 @@ SQL
 
 Compare row counts and maximum message/audit sequence values between the
 snapshot and PostgreSQL. Run `inboxd audit --limit 100`, verify known agent
-polls and acknowledgements, and inspect notification state before allowing the
+polls and acknowledgements, and inspect delivery state before allowing the
 proxy to reopen traffic. Keep the SQLite snapshot intact until PostgreSQL
 backup and restore have been verified. Never operate both databases as active
 inboxes during or after cutover; that would split ordering, replay protection,

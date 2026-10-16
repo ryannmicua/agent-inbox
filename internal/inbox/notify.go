@@ -17,6 +17,7 @@ type Notification struct {
 	MessageID   string `json:"message_id,omitempty"`
 	SenderID    string `json:"sender_id,omitempty"`
 	RecipientID string `json:"recipient_id,omitempty"`
+	SpaceID     string `json:"space_id,omitempty"`
 	TenantID    string `json:"tenant_id,omitempty"`
 	Kind        string `json:"kind,omitempty"`
 	Code        string `json:"code,omitempty"`
