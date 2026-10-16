@@ -1,4 +1,4 @@
-.PHONY: build test compose-up compose-down compose-smoke getting-started-check walkthrough
+.PHONY: build test compose-up compose-down compose-smoke getting-started-check walkthrough release release-dry-run
 
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/inboxd ./cmd/inboxd
@@ -22,3 +22,9 @@ getting-started-check:
 
 walkthrough:
 	./scripts/walkthrough.sh
+
+release:
+	./scripts/release.sh $(VERSION)
+
+release-dry-run:
+	./scripts/release.sh --dry-run $(VERSION)
