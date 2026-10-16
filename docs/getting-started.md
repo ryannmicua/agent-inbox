@@ -43,13 +43,17 @@ If you see `command not found`, or a version below 1.24.0, install the
 current Go from <https://go.dev/doc/install>, open a new terminal, and run
 `go version` again.
 
+To skip Go, install the prebuilt programs as in
+[Download a release binary](install.md#download-a-release-binary), put
+them on your `PATH`, and start at step 2.
+
 ## Step 1: Install the binaries
 
 ```sh
 go install github.com/ryannmicua/agent-inbox/cmd/...@latest
 ```
 
-Go downloads the source and builds all three programs from the latest commit.
+Go downloads the source of the newest release and builds all three programs.
 The first run takes about a minute and prints `go: downloading ...` lines.
 It is done when the prompt returns with no error.
 
@@ -88,14 +92,15 @@ You should see one line from each, naming the program and the version Go
 recorded when it built it:
 
 ```text
-agent-inbox v0.0.0-20261016050527-3e4e1e939178
-inboxd v0.0.0-20261016050527-3e4e1e939178
-agent-inbox-mcp v0.0.0-20261016050527-3e4e1e939178
+agent-inbox v0.1.0
+inboxd v0.1.0
+agent-inbox-mcp v0.1.0
 ```
 
-Your version will differ. The project has no release tags yet, so the
-version is a Go pseudo-version: the commit time and the first 12 characters
-of the commit.
+Your version will differ: it is the release Go installed, such as
+`v0.1.0`. A build of a commit that is not a release shows a Go
+pseudo-version instead, such as `v0.0.0-20261016050527-3e4e1e939178`: the
+commit time and the first 12 characters of the commit.
 
 If a line shows an error instead, such as `unknown command "version"`,
 `flag provided but not defined: -version`, or
