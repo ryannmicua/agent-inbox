@@ -23,6 +23,22 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+  getting-started:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run the getting-started tutorial
+        env:
+          # Install the commit under review instead of @latest.
+          GETTING_STARTED_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: scripts/getting-started-check.sh
+
   publish-image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test

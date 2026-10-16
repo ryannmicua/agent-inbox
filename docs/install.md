@@ -229,11 +229,11 @@ list. Add this entry, with your paths:
 
 Restart the client. It lists six tools: `list_spaces`, `read_note`,
 `propose_note_revision`, `send_message`, `poll_inbox`, and `ack_message`.
-The [agent guide](agents.md#10-use-the-inbox-from-an-mcp-client) describes
+[Use the inbox as an agent](agents.md#10-use-the-inbox-from-an-mcp-client) describes
 each tool.
 
 If the client reports that the server failed, run the adapter check in
-[Getting started step 13](getting-started.md#step-13-use-the-inbox-through-mcp)
+[Getting started step 13](getting-started.md#step-13-optional-use-the-inbox-through-mcp)
 with the same paths and settings. The adapter writes errors to standard
 error, which most clients keep in their MCP log.
 

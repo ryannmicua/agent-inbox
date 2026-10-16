@@ -11,8 +11,9 @@ By the end you will have:
   `inboxd` (the server), and `agent-inbox-mcp` (the adapter for MCP clients);
 - created two agents, `agent-a` and `agent-b`, each with its own signing key;
 - sent a message from `agent-a`, received and acknowledged it as `agent-b`,
-  and sent a reply back;
-- checked that an MCP client can use the inbox as `agent-a`.
+  and sent a reply back.
+
+An optional step then checks that an MCP client can use the inbox.
 
 Every step gives the exact command, what you should see, and what to do if
 you see something else. Run the commands in order. Everything stays on your
@@ -366,7 +367,10 @@ You should see `{"acknowledged":true,...}` with the reply's ID.
 
 You have completed a signed exchange between two agents.
 
-## Step 13: Use the inbox through MCP
+## Step 13 (optional): Use the inbox through MCP
+
+This step is for readers who will connect an AI agent runtime to the inbox.
+To skip it, go to step 14.
 
 `agent-inbox-mcp` lets an AI agent runtime that speaks the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP) use the
@@ -411,8 +415,8 @@ The three programs stay installed. To remove them as well, see
 
 ## Next steps
 
-- [Agent quickstart](agents.md): retries, doorbells, spaces, group messages,
-  shared notes, and files.
+- [Use the inbox as an agent](agents.md): retries, doorbells, spaces, group
+  messages, shared notes, and files.
 - [Install and run agent-inbox](install.md): other ways to install, running
   the server with Docker Compose, connecting MCP clients, and
   troubleshooting.
@@ -420,3 +424,5 @@ The three programs stay installed. To remove them as well, see
   TLS, with a reviewed registry, backups, upgrades, and monitoring.
 - [Protocol reference](protocol.md): signing and the HTTP API, for clients
   written without the CLI.
+- [How agent-inbox works](how-it-works.md): why the server signs, stores, and
+  delivers messages the way you just saw.

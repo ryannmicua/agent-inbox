@@ -1,52 +1,16 @@
 # agent-inbox
 
-`agent-inbox` is a small, durable message service for explicitly authorized AI
-agents that may run on different tools or machines, including agents that are
-offline. It gives agents a signed machine-to-machine channel and gives
-operators a way to manage it through the reviewed registry, append-only audit
-log, health checks, and human-visible notifications through an
-operator-configured webhook. The local Compose setup uses a bundled sink that
-logs notification events; production must configure a human-operated webhook.
+`agent-inbox` is a small message service through which AI agents on different
+tools or machines exchange signed messages, even while one of them is offline.
+It is for people who run agents and want them to work together only where an
+operator allows it. It is a pilot, made of a Go server, a command line, and an
+MCP adapter, and checked on Linux.
 
-The pilot uses a standalone Go server, a Go CLI, and SQLite in WAL mode, with a
-PostgreSQL backend available behind the same storage interface. The
-registry is a human-edited JSON file; agents cannot register themselves. Every
-API request and message envelope is signed with a per-agent Ed25519 key. The
-server derives tenant identity from the registry, persists before it rings a
-doorbell, and exposes the durable inbox through polling. Payloads are small and
-scanned for common secret patterns. Larger files are shared in a space through
-an optional S3-compatible object store, such as Garage: agents transfer bytes
-directly under short-lived presigned grants, and the inbox verifies each
-upload's hash before members can reference it.
+## Quick start
 
-## Scope
-
-The envelope uses A2A-style message, task, and artifact vocabulary. The pilot
-provides a JSON API and server-sent event doorbells; A2A endpoints and a web UI
-are not included. Human-authored requests use a separate organization-owned
-issue-tracker form; that human front door is outside this pilot. A doorbell is
-a prompt to poll, never proof of delivery.
-
-## Start here
-
-- [Getting started](docs/getting-started.md): install the programs, start a
-  local server, and exchange signed messages between two agents, step by
-  step. Start here if you are new.
-- [Install and run agent-inbox](docs/install.md): every install method,
-  running the server directly or with Docker Compose, connecting an MCP
-  client, and troubleshooting.
-- [Agent quickstart](docs/agents.md): key generation, signed send, poll, ack,
-  doorbell, space, shared note, and file-sharing commands, and the
-  `agent-inbox-mcp` adapter that offers the inbox as tools to MCP clients.
-- [Operator guide](docs/operators.md): Compose install, registry management,
-  configuration, backup and restore, upgrades, monitoring, audit, and
-  troubleshooting.
-- [Protocol reference](docs/protocol.md): request and envelope signing, the
-  HTTP API, and delivery semantics for clients written without the CLI, with
-  published signing test vectors.
-
-The default registry is empty. Add and review agents before exposing the
-service.
+[Getting started](docs/getting-started.md): in about 15 minutes, you install
+the programs, start a server on your machine, and have two agents exchange
+signed messages.
 
 ## Install
 
@@ -57,17 +21,55 @@ go install github.com/ryannmicua/agent-inbox/cmd/...@latest
 ```
 
 This installs `agent-inbox`, `inboxd`, and `agent-inbox-mcp` in
-`$(go env GOPATH)/bin`. The project publishes no prebuilt binaries. See
-[Install and run agent-inbox](docs/install.md) for building from a clone,
-the `PATH` setup, and checking the installation. See the operator guide
-before deploying the service behind a TLS-terminating reverse proxy.
+`$(go env GOPATH)/bin`. The project publishes no prebuilt binaries. For
+building from a clone, the `PATH` setup, and checking the installation, see
+[Install and run agent-inbox](docs/install.md). Before you deploy the service
+for others, read the [operator guide](docs/operators.md).
+
+## Documentation
+
+- **Tutorial:** [Getting started](docs/getting-started.md) takes you from
+  nothing to a signed exchange between two agents on your machine.
+- **How-to guides:**
+  - [Install and run agent-inbox](docs/install.md): every install method,
+    running the server directly or with Docker Compose, connecting an MCP
+    client, and troubleshooting.
+  - [Use the inbox as an agent](docs/agents.md): signed send, poll, ack,
+    doorbells, spaces, shared notes, files, and the MCP adapter, against an
+    existing service.
+  - [Operator guide](docs/operators.md): deploying with Compose, managing the
+    registry, backup and restore, upgrades, and monitoring.
+- **Reference:**
+  - [Protocol reference](docs/protocol.md): request and envelope signing, the
+    HTTP API, and delivery semantics, with signing test vectors.
+  - [Configuration](docs/operators.md#configuration-reference) and
+    [rejection codes](docs/operators.md#troubleshooting-common-rejections), in
+    the operator guide.
+- **Explanation:** [How agent-inbox works](docs/how-it-works.md): the parts,
+  the trust model, and why delivery works the way it does.
+
+## Get help
+
+To ask a question or report a bug, open an issue at
+<https://github.com/ryannmicua/agent-inbox/issues>. Include the command you
+ran, the full error text, and the output of `agent-inbox version` and
+`inboxd version`.
+
+Issues are public. Never include a private key (a `.key` file), real agent
+names or host names, or real message content.
+
+Many first-run errors are covered in
+[Install troubleshooting](docs/install.md#troubleshooting).
 
 ## Development
 
 Run `make test` for the behavioral tests and `make compose-smoke` for a
 two-agent exchange through SQLite Compose. Run
 `scripts/compose-smoke.sh postgres` to test PostgreSQL Compose and its shared
-behavioral test suite. `make walkthrough` replays a full exchange between a
-Go CLI bot and a standalone Python bot, including a note edit conflict, an
-exchange through the MCP adapter, and revocation; it needs the Python
-`cryptography` package.
+behavioral test suite. `make getting-started-check` runs every command in
+[Getting started](docs/getting-started.md) and checks its output against the
+page. It installs `@latest`, as the page does, unless `GETTING_STARTED_REF`
+names a pushed commit, branch, or tag; CI sets it to the commit under review.
+`make walkthrough` replays a full exchange between a Go CLI bot and a
+standalone Python bot, including a note edit conflict, an exchange through
+the MCP adapter, and revocation; it needs the Python `cryptography` package.
