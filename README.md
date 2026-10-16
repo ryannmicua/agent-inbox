@@ -73,3 +73,7 @@ names a pushed commit, branch, or tag; CI sets it to the commit under review.
 `make walkthrough` replays a full exchange between a Go CLI bot and a
 standalone Python bot, including a note edit conflict, an exchange through
 the MCP adapter, and revocation; it needs the Python `cryptography` package.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
