@@ -1,10 +1,10 @@
 # Install and run agent-inbox
 
-This page covers each way to install the `agent-inbox`, `inboxd`, and
-`agent-inbox-mcp` programs, how to run a local server, how to connect an MCP
-client, and how to fix common first-run problems. For a guided first run
-from nothing to a working exchange, follow [Getting started](getting-started.md)
-instead.
+This page shows how to install the `agent-inbox`, `inboxd`, and
+`agent-inbox-mcp` programs and run them. It covers every install method, a
+local server, MCP clients, and fixes for common first-run problems. For a
+guided first run from nothing to a working exchange, follow
+[Getting started](getting-started.md) instead.
 
 ## Requirements
 
@@ -176,7 +176,10 @@ events with `docker compose logs notification-sink`. Stop the server and
 delete its data with `docker compose down --volumes`.
 
 The container reads the registry as a different user, so keep the file
-readable by everyone: `chmod 644 registry.json`.
+readable by everyone: `chmod 644 registry.json`. If it is not, a running
+server answers every request with `authentication_failed`, and a starting
+server restarts in a loop, logging
+`registry is not ready: read registry: open /etc/agent-inbox/registry.json: permission denied`.
 
 ## Connect an MCP client
 
@@ -201,7 +204,10 @@ claude mcp add agent-inbox \
   -- /home/you/go/bin/agent-inbox-mcp
 ```
 
-Remove it later with `claude mcp remove agent-inbox`.
+`claude mcp list` should then show `agent-inbox` as `Connected`. The
+registration applies to the directory you ran it in; add `-s user` after
+`add` to use it in every directory. Remove it later with
+`claude mcp remove agent-inbox`.
 
 Other clients, such as Claude Desktop and most editors, read a JSON server
 list. Add this entry, with your paths:
@@ -245,7 +251,7 @@ error code the server returns.
 | `requires go >= 1.24.0 (running go 1.22.12; GOTOOLCHAIN=local)` | Your Go is older than 1.24 and may not download a newer toolchain. | Install Go 1.24 or newer, or run the command again with `GOTOOLCHAIN=auto` in front. |
 | `dial tcp: lookup proxy.golang.org` or `i/o timeout` | Go cannot download modules. | Check your network. Behind a proxy, set `HTTPS_PROXY`, or ask your network administrator which `GOPROXY` to use. |
 | `agent-inbox: command not found` | Go's `bin` directory is not on `PATH` in this terminal. | Run the `export PATH=...` line from [Put the programs on your PATH](#put-the-programs-on-your-path). |
-| `unknown command "version"` | An old build comes first on `PATH`. | Run `command -v agent-inbox` to find it, then remove or rebuild it. |
+| `unknown command "version"`, `flag provided but not defined: -version`, or `INBOX_WEBHOOK_URL is required` from a `version` command | An old build, from before the `version` command, comes first on `PATH`. | Run `command -v agent-inbox` to find it, then remove or rebuild it. |
 
 ### Starting the server
 
@@ -257,6 +263,7 @@ error code the server returns.
 | `registry is not ready: parse registry JSON: ...` | The registry is not valid JSON. | Fix the file, or write it again as in [Getting started step 5](getting-started.md#step-5-register-both-agents). |
 | `bind: address already in use` | Another program uses the port. `inboxd` logs `listening on` just before this error. | Stop the other program, or choose another port in `INBOX_LISTEN_ADDR` and `INBOX_SERVER`. |
 | `human notification message.accepted failed` | Nothing listens on `INBOX_WEBHOOK_URL`. | Expected locally; delivery is not affected. Run the [notification viewer](#directly-with-inboxd) to see events. |
+| Compose `server` shows `Restarting`, and `docker compose logs server` shows `registry is not ready: ... permission denied` | The container cannot read the registry file. | Run `chmod 644` on the registry file, then `docker compose up -d` again. |
 | `database file "/var/lib/agent-inbox/inbox.db" is unavailable` from `inboxd healthcheck` | `healthcheck` did not get the server's `INBOX_DB_PATH`. | Run it with the same `INBOX_DB_PATH` and `INBOX_LISTEN_ADDR` as the server. |
 
 ### Sending, polling, and acknowledging
@@ -267,10 +274,9 @@ error code the server returns.
 | `connect: connection refused` | The server is not running, or listens on another port. | Start it, and match the port in `INBOX_SERVER`. |
 | `--agent and --key (or INBOX_AGENT and INBOX_KEY) are required` | The command lacks `--agent` or `--key`. | Add both. |
 | `load signing key: open agent-a.key: no such file or directory` | The key file is not in the current directory. | Run the command from the directory that holds the key, or pass the key's full path. |
-| `authentication_failed, HTTP 401` | The server could not verify the request. It does not say why, on purpose. | Check, in order: `--agent` matches an `id` in the registry; the `--key` file belongs to that agent; the registry holds that agent's current `.pub` content; the computer's clock is within five minutes of the server's; and, under Compose, the registry is readable by everyone. |
+| `authentication_failed, HTTP 401` | The server could not verify the request. It does not say why, on purpose. | Check, in order: `--agent` matches an `id` in the registry; the `--key` file belongs to that agent; the registry holds that agent's current `.pub` content; the computer's clock is within five minutes of the server's; and, under Compose, the registry file is readable by everyone (`chmod 644`). |
 | `recipient_not_allowed, HTTP 403` | The recipient is not in the sender's `allowed_recipients`, or is in another tenant. | Fix the registry. The server rereads it on every request, so no restart is needed. |
 | `kind_not_allowed` | The sender's `allowed_kinds` lacks that kind. | Add the kind to the registry. |
 | `payload must be valid JSON` | The `--payload` value is not JSON, often because the shell removed its quotes. | Put the JSON in single quotes: `--payload '{"task":"say hello"}'`. |
 | `message_not_found, HTTP 404` on `ack` | The ID is wrong, or the message was not delivered to this agent. | Copy the `id` from this agent's own poll output. |
 | `invalid_reply_to` or `reply_to_required` | A `result` must answer a message its sender received, and repeat that message's task and thread IDs. | Pass the original message's `id` to `--reply-to`, and its `task_id` and `thread_id` to `--task` and `--thread`. |
-| `registry_unavailable` | The server cannot read or parse the registry. | Under Compose, run `chmod 644` on the registry file. Otherwise fix the JSON. |

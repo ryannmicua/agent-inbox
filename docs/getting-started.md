@@ -96,9 +96,11 @@ Your version will differ. The project has no release tags yet, so the
 version is a Go pseudo-version: the commit time and the first 12 characters
 of the commit.
 
-If you see `unknown command "version"` or a usage message instead, an older
-build comes first on your `PATH`. Run `command -v agent-inbox` to see which
-file runs, and remove or rebuild it.
+If a line shows an error instead, such as `unknown command "version"`,
+`flag provided but not defined: -version`, or
+`inboxd: INBOX_WEBHOOK_URL is required`, an older build comes first on your
+`PATH`. Run `command -v agent-inbox` to see which file runs, and remove or
+rebuild it.
 
 ## Step 3: Make a working directory
 
