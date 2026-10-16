@@ -4,7 +4,9 @@
 # poll and acknowledge while offline, reply with a correlated result, list
 # the spaces the operator granted them, exchange a group message in a
 # space, each acknowledging only its own delivery, and edit a shared note from
-# the same revision, where the second write conflicts and is merged.
+# the same revision, where the second write conflicts and is merged. When the
+# inbox has an object store, the CLI bot also uploads a file to the space and
+# the Python bot downloads and verifies it.
 #
 #   scripts/walkthrough.sh          local: build, start inboxd on loopback,
 #                                   replay, edit the Python bot's space grants
@@ -16,6 +18,12 @@
 #                                   must then hold read, post and note.write
 #                                   there; they exchange a group message in it
 #                                   and edit its note release-plan
+#
+# File sharing needs an object store: in local mode, export the
+# INBOX_OBJECT_STORE_* settings (for example, for a local Garage on loopback)
+# and inboxd uses them; in remote mode, the server's operator configures it,
+# and CLI_BOT needs artifact.put and RAW_BOT artifact.get in the space.
+# Without a store, the walkthrough shows artifacts_disabled and goes on.
 #
 # Needs Go, Python 3, and the Python 'cryptography' package. Remote mode can
 # skip Go by setting AGENT_INBOX_BIN to a prebuilt agent-inbox CLI. In remote mode the
@@ -39,6 +47,7 @@ python3 -c 'import cryptography' 2>/dev/null || { echo "the Python 'cryptography
 
 tmp_dir="$(mktemp -d)"
 pids=()
+artifacts=0
 cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   rm -rf "$tmp_dir"
@@ -103,8 +112,9 @@ else
   done
 fi
 
-# cli and raw run one command as each bot; "note get|put|log" is one command.
-cli() { local command=("$1"); shift; [[ "${command[0]}" != note ]] || { command+=("$1"); shift; }; "$cli_bin" "${command[@]}" --server "$INBOX_SERVER" --agent "$CLI_BOT" --key "$CLI_KEY" "$@"; }
+# cli and raw run one command as each bot; "note get|put|log" and
+# "artifact put|get" are one command.
+cli() { local command=("$1"); shift; [[ "${command[0]}" != note && "${command[0]}" != artifact ]] || { command+=("$1"); shift; }; "$cli_bin" "${command[@]}" --server "$INBOX_SERVER" --agent "$CLI_BOT" --key "$CLI_KEY" "$@"; }
 raw() { local command=("$1"); shift; [[ "${command[0]}" != note ]] || { command+=("$1"); shift; }; "${raw_agent[@]}" "${command[@]}" --server "$INBOX_SERVER" --agent "$RAW_BOT" --key "$RAW_KEY" "$@"; }
 
 step "Python client matches the published signing vectors"
@@ -240,6 +250,35 @@ row = next(e for e in json.load(sys.stdin) if e["action"] == "note.revision" and
 assert row["code"] == "revision_conflict" and "body" not in row["detail"], row
 print("audit: note.revision rejected revision_conflict by %s, base %d against head %d" % (row["actor_id"], row["detail"]["base_revision"], row["detail"]["head_revision"]))'
   fi
+
+  step "$CLI_BOT uploads a file to $WALKTHROUGH_SPACE; $RAW_BOT downloads and verifies it"
+  printf 'release plan: ship <v2> & tag\n' > "$tmp_dir/plan.md"
+  if put="$(cli artifact put --space "$WALKTHROUGH_SPACE" --file "$tmp_dir/plan.md" 2>"$tmp_dir/put.err")"; then
+    artifacts=1
+    plan_uri="$(json_field artifact.uri <<< "$put")"
+    echo "stored $plan_uri ($(json_field artifact.size <<< "$put") bytes, verified by the inbox)"
+    shared="$(cli send --space "$WALKTHROUGH_SPACE" --kind instruction --payload '{"ask":"review the attached plan"}' --artifact "$(json_field artifact_ref <<< "$put")")"
+    shared_id="$(json_field id <<< "$shared")"
+    polled="$(raw poll)"
+    [[ "$(json_field messages.0.id <<< "$polled")" == "$shared_id" && "$(json_field messages.0.artifacts.0.uri <<< "$polled")" == "$plan_uri" ]] || { echo "unexpected poll: $polled" >&2; exit 1; }
+    raw artifact-get --uri "$plan_uri" --out "$tmp_dir/plan.downloaded.md" > /dev/null
+    cmp -s "$tmp_dir/plan.md" "$tmp_dir/plan.downloaded.md" || { echo "downloaded file differs" >&2; exit 1; }
+    echo "$RAW_BOT downloaded $plan_uri and its sha256 matched"
+    raw ack --message "$shared_id"
+    if [[ "$mode" == local ]]; then
+      "$tmp_dir/inboxd" audit --limit 100 | python3 -c 'import json,sys
+rows = [(e["action"], e["actor_id"], e["outcome"]) for e in json.load(sys.stdin) if e["action"].startswith("artifact.")]
+want = [("artifact.download", "raw-bot", "granted"), ("artifact.complete", "cli-bot", "stored"), ("artifact.upload", "cli-bot", "granted")]
+sys.exit(0 if rows[:3] == want else "unexpected artifact audit rows: %s" % rows)'
+      echo "audit: artifact.upload granted, artifact.complete stored, artifact.download granted"
+    fi
+  elif grep -q artifacts_disabled "$tmp_dir/put.err"; then
+    artifacts=0
+    echo "this inbox has no object store (artifacts_disabled); set INBOX_OBJECT_STORE_* to replay file sharing"
+  else
+    cat "$tmp_dir/put.err" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$mode" == local ]]; then
@@ -256,6 +295,11 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   later_id="$(json_field id <<< "$later")"
   [[ "$(json_field messages.0.id <<< "$(raw poll)")" == "$later_id" ]] || { echo "read-only member did not receive the group message" >&2; exit 1; }
   echo "$RAW_BOT, holding read only, received group message $later_id"
+  if [[ "$artifacts" == 1 ]]; then
+    if raw artifact-get --uri "$plan_uri" --out "$tmp_dir/plan.denied.md" 2>"$tmp_dir/refused.txt"; then echo "download allowed without artifact.get" >&2; exit 1; fi
+    grep -q artifact_get_not_allowed "$tmp_dir/refused.txt" || { cat "$tmp_dir/refused.txt" >&2; exit 1; }
+    echo "$RAW_BOT, without artifact.get, is refused a new download grant: artifact_get_not_allowed"
+  fi
   write_registry false ''
   [[ "$(raw spaces)" == '{"spaces":[]}' ]] || { echo "removed member still lists the space" >&2; exit 1; }
   [[ "$(raw poll)" == '{"messages":[]}' ]] || { echo "removed member still sees the space's messages" >&2; exit 1; }
@@ -263,6 +307,11 @@ sys.exit(0 if any(e["action"] == action and e["outcome"] == outcome and e.get("c
   if raw note get --space release-notes --note release-plan 2>"$tmp_dir/refused.txt"; then echo "removed member still reads the note" >&2; exit 1; fi
   grep -q '"not_found"' "$tmp_dir/refused.txt" || { cat "$tmp_dir/refused.txt" >&2; exit 1; }
   echo "$RAW_BOT, removed, reading the note: not_found"
+  if [[ "$artifacts" == 1 ]]; then
+    if raw artifact-get --uri "$plan_uri" --out "$tmp_dir/plan.denied.md" 2>"$tmp_dir/refused.txt"; then echo "removed member downloaded a file" >&2; exit 1; fi
+    grep -q space_not_found "$tmp_dir/refused.txt" || { cat "$tmp_dir/refused.txt" >&2; exit 1; }
+    echo "$RAW_BOT, removed from release-notes, is refused a download grant: space_not_found"
+  fi
   echo "$RAW_BOT in release-notes: $(raw spaces | space_grants release-notes)"
   echo "$CLI_BOT in release-notes: $(cli spaces | space_grants release-notes)"
   audit_rows | python3 -c 'import json,sys
@@ -322,7 +371,9 @@ for e in reversed(json.load(sys.stdin)):
     d = e.get("detail") or {}
     extra = {k: d[k] for k in ("disabled", "key_id", "recipient_id", "space_id", "recipients", "memberships_changed", "base_revision", "head_revision") if d.get(k) not in (None, [], "")}
     subject = e.get("subject_id", "")
-    print(e["sequence"], e["action"], e.get("actor_id",""), subject if "/" in subject else subject[:8], e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
+    space, _, rest = subject.rpartition("/")
+    subject = space + "/" + rest[:8] if space and len(rest) == 64 else subject[:8] if len(subject) in (26, 36) else subject
+    print(e["sequence"], e["action"], e.get("actor_id",""), subject, e["outcome"], e.get("code",""), json.dumps(extra) if extra else "")'
 fi
 
 step "Walkthrough passed ($mode)"

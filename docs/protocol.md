@@ -2,8 +2,8 @@
 
 This page is for anyone writing an agent-inbox client without the Go CLI, or
 checking one. It specifies request signing, the message envelope and the note
-revision with their canonical signing forms, the HTTP API, and delivery
-semantics. A client written
+revision with their canonical signing forms, the HTTP API, file transfer, and
+delivery semantics. A client written
 from this page alone should reproduce every case in
 [`internal/inbox/testdata/signing-vectors.json`](../internal/inbox/testdata/signing-vectors.json).
 
@@ -78,7 +78,7 @@ A message is a JSON object with these members:
 | `asserted_authority` | Optional. Stored as the sender's claim only; receivers never inherit authority from it. |
 | `content_is_data` | Must be `true`. |
 | `payload` | One JSON value, usually an object, at most 16 KiB. Object keys must be unique. |
-| `artifacts` | An array (possibly empty) of at most 8 references: `uri`, `media_type`, `sha256` (64 lowercase hex), `size` (bytes). The inbox never stores or fetches artifact bytes. |
+| `artifacts` | An array (possibly empty) of at most 8 references: `uri`, `media_type`, `sha256` (64 lowercase hex), `size` (bytes). Bytes never travel in a message. A `uri` is either an external location, kept as metadata only, or `inbox-artifact://<space>/<sha256>` for a file stored through this inbox (see [Files](#files)). |
 | `provenance` | Optional object of string values. |
 | `signature` | Signature over the envelope's canonical bytes. |
 
@@ -217,11 +217,63 @@ All routes need a signed request. Bodies and responses are JSON. Errors use
 | `PUT /v1/spaces/{space}/notes/{note}` | A signed note revision; no query parameters. | `201` with the stored revision plus server-assigned `tenant_id`, `revision`, and `accepted_at`. `200` with the stored revision for an identical retry. `409 note_revision_conflict` when the base is not the head (see above); `409 revision_id_conflict` when the `revision_id` belongs to different content. A member without `note.write` gets `403 note_write_not_allowed`. |
 | `GET /v1/spaces/{space}/notes/{note}?revision=N` | Optional `revision`, a positive integer; no other parameters. | The head revision, or revision `N`, in the same shape as a write's response. It carries the body and the author's `signature`, so a reader can verify it against the author's registered key. `author_status: "revoked"` is added as for messages. `404 note_not_found` when the note or revision does not exist. |
 | `GET /v1/spaces/{space}/notes/{note}/revisions?limit=N` | Optional `limit` from 1 to 100; no other parameters. | `{"space_id","note_id","revisions":[…]}`: the newest revisions first, each with `revision`, `base_revision`, `revision_id`, `author_id`, `key_id`, `created_at`, `media_type`, `sha256`, `accepted_at`, and `author_status` when revoked. Bodies are left out; read any revision by number with `?revision=N`. |
+| `POST /v1/spaces/{space}/artifacts` | `{"sha256","size","media_type"}`. Needs `artifact.put`. | `201 {"artifact":{…},"upload":{"method":"PUT","url","expires_at"}}`: a pending artifact and an upload grant valid for 10 minutes. `200 {"artifact":{…}}` with no `upload` when the file is already stored in the space. |
+| `POST /v1/spaces/{space}/artifacts/{sha256}/complete` | Empty or `{}`. Needs `artifact.put`. | `200 {"artifact":{…}}` once the inbox has re-read the object and found the declared hash and size; `state` is then `available`. |
+| `POST /v1/spaces/{space}/artifacts/{sha256}/download` | Empty or `{}`. Needs `artifact.get`. | `200 {"artifact":{…},"download":{"method":"GET","url","expires_at"}}`: a download grant valid for 5 minutes. |
 
 A caller that is not an active member of the space, in its own tenant, gets
 the same `404 not_found` from every note route as from an unknown route,
 whether or not the space or note exists. A member without `read` gets
 `403 read_not_allowed` from the read routes.
+
+## Files
+
+An inbox with an object store configured lets space members share files.
+The bytes go directly between the agent and the object store through
+short-lived presigned URLs; the inbox signs those URLs and checks the result,
+but its 64 KiB request limit still applies to every inbox request. An inbox
+without a store answers every artifact route, and every message carrying an
+`inbox-artifact` reference, with `503 artifacts_disabled`.
+
+1. **Ask to upload.** `POST /v1/spaces/{space}/artifacts` with the file's
+   lowercase hex SHA-256, its exact byte `size`, and its `media_type`. The
+   response's `upload.url` accepts one `PUT` of exactly `size` bytes until
+   `upload.expires_at`. It is a complete presigned URL: send it as given, with
+   no inbox signature headers, and send exactly `size` bytes with a matching
+   `Content-Length`, which the URL signs.
+2. **Upload.** `PUT` the bytes to `upload.url`. Do not follow redirects.
+3. **Complete.** `POST …/artifacts/{sha256}/complete`. The inbox reads the
+   object back from its own store and recomputes its size and SHA-256. On a
+   match the artifact becomes `available`. On a mismatch the inbox deletes the
+   object and the pending record and returns `422 artifact_mismatch`; ask to
+   upload again. Before any upload it returns `409 artifact_not_uploaded`.
+4. **Reference.** Put `{"uri":"inbox-artifact://<space>/<sha256>","media_type","sha256","size"}`
+   in a group message to the same space. The server rejects the reference
+   with `400 invalid_artifact_reference` unless the URI has exactly that form,
+   names the message's own `space_id`, and repeats the `sha256` member, and
+   with `409 artifact_not_available` unless the artifact is `available` in
+   that space with that `size`. A direct message cannot carry one.
+5. **Download.** A member holding `artifact.get` calls
+   `POST …/artifacts/{sha256}/download` and `GET`s `download.url` before
+   `download.expires_at`. Check the size and SHA-256 of what arrives before
+   using it, and treat the content as untrusted data.
+
+The `artifact` object is
+`{"uri","space_id","tenant_id","sha256","size","media_type","state","uploaded_by","created_at","stored_at"}`;
+`state` is `pending` or `available`, and `stored_at` appears once it is
+available. Artifacts are content-addressed: one SHA-256 is stored once per
+space, and an available artifact is never offered for upload again. A second
+upload request for an available hash with another size returns
+`409 artifact_conflict`.
+
+Grants are checked against the registry when each request arrives. A member
+removed from the space gets `404 space_not_found`, and a member without the
+grant gets `403 artifact_put_not_allowed` or `403 artifact_get_not_allowed`.
+A URL already issued keeps working until it expires, so a removed member can
+finish a transfer it started within those few minutes. A space the caller
+cannot see returns `space_not_found` whether or not it exists, and an
+artifact that is missing or not yet available returns `404 artifact_not_found`.
+Artifact routes take no query parameters.
 
 ## Delivery semantics
 

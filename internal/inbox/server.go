@@ -46,10 +46,14 @@ type ServerConfig struct {
 	RetryInterval       time.Duration
 	MaxDoorbellAttempts int
 	MaxPollLimit        int
+	// Objects holds artifact bytes. When nil, artifact routes and
+	// inbox-artifact references return artifacts_disabled.
+	Objects          ObjectStore
+	MaxArtifactBytes int64
 }
 
 func DefaultServerConfig() ServerConfig {
-	return ServerConfig{RequestSkew: 5 * time.Minute, RetryInterval: 30 * time.Second, MaxDoorbellAttempts: 3, MaxPollLimit: 100}
+	return ServerConfig{RequestSkew: 5 * time.Minute, RetryInterval: 30 * time.Second, MaxDoorbellAttempts: 3, MaxPollLimit: 100, MaxArtifactBytes: DefaultMaxArtifactBytes}
 }
 
 type Server struct {
@@ -111,6 +115,9 @@ func NewServer(store Store, registry RegistrySource, notifier Notifier, config S
 	if config.MaxPollLimit <= 0 {
 		config.MaxPollLimit = 100
 	}
+	if config.MaxArtifactBytes <= 0 {
+		config.MaxArtifactBytes = DefaultMaxArtifactBytes
+	}
 	return &Server{store: store, registry: registry, notifier: notifier, config: config, now: time.Now, hub: newDoorbellHub(), revokedAuditedAt: make(map[string]time.Time)}, nil
 }
 
@@ -155,6 +162,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, identity authCont
 		s.ack(w, r, identity)
 	case r.URL.Path == "/v1/spaces" && r.Method == http.MethodGet:
 		s.listSpaces(w, r, identity)
+	case isArtifactRoute(r.URL.Path):
+		s.artifacts(w, r, identity)
 	case strings.HasPrefix(r.URL.Path, "/v1/spaces/"):
 		s.notes(w, r, identity)
 	default:
@@ -481,6 +490,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, auth authContext) 
 		}
 		recipients = []string{e.RecipientID}
 	}
+	if !s.artifactReferencesAvailable(w, r, auth, e) {
+		return
+	}
 	if e.ReplyTo != "" {
 		original, err := s.store.GetReplyTarget(r.Context(), e.ReplyTo, auth.agent.TenantID, auth.agent.ID)
 		if err != nil {
@@ -690,8 +702,13 @@ func validateEnvelope(e Envelope, auth authContext) *validationError {
 		return &validationError{"too_many_artifacts", "a message may reference at most 8 artifacts"}
 	}
 	for _, artifact := range e.Artifacts {
-		u, err := url.Parse(artifact.URI)
-		if err != nil || u.Scheme == "" || u.User != nil || strings.EqualFold(u.Scheme, "data") || strings.EqualFold(u.Scheme, "javascript") || len(artifact.URI) > 2048 {
+		if space, sha, isArtifact, ok := parseArtifactURI(artifact.URI); isArtifact {
+			// Parsed by its own rules: a space ID may contain ':', which a
+			// URL host cannot.
+			if !ok || sha != artifact.SHA256 || space != e.SpaceID {
+				return &validationError{"invalid_artifact_reference", "an inbox-artifact reference must be inbox-artifact://<space>/<sha256>, name the message's own space, and match its sha256"}
+			}
+		} else if u, err := url.Parse(artifact.URI); err != nil || u.Scheme == "" || u.User != nil || strings.EqualFold(u.Scheme, "data") || strings.EqualFold(u.Scheme, "javascript") || len(artifact.URI) > 2048 {
 			return &validationError{"invalid_artifact_uri", "artifact uri must be a safe absolute reference"}
 		}
 		if artifact.MediaType == "" || len(artifact.MediaType) > 128 || artifact.Size < 0 || !shaPattern.MatchString(artifact.SHA256) {
@@ -731,9 +748,9 @@ func (s *Server) rejectSendWithAuditCode(w http.ResponseWriter, agent RegistryAg
 		status = http.StatusForbidden
 	case "space_not_found":
 		status = http.StatusNotFound
-	case "message_id_conflict":
+	case "message_id_conflict", "artifact_not_available":
 		status = http.StatusConflict
-	case "registry_unavailable", "storage_unavailable":
+	case "registry_unavailable", "storage_unavailable", "artifacts_disabled":
 		status = http.StatusServiceUnavailable
 	}
 	writeError(w, status, code, message)

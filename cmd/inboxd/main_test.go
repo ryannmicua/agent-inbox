@@ -242,3 +242,50 @@ func TestAuditAcceptsRelativeDatabasePath(t *testing.T) {
 		}
 	}
 }
+
+func TestConfiguredObjectStoreValidatesSettings(t *testing.T) {
+	clear := func() {
+		for _, name := range objectStoreSettings {
+			t.Setenv(name, "")
+		}
+	}
+	clear()
+	if store, maxBytes, err := configuredObjectStore(); err != nil || store != nil || maxBytes != inbox.DefaultMaxArtifactBytes {
+		t.Fatalf("no settings = %v %d %v, want artifacts disabled", store, maxBytes, err)
+	}
+	t.Setenv("INBOX_OBJECT_STORE_BUCKET", "inbox-artifacts")
+	if _, _, err := configuredObjectStore(); err == nil || !strings.Contains(err.Error(), "INBOX_OBJECT_STORE_ENDPOINT is not") {
+		t.Fatalf("a bucket without an endpoint = %v", err)
+	}
+	valid := map[string]string{
+		"INBOX_OBJECT_STORE_ENDPOINT": "https://objects.example.com", "INBOX_OBJECT_STORE_BUCKET": "inbox-artifacts",
+		"INBOX_OBJECT_STORE_REGION": "garage", "INBOX_OBJECT_STORE_ACCESS_KEY_ID": "GKexample", "INBOX_OBJECT_STORE_SECRET_ACCESS_KEY": "example-secret",
+	}
+	for _, c := range []struct{ name, value, want string }{
+		{"INBOX_OBJECT_STORE_ENDPOINT", "http://objects.example.com", "must use HTTPS"},
+		{"INBOX_OBJECT_STORE_ENDPOINT", "objects.example.com", "absolute HTTP or HTTPS URL"},
+		{"INBOX_OBJECT_STORE_ENDPOINT", "https://objects.example.com/prefix", "no path"},
+		{"INBOX_OBJECT_STORE_BUCKET", "Not_A_Bucket", "bucket"},
+		{"INBOX_OBJECT_STORE_REGION", "", "region"},
+		{"INBOX_OBJECT_STORE_SECRET_ACCESS_KEY", "", "secret access key"},
+		{"INBOX_OBJECT_STORE_MAX_BYTES", "0", "positive byte count"},
+	} {
+		clear()
+		for name, value := range valid {
+			t.Setenv(name, value)
+		}
+		t.Setenv(c.name, c.value)
+		if _, _, err := configuredObjectStore(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s=%q = %v, want an error containing %q", c.name, c.value, err, c.want)
+		}
+	}
+	clear()
+	for name, value := range valid {
+		t.Setenv(name, value)
+	}
+	t.Setenv("INBOX_OBJECT_STORE_ENDPOINT", "http://127.0.0.1:3900")
+	t.Setenv("INBOX_OBJECT_STORE_MAX_BYTES", "1048576")
+	if store, maxBytes, err := configuredObjectStore(); err != nil || store == nil || maxBytes != 1<<20 {
+		t.Fatalf("loopback HTTP store = %v %d %v", store, maxBytes, err)
+	}
+}

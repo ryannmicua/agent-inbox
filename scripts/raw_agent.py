@@ -15,6 +15,7 @@ Commands (flags fall back to INBOX_SERVER, INBOX_AGENT, INBOX_KEY, INBOX_KEY_ID)
   raw_agent.py note put --space ID --note ID --base N --file PATH
                         [--media-type TYPE] [--id ID]
   raw_agent.py note log --space ID --note ID [--limit N]
+  raw_agent.py artifact-get --uri inbox-artifact://SPACE/SHA256 --out PATH
 """
 
 import argparse
@@ -246,6 +247,36 @@ def cmd_note(args):
     return finish(*call(args, "PUT", path, payload.encode("utf-8")))
 
 
+def cmd_artifact_get(args):
+    """Ask for a download grant, fetch from the object store, verify, then write."""
+    prefix = "inbox-artifact://"
+    space, _, sha = args.uri[len(prefix):].partition("/") if args.uri.startswith(prefix) else ("", "", "")
+    if not space or len(sha) != 64:
+        sys.exit("--uri must be inbox-artifact://SPACE/SHA256")
+    if os.path.lexists(args.out):
+        sys.exit(f"{args.out} already exists")
+    status, data = call(args, "POST", f"/v1/spaces/{space}/artifacts/{sha}/download", b"{}")
+    if status != 200:
+        return finish(status, data)
+    grant = json.loads(data)
+    size = grant["artifact"]["size"]
+    # The presigned URL goes to the object store, not the inbox: no signature.
+    request = urllib.request.Request(grant["download"]["url"], method=grant["download"]["method"])
+    try:
+        with OPENER.open(request, timeout=60) as response:
+            body = response.read(size + 1)
+    except urllib.error.HTTPError as err:
+        print(f"raw_agent.py: object store returned HTTP {err.code}", file=sys.stderr)
+        return 1
+    if len(body) != size or hashlib.sha256(body).hexdigest() != sha:
+        print("raw_agent.py: downloaded bytes do not match the artifact; nothing was written", file=sys.stderr)
+        return 1
+    with open(args.out, "xb") as out:
+        out.write(body)
+    print(json.dumps({"artifact": grant["artifact"], "path": args.out}))
+    return 0
+
+
 def cmd_vectors(path):
     vectors = parse_json(open(path, encoding="utf-8").read())
     key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(vectors["seed_base64"]))
@@ -300,7 +331,7 @@ def main(argv):
             p.add_argument("--file", required=True)
             p.add_argument("--media-type", default="text/markdown")
             p.add_argument("--id")
-    for name in ("poll", "ack", "send", "spaces"):
+    for name in ("poll", "ack", "send", "spaces", "artifact-get"):
         p = sub.add_parser(name)
         connection(p)
         if name == "poll":
@@ -318,6 +349,9 @@ def main(argv):
             p.add_argument("--thread")
             p.add_argument("--reply-to", default="")
             p.add_argument("--artifact", action="append", default=[])
+        elif name == "artifact-get":
+            p.add_argument("--uri", required=True)
+            p.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.command == "vectors":
         return cmd_vectors(args.file)
@@ -331,6 +365,8 @@ def main(argv):
         return finish(*call(args, "GET", "/v1/spaces"))
     if args.command == "note":
         return cmd_note(args)
+    if args.command == "artifact-get":
+        return cmd_artifact_get(args)
     return cmd_send(args)
 
 

@@ -19,8 +19,9 @@ var validKinds = map[string]bool{
 	"ack":         true,
 }
 
-// Artifact is a reference to externally stored content. The inbox never accepts
-// artifact bytes.
+// Artifact is a reference to stored content. The inbox never accepts artifact
+// bytes in a message: a reference names either an external location or, with
+// the inbox-artifact scheme, a file stored through the inbox's object store.
 type Artifact struct {
 	URI       string `json:"uri"`
 	MediaType string `json:"media_type"`
@@ -171,6 +172,34 @@ type NoteNotice struct {
 	NoteID   string `json:"note_id"`
 	Revision int64  `json:"revision"`
 	AuthorID string `json:"author_id"`
+}
+
+// ArtifactInfo describes one artifact stored in a space. URI is the
+// inbox-artifact reference a message carries for it.
+type ArtifactInfo struct {
+	URI        string     `json:"uri"`
+	SpaceID    string     `json:"space_id"`
+	TenantID   string     `json:"tenant_id"`
+	SHA256     string     `json:"sha256"`
+	Size       int64      `json:"size"`
+	MediaType  string     `json:"media_type"`
+	State      string     `json:"state"`
+	UploadedBy string     `json:"uploaded_by"`
+	CreatedAt  time.Time  `json:"created_at"`
+	StoredAt   *time.Time `json:"stored_at,omitempty"`
+}
+
+// ArtifactTransfer is a short-lived presigned request to the object store.
+type ArtifactTransfer struct {
+	Method    string    `json:"method"`
+	URL       string    `json:"url"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type ArtifactResponse struct {
+	Artifact ArtifactInfo      `json:"artifact"`
+	Upload   *ArtifactTransfer `json:"upload,omitempty"`
+	Download *ArtifactTransfer `json:"download,omitempty"`
 }
 
 type DoorbellEvent struct {

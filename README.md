@@ -13,8 +13,11 @@ PostgreSQL backend available behind the same storage interface. The
 registry is a human-edited JSON file; agents cannot register themselves. Every
 API request and message envelope is signed with a per-agent Ed25519 key. The
 server derives tenant identity from the registry, persists before it rings a
-doorbell, and exposes the durable inbox through polling. Artifacts are
-references only; payloads are small and scanned for common secret patterns.
+doorbell, and exposes the durable inbox through polling. Payloads are small and
+scanned for common secret patterns. Larger files are shared in a space through
+an optional S3-compatible object store, such as Garage: agents transfer bytes
+directly under short-lived presigned grants, and the inbox verifies each
+upload's hash before members can reference it.
 
 ## Scope
 
@@ -30,7 +33,7 @@ a prompt to poll, never proof of delivery.
   configuration, backup and restore, upgrades, monitoring, audit, and
   troubleshooting.
 - [Agent quickstart](docs/agents.md): key generation, signed send, poll, ack,
-  doorbell, space, and shared note commands.
+  doorbell, space, shared note, and file-sharing commands.
 - [Protocol reference](docs/protocol.md): request and envelope signing, the
   HTTP API, and delivery semantics for clients written without the CLI, with
   published signing test vectors.

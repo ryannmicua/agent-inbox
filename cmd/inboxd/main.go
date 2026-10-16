@@ -64,6 +64,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("registry is not ready: %w", err)
 	}
 	config := inbox.DefaultServerConfig()
+	config.Objects, config.MaxArtifactBytes, err = configuredObjectStore()
+	if err != nil {
+		return err
+	}
+	if config.Objects == nil {
+		log.Printf("artifact uploads disabled: INBOX_OBJECT_STORE_ENDPOINT is not set")
+	}
 	config.RequestSkew = durationEnv("INBOX_REQUEST_SKEW", config.RequestSkew)
 	config.RetryInterval = retryInterval
 	config.MaxDoorbellAttempts = intEnv("INBOX_MAX_DOORBELL_ATTEMPTS", config.MaxDoorbellAttempts)
@@ -281,28 +288,74 @@ func configuredNotifier() (inbox.Notifier, error) {
 	return inbox.WebhookNotifier{URL: webhook, Client: &http.Client{Timeout: 5 * time.Second}}, nil
 }
 
-func allowsInsecureWebhookHost(host string) bool {
-	if strings.EqualFold(host, "notification-sink") {
-		return true
+// objectStoreSettings are the INBOX_OBJECT_STORE_* variables. Credentials are
+// read only from the environment, where the host's secret mechanism puts them.
+var objectStoreSettings = []string{
+	"INBOX_OBJECT_STORE_ENDPOINT", "INBOX_OBJECT_STORE_BUCKET", "INBOX_OBJECT_STORE_REGION",
+	"INBOX_OBJECT_STORE_ACCESS_KEY_ID", "INBOX_OBJECT_STORE_SECRET_ACCESS_KEY", "INBOX_OBJECT_STORE_SESSION_TOKEN",
+	"INBOX_OBJECT_STORE_MAX_BYTES",
+}
+
+// configuredObjectStore returns the artifact store, or nil when no endpoint
+// is configured, and the artifact size limit.
+func configuredObjectStore() (inbox.ObjectStore, int64, error) {
+	endpoint := os.Getenv("INBOX_OBJECT_STORE_ENDPOINT")
+	if endpoint == "" {
+		for _, name := range objectStoreSettings {
+			if os.Getenv(name) != "" {
+				return nil, 0, fmt.Errorf("%s is set but INBOX_OBJECT_STORE_ENDPOINT is not; set the endpoint or unset every INBOX_OBJECT_STORE_ setting", name)
+			}
+		}
+		return nil, inbox.DefaultMaxArtifactBytes, nil
 	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+		return nil, 0, errors.New("INBOX_OBJECT_STORE_ENDPOINT must be an absolute HTTP or HTTPS URL")
+	}
+	// Agents receive presigned URLs on this host, so it must use HTTPS unless
+	// it is on loopback.
+	if parsed.Scheme == "http" && !allowsInsecureLoopbackHost(parsed.Hostname()) {
+		return nil, 0, errors.New("INBOX_OBJECT_STORE_ENDPOINT must use HTTPS for remote hosts")
+	}
+	maxBytes := int64(inbox.DefaultMaxArtifactBytes)
+	if value := os.Getenv("INBOX_OBJECT_STORE_MAX_BYTES"); value != "" {
+		maxBytes, err = strconv.ParseInt(value, 10, 64)
+		if err != nil || maxBytes < 1 {
+			return nil, 0, errors.New("INBOX_OBJECT_STORE_MAX_BYTES must be a positive byte count")
+		}
+	}
+	store, err := inbox.NewS3ObjectStore(inbox.S3Config{
+		Endpoint: endpoint, Bucket: os.Getenv("INBOX_OBJECT_STORE_BUCKET"), Region: os.Getenv("INBOX_OBJECT_STORE_REGION"),
+		AccessKeyID: os.Getenv("INBOX_OBJECT_STORE_ACCESS_KEY_ID"), SecretAccessKey: os.Getenv("INBOX_OBJECT_STORE_SECRET_ACCESS_KEY"),
+		SessionToken: os.Getenv("INBOX_OBJECT_STORE_SESSION_TOKEN"),
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("INBOX_OBJECT_STORE settings are invalid: %w", err)
+	}
+	log.Printf("artifact store: bucket %s on %s", os.Getenv("INBOX_OBJECT_STORE_BUCKET"), store.Host())
+	return store, maxBytes, nil
+}
+
+func allowsInsecureLoopbackHost(host string) bool {
 	host = strings.TrimSuffix(host, ".")
-	if host == "" {
-		return false
-	}
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	if address, err := netip.ParseAddr(host); err == nil {
-		return address.Unmap().IsLoopback()
-	}
-	return false
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.Unmap().IsLoopback()
+}
+
+func allowsInsecureWebhookHost(host string) bool {
+	return strings.EqualFold(host, "notification-sink") || allowsInsecureLoopbackHost(host)
 }
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, `inboxd: standalone agent inbox server (SQLite or PostgreSQL)
 
 Run server with environment: INBOX_LISTEN_ADDR, INBOX_STORAGE, INBOX_DB_PATH,
-INBOX_DATABASE_URL, INBOX_REGISTRY_PATH, INBOX_WEBHOOK_URL.
+INBOX_DATABASE_URL, INBOX_REGISTRY_PATH, INBOX_WEBHOOK_URL, and optionally
+INBOX_OBJECT_STORE_ENDPOINT, _BUCKET, _REGION, _ACCESS_KEY_ID,
+_SECRET_ACCESS_KEY, _SESSION_TOKEN, and _MAX_BYTES for artifact uploads.
 Operator commands:
   inboxd healthcheck
   inboxd audit --db PATH [--limit 100]
