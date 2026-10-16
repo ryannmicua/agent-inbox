@@ -34,10 +34,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	agent := flags.String("agent", os.Getenv("INBOX_AGENT"), "registered agent id")
 	keyPath := flags.String("key", os.Getenv("INBOX_KEY"), "base64 private key file")
 	keyID := flags.String("key-id", envOr("INBOX_KEY_ID", "primary"), "registered signing key id")
+	version := flags.Bool("version", false, "print the build version and exit")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
+		return err
+	}
+	if *version {
+		_, err := fmt.Fprintln(stdout, "agent-inbox-mcp", inbox.BuildVersion())
 		return err
 	}
 	if flags.NArg() != 0 {
@@ -65,6 +70,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, `agent-inbox-mcp: MCP stdio server for one agent's inbox
 
 Usage: agent-inbox-mcp --server URL --agent ID --key PATH [--key-id ID]
+       agent-inbox-mcp --version
 
 Each flag can instead come from INBOX_SERVER, INBOX_AGENT, INBOX_KEY and
 INBOX_KEY_ID. The MCP client starts this command and speaks JSON-RPC on its

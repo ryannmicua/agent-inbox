@@ -29,32 +29,45 @@ a prompt to poll, never proof of delivery.
 
 ## Start here
 
-- [Operator guide](docs/operators.md): Compose install, registry management,
-  configuration, backup and restore, upgrades, monitoring, audit, and
-  troubleshooting.
+- [Getting started](docs/getting-started.md): install the programs, start a
+  local server, and exchange signed messages between two agents, step by
+  step. Start here if you are new.
+- [Install and run agent-inbox](docs/install.md): every install method,
+  running the server directly or with Docker Compose, connecting an MCP
+  client, and troubleshooting.
 - [Agent quickstart](docs/agents.md): key generation, signed send, poll, ack,
   doorbell, space, shared note, and file-sharing commands, and the
   `agent-inbox-mcp` adapter that offers the inbox as tools to MCP clients.
+- [Operator guide](docs/operators.md): Compose install, registry management,
+  configuration, backup and restore, upgrades, monitoring, audit, and
+  troubleshooting.
 - [Protocol reference](docs/protocol.md): request and envelope signing, the
   HTTP API, and delivery semantics for clients written without the CLI, with
   published signing test vectors.
 
 The default registry is empty. Add and review agents before exposing the
-service. For local validation, run `make test` and `make compose-smoke`.
-`make walkthrough` replays a full exchange between a Go CLI bot and a
-standalone Python bot, including a note edit conflict, an exchange through
-the MCP adapter, and revocation; it needs the Python `cryptography` package.
+service.
 
-## Build
+## Install
+
+With Go 1.24 or newer:
 
 ```sh
-go build -o inboxd ./cmd/inboxd
-go build -o agent-inbox ./cmd/agent-inbox
-go build -o agent-inbox-mcp ./cmd/agent-inbox-mcp
+go install github.com/ryannmicua/agent-inbox/cmd/...@latest
 ```
 
-The SQLite and PostgreSQL drivers are pure Go, so these binaries build without
-cgo. See the operator guide before deploying the service behind a
-TLS-terminating reverse proxy. `make compose-smoke` exercises SQLite; run
+This installs `agent-inbox`, `inboxd`, and `agent-inbox-mcp` in
+`$(go env GOPATH)/bin`. The project publishes no prebuilt binaries. See
+[Install and run agent-inbox](docs/install.md) for building from a clone,
+the `PATH` setup, and checking the installation. See the operator guide
+before deploying the service behind a TLS-terminating reverse proxy.
+
+## Development
+
+Run `make test` for the behavioral tests and `make compose-smoke` for a
+two-agent exchange through SQLite Compose. Run
 `scripts/compose-smoke.sh postgres` to test PostgreSQL Compose and its shared
-behavioral test suite.
+behavioral test suite. `make walkthrough` replays a full exchange between a
+Go CLI bot and a standalone Python bot, including a note edit conflict, an
+exchange through the MCP adapter, and revocation; it needs the Python
+`cryptography` package.

@@ -352,3 +352,15 @@ func TestSendSpaceAddressesEveryReader(t *testing.T) {
 		t.Fatalf("reader did not receive the group message: %+v (%v)", messages, err)
 	}
 }
+
+func TestVersionCommand(t *testing.T) {
+	for _, arg := range []string{"version", "--version"} {
+		var stdout bytes.Buffer
+		if err := run([]string{arg}, &stdout, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := stdout.String(), "agent-inbox "+inbox.BuildVersion()+"\n"; got != want {
+			t.Fatalf("%s printed %q, want %q", arg, got, want)
+		}
+	}
+}

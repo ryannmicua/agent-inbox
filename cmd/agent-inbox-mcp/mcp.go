@@ -7,9 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"runtime/debug"
 	"slices"
 	"sync"
+
+	"github.com/ryannmicua/agent-inbox/internal/inbox"
 )
 
 // The MCP stdio transport is newline-delimited JSON-RPC 2.0. This file holds
@@ -167,7 +168,7 @@ func dispatch(ctx context.Context, tools *adapter, req request) (any, *rpcError)
 		return map[string]any{
 			"protocolVersion": negotiated,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
-			"serverInfo":      map[string]any{"name": "agent-inbox-mcp", "version": buildVersion()},
+			"serverInfo":      map[string]any{"name": "agent-inbox-mcp", "version": inbox.BuildVersion()},
 			"instructions":    serverInstructions,
 		}, nil
 	case "ping":
@@ -226,11 +227,4 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 		}
 		return bytes.TrimRight(line, "\r\n"), nil
 	}
-}
-
-func buildVersion() string {
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
-		return info.Main.Version
-	}
-	return "(devel)"
 }

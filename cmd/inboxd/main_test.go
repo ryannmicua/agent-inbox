@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"io"
 	"net"
@@ -287,5 +288,18 @@ func TestConfiguredObjectStoreValidatesSettings(t *testing.T) {
 	t.Setenv("INBOX_OBJECT_STORE_MAX_BYTES", "1048576")
 	if store, maxBytes, err := configuredObjectStore(); err != nil || store == nil || maxBytes != 1<<20 {
 		t.Fatalf("loopback HTTP store = %v %d %v", store, maxBytes, err)
+	}
+}
+
+func TestVersionCommandStartsNoServer(t *testing.T) {
+	t.Setenv("INBOX_WEBHOOK_URL", "")
+	for _, arg := range []string{"version", "--version"} {
+		var stdout bytes.Buffer
+		if err := run([]string{arg}, &stdout, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := stdout.String(), "inboxd "+inbox.BuildVersion()+"\n"; got != want {
+			t.Fatalf("%s printed %q, want %q", arg, got, want)
+		}
 	}
 }
