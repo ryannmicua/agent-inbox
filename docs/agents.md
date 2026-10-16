@@ -81,9 +81,11 @@ extension:
 agent-inbox artifact-ref --file report.pdf --uri https://files.example.com/report.pdf
 ```
 
-The artifact URI, media type, hash, and byte size are metadata only. The inbox
-does not upload or fetch artifact bytes. Do not put credentials or secrets in
-payloads, provenance, or artifact URLs.
+The artifact URI, media type, hash, and byte size are metadata only: the inbox
+does not fetch that URL. To share the file itself with a space, upload it
+through the inbox instead (see
+[section 9](#9-share-a-file-with-a-space)). Do not put credentials or secrets
+in payloads, provenance, or artifact URLs.
 
 ## 3. Poll and process before acknowledging
 
@@ -243,6 +245,53 @@ When another member writes a revision, you get one notice in your inbox:
 itself is written by the server and carries no signature. Acknowledge it like
 any message. A revision whose author has since been revoked reads with
 `"author_status":"revoked"`.
+
+## 9. Share a file with a space
+
+When the operator has configured an object store, a member holding
+`artifact.put` can upload a file to a space, and members holding
+`artifact.get` can download it. The bytes go straight to and from the store
+under grants that last minutes; the inbox checks the upload before anyone can
+reference it.
+
+```sh
+agent-inbox artifact put \
+  --server https://inbox.example.com \
+  --agent agent-a \
+  --key agent-a.key \
+  --space release-notes \
+  --file plan.md
+```
+
+```json
+{"artifact":{"uri":"inbox-artifact://release-notes/<sha256>","space_id":"release-notes","sha256":"<sha256>","size":1432,"media_type":"text/markdown","state":"available",…},"artifact_ref":"inbox-artifact://release-notes/<sha256>|text/markdown|<sha256>|1432"}
+```
+
+The command hashes the file, asks for an upload grant, uploads, and asks the
+inbox to verify the stored bytes. Pass `artifact_ref` to `send --space
+release-notes --artifact` to point the space's members at the file. A file
+already stored in the space is not uploaded again. The media type comes from
+`--media-type`, or else from the file extension.
+
+A member that receives a message with an `inbox-artifact://` reference
+downloads it with:
+
+```sh
+agent-inbox artifact get \
+  --server https://inbox.example.com \
+  --agent agent-b \
+  --key agent-b.key \
+  --uri 'inbox-artifact://release-notes/<sha256>' \
+  --out plan.md
+```
+
+`get` writes `--out` only if the downloaded size and SHA-256 match the
+artifact, and never overwrites an existing file. The content is still
+untrusted data. A reference must point to a stored file in the message's own
+space, so `send` rejects it with `artifact_not_available` until the upload is
+complete. If the operator removes you from the space or takes away
+`artifact.get`, new downloads are refused at once. An inbox with no object
+store returns `artifacts_disabled`.
 
 Set `INBOX_SERVER`, `INBOX_AGENT`, `INBOX_KEY`, and optionally `INBOX_KEY_ID` to
 avoid repeating those flags. Key material stays on the agent machine; requests

@@ -18,12 +18,13 @@ import (
 )
 
 var (
-	ErrMessageNotFound = errors.New("message not found")
-	ErrNotRecipient    = errors.New("agent is not the message recipient")
-	ErrNotMember       = errors.New("agent no longer reads the message's space")
-	ErrWrongTenant     = errors.New("message belongs to another tenant")
-	ErrMessageConflict = errors.New("message id already exists with different content")
-	ErrReplay          = errors.New("request nonce already used")
+	ErrMessageNotFound  = errors.New("message not found")
+	ErrNotRecipient     = errors.New("agent is not the message recipient")
+	ErrNotMember        = errors.New("agent no longer reads the message's space")
+	ErrWrongTenant      = errors.New("message belongs to another tenant")
+	ErrMessageConflict  = errors.New("message id already exists with different content")
+	ErrReplay           = errors.New("request nonce already used")
+	ErrArtifactNotFound = errors.New("artifact not found")
 )
 
 const requestNonceRetention = 24 * time.Hour
@@ -107,7 +108,42 @@ type Store interface {
 	// ListNoteRevisions returns a note's revisions newest first, or
 	// ErrNoteNotFound.
 	ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error)
+	// GetArtifact returns one artifact recorded in a tenant's space, or
+	// ErrArtifactNotFound.
+	GetArtifact(ctx context.Context, tenant, space, sha256 string) (ArtifactRecord, error)
+	// GrantArtifactUpload records a pending upload and its audit row in one
+	// transaction; a pending row takes the new size, media type, and uploader.
+	// An available artifact is returned unchanged and nothing is written.
+	GrantArtifactUpload(context.Context, ArtifactRecord, AuditRecord) (ArtifactRecord, error)
+	// MarkArtifactStored makes a pending artifact available and appends its
+	// audit row in one transaction. It reports whether this call made the
+	// transition.
+	MarkArtifactStored(ctx context.Context, tenant, space, sha256 string, now time.Time, audit AuditRecord) (bool, error)
+	// DiscardArtifactUpload removes a pending artifact and appends its audit
+	// row in one transaction. An available artifact is kept.
+	DiscardArtifactUpload(ctx context.Context, tenant, space, sha256 string, audit AuditRecord) error
 	Close() error
+}
+
+// Artifact states: an upload is pending until the inbox has re-read the
+// object from its own store and found the declared hash and size.
+const (
+	ArtifactPending   = "pending"
+	ArtifactAvailable = "available"
+)
+
+// ArtifactRecord is one content-addressed file in a space. Its object lives
+// in the configured object store under ArtifactObjectKey.
+type ArtifactRecord struct {
+	TenantID   string
+	SpaceID    string
+	SHA256     string
+	Size       int64
+	MediaType  string
+	State      string
+	UploadedBy string
+	CreatedAt  time.Time
+	StoredAt   *time.Time
 }
 
 // RecordedRegistry is the last observed registry: its hash and the parsed
@@ -298,6 +334,18 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TRIGGER IF NOT EXISTS note_revisions_no_update BEFORE UPDATE ON note_revisions BEGIN SELECT RAISE(ABORT, 'note revisions are append-only'); END`,
 		`CREATE TRIGGER IF NOT EXISTS note_revisions_no_delete BEFORE DELETE ON note_revisions BEGIN SELECT RAISE(ABORT, 'note revisions are append-only'); END`,
+		`CREATE TABLE IF NOT EXISTS artifacts (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			sha256 TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			media_type TEXT NOT NULL,
+			state TEXT NOT NULL CHECK (state IN ('pending', 'available')),
+			uploaded_by TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			stored_at TEXT,
+			PRIMARY KEY(tenant_id, space_id, sha256)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -790,6 +838,98 @@ func (s *SQLiteStore) GetNoteRevision(ctx context.Context, tenant, space, note s
 
 func (s *SQLiteStore) ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error) {
 	return sqliteNotes.list(ctx, s.db, tenant, space, note, limit)
+}
+
+const artifactColumns = `tenant_id, space_id, sha256, size, media_type, state, uploaded_by, created_at, stored_at`
+
+func (s *SQLiteStore) GetArtifact(ctx context.Context, tenant, space, sha string) (ArtifactRecord, error) {
+	return scanArtifact(s.db.QueryRowContext(ctx, `SELECT `+artifactColumns+` FROM artifacts WHERE tenant_id = ? AND space_id = ? AND sha256 = ?`, tenant, space, sha))
+}
+
+func (s *SQLiteStore) GrantArtifactUpload(ctx context.Context, record ArtifactRecord, audit AuditRecord) (ArtifactRecord, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO artifacts(tenant_id, space_id, sha256, size, media_type, state, uploaded_by, created_at)
+		VALUES(?, ?, ?, ?, ?, 'pending', ?, ?)
+		ON CONFLICT(tenant_id, space_id, sha256) DO UPDATE SET size = excluded.size, media_type = excluded.media_type, uploaded_by = excluded.uploaded_by
+		WHERE artifacts.state = 'pending'`,
+		record.TenantID, record.SpaceID, record.SHA256, record.Size, record.MediaType, record.UploadedBy, record.CreatedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	if updated, err := result.RowsAffected(); err != nil {
+		return ArtifactRecord{}, err
+	} else if updated == 1 {
+		if err := insertAudit(ctx, tx, audit, record.CreatedAt); err != nil {
+			return ArtifactRecord{}, err
+		}
+	}
+	stored, err := scanArtifact(tx.QueryRowContext(ctx, `SELECT `+artifactColumns+` FROM artifacts WHERE tenant_id = ? AND space_id = ? AND sha256 = ?`, record.TenantID, record.SpaceID, record.SHA256))
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	return stored, tx.Commit()
+}
+
+func (s *SQLiteStore) MarkArtifactStored(ctx context.Context, tenant, space, sha string, now time.Time, audit AuditRecord) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE artifacts SET state = 'available', stored_at = ? WHERE tenant_id = ? AND space_id = ? AND sha256 = ? AND state = 'pending'`,
+		now.UTC().Format(time.RFC3339Nano), tenant, space, sha)
+	if err != nil {
+		return false, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated == 0 {
+		return false, err
+	}
+	if err := insertAudit(ctx, tx, audit, now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *SQLiteStore) DiscardArtifactUpload(ctx context.Context, tenant, space, sha string, audit AuditRecord) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM artifacts WHERE tenant_id = ? AND space_id = ? AND sha256 = ? AND state = 'pending'`, tenant, space, sha); err != nil {
+		return err
+	}
+	if err := insertAudit(ctx, tx, audit, time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func scanArtifact(row rowScanner) (ArtifactRecord, error) {
+	var record ArtifactRecord
+	var created, stored any
+	if err := row.Scan(&record.TenantID, &record.SpaceID, &record.SHA256, &record.Size, &record.MediaType, &record.State, &record.UploadedBy, &created, &stored); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ArtifactRecord{}, ErrArtifactNotFound
+		}
+		return ArtifactRecord{}, err
+	}
+	var err error
+	if record.CreatedAt, err = parseDatabaseTime(created); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if stored != nil {
+		parsed, err := parseDatabaseTime(stored)
+		if err != nil {
+			return ArtifactRecord{}, err
+		}
+		record.StoredAt = &parsed
+	}
+	return record, nil
 }
 
 type rowScanner interface{ Scan(...any) error }

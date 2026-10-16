@@ -159,6 +159,18 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`CREATE TRIGGER note_revisions_no_update BEFORE UPDATE ON note_revisions FOR EACH ROW EXECUTE FUNCTION agent_inbox_reject_note_revision_mutation()`,
 		`DROP TRIGGER IF EXISTS note_revisions_no_delete ON note_revisions`,
 		`CREATE TRIGGER note_revisions_no_delete BEFORE DELETE ON note_revisions FOR EACH ROW EXECUTE FUNCTION agent_inbox_reject_note_revision_mutation()`,
+		`CREATE TABLE IF NOT EXISTS artifacts (
+			tenant_id TEXT NOT NULL,
+			space_id TEXT NOT NULL,
+			sha256 TEXT NOT NULL,
+			size BIGINT NOT NULL,
+			media_type TEXT NOT NULL,
+			state TEXT NOT NULL CHECK (state IN ('pending', 'available')),
+			uploaded_by TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			stored_at TIMESTAMPTZ,
+			PRIMARY KEY(tenant_id, space_id, sha256)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -539,6 +551,73 @@ func (s *PostgresStore) GetNoteRevision(ctx context.Context, tenant, space, note
 
 func (s *PostgresStore) ListNoteRevisions(ctx context.Context, tenant, space, note string, limit int) ([]StoredNoteRevision, error) {
 	return postgresNotes.list(ctx, s.db, tenant, space, note, limit)
+}
+
+func (s *PostgresStore) GetArtifact(ctx context.Context, tenant, space, sha string) (ArtifactRecord, error) {
+	return scanArtifact(s.db.QueryRowContext(ctx, `SELECT `+artifactColumns+` FROM artifacts WHERE tenant_id = $1 AND space_id = $2 AND sha256 = $3`, tenant, space, sha))
+}
+
+func (s *PostgresStore) GrantArtifactUpload(ctx context.Context, record ArtifactRecord, audit AuditRecord) (ArtifactRecord, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO artifacts(tenant_id, space_id, sha256, size, media_type, state, uploaded_by, created_at)
+		VALUES($1, $2, $3, $4, $5, 'pending', $6, $7)
+		ON CONFLICT(tenant_id, space_id, sha256) DO UPDATE SET size = excluded.size, media_type = excluded.media_type, uploaded_by = excluded.uploaded_by
+		WHERE artifacts.state = 'pending'`,
+		record.TenantID, record.SpaceID, record.SHA256, record.Size, record.MediaType, record.UploadedBy, record.CreatedAt.UTC())
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	if updated, err := result.RowsAffected(); err != nil {
+		return ArtifactRecord{}, err
+	} else if updated == 1 {
+		if err := insertPostgresAudit(ctx, tx, audit, record.CreatedAt); err != nil {
+			return ArtifactRecord{}, err
+		}
+	}
+	stored, err := scanArtifact(tx.QueryRowContext(ctx, `SELECT `+artifactColumns+` FROM artifacts WHERE tenant_id = $1 AND space_id = $2 AND sha256 = $3`, record.TenantID, record.SpaceID, record.SHA256))
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	return stored, tx.Commit()
+}
+
+func (s *PostgresStore) MarkArtifactStored(ctx context.Context, tenant, space, sha string, now time.Time, audit AuditRecord) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE artifacts SET state = 'available', stored_at = $1 WHERE tenant_id = $2 AND space_id = $3 AND sha256 = $4 AND state = 'pending'`,
+		now.UTC(), tenant, space, sha)
+	if err != nil {
+		return false, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated == 0 {
+		return false, err
+	}
+	if err := insertPostgresAudit(ctx, tx, audit, now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *PostgresStore) DiscardArtifactUpload(ctx context.Context, tenant, space, sha string, audit AuditRecord) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM artifacts WHERE tenant_id = $1 AND space_id = $2 AND sha256 = $3 AND state = 'pending'`, tenant, space, sha); err != nil {
+		return err
+	}
+	if err := insertPostgresAudit(ctx, tx, audit, time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type postgresStateError interface {

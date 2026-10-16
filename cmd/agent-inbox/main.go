@@ -38,6 +38,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if args[0] == "note" {
 		return runNote(args[1:], stdout, stderr)
 	}
+	if args[0] == "artifact" {
+		return runArtifact(args[1:], stdout, stderr)
+	}
 	command := args[0]
 	if command != "send" && command != "poll" && command != "ack" && command != "wait" && command != "spaces" {
 		return fmt.Errorf("unknown command %q (run agent-inbox help)", args[0])
@@ -292,6 +295,10 @@ Commands:
                                          (list revisions, newest first)
   artifact-ref --file PATH --uri URI [--media-type TYPE]
                                          (print an --artifact value with sha256 and size)
+  artifact put --space ID --file PATH [--media-type TYPE]
+                                         (upload a file to a space; prints its artifact_ref)
+  artifact get (--space ID --sha256 HASH | --uri inbox-artifact://ID/HASH) --out PATH
+                                         (download, verify sha256 and size, then write PATH)
 
 Each API command requires --agent and --key, or INBOX_AGENT and INBOX_KEY.
 The doorbell only prompts; poll for durable delivery and acknowledge after processing.`)

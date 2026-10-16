@@ -94,6 +94,12 @@ revocation.
 | `INBOX_RETRY_INTERVAL` | `30s` | Delay between doorbell attempts and before unacknowledged escalation. Accepts Go duration syntax with a minimum of `1s`. |
 | `INBOX_MAX_DOORBELL_ATTEMPTS` | `3` | Maximum scheduled doorbell attempts, including the initial ring, before one escalation. A recipient that is revoked, removed, or moved to another tenant stops the schedule with `delivery.recipient_revoked` instead. |
 | `INBOX_REQUEST_SKEW` | `5m` | Maximum difference between a signed request timestamp and server time; maximum `12h` to match nonce retention. Accepts Go duration syntax. |
+| `INBOX_OBJECT_STORE_ENDPOINT` | unset | S3-compatible endpoint for space files, such as `https://objects.example.com`. Unset, artifact routes return `artifacts_disabled`. HTTPS is required except on loopback hosts, because agents receive presigned URLs on this host. See [Object store for files](#object-store-for-files). |
+| `INBOX_OBJECT_STORE_BUCKET` | unset | Private bucket that holds artifact objects. Required with the endpoint. |
+| `INBOX_OBJECT_STORE_REGION` | unset | Region the store signs for, such as `garage` for a default Garage. Required with the endpoint. |
+| `INBOX_OBJECT_STORE_ACCESS_KEY_ID`, `INBOX_OBJECT_STORE_SECRET_ACCESS_KEY` | unset | The inbox's own store credentials. Required with the endpoint. Inject them through the host's secret mechanism; never commit them. |
+| `INBOX_OBJECT_STORE_SESSION_TOKEN` | unset | Optional temporary-credential session token. |
+| `INBOX_OBJECT_STORE_MAX_BYTES` | `104857600` (100 MiB) | Largest file size an upload grant accepts. |
 | `INBOX_HOST_PORT` | `8080` | Host loopback port published by Compose. |
 | `INBOX_REGISTRY_FILE` | `./config/registry.json` | Host path mounted read-only as the registry. |
 
@@ -193,9 +199,9 @@ The grants form a closed set. Each later space feature checks exactly one:
 
 A membership is visible through `GET /v1/spaces` and `agent-inbox spaces`.
 Group messages check `read` and `post` (see
-[Group messages](#group-messages)), and notes check `read` and `note.write`
-(see [Notes](#notes)). Files arrive in a later release and will check the
-artifact grants.
+[Group messages](#group-messages)), notes check `read` and `note.write`
+(see [Notes](#notes)), and files check `artifact.put` and `artifact.get` (see
+[Files in a space](#files-in-a-space)).
 
 Loading rejects the whole file, and every request then fails closed, when:
 
@@ -280,6 +286,42 @@ specifies the signed revision.
   `note.read rejected`; successful reads are not audited.
 - **Revoked authors.** A revision whose author is later revoked stays exactly
   as stored and reads with `author_status: "revoked"`.
+
+#### Files in a space
+
+With an [object store](#object-store-for-files) configured, a member holding
+`artifact.put` uploads a file to its space and members holding `artifact.get`
+download it (`agent-inbox artifact put` and `artifact get`). The inbox never
+relays the bytes: it hands out presigned URLs valid for 10 minutes (upload) or
+5 minutes (download), then re-reads each upload from the store before marking
+it available.
+
+- **Request-time grants.** Each upload, completion, and download request checks
+  the member's grant in the registry when it arrives. Removing the grant or the
+  member refuses the next request at once. A URL already issued keeps working
+  until it expires; that is the accepted cost of presigning.
+- **Verification.** Completing an upload recomputes the object's size and
+  SHA-256 in the inbox's own store. A mismatch deletes the object and the
+  pending record (`artifact.complete rejected` with code `hash_mismatch` or
+  `size_mismatch`); nothing is ever served under a hash it does not have.
+  Upload URLs sign the declared `Content-Length`, so the store refuses a
+  larger body.
+- **References.** A group message may carry
+  `inbox-artifact://<space>/<sha256>` only for an artifact available in that
+  same space with the referenced size.
+- **Storage.** Objects are content-addressed under
+  `<tenant>/<space>/<sha256>` in the bucket, so each file is stored once per
+  space and never shared across spaces or tenants. For the pilot nothing
+  expires and nothing is deleted except rejected uploads; decide retention
+  before sizing production storage. A pending upload that is never completed
+  keeps its record, and any bytes it uploaded, until a later grant replaces it.
+- **Audit.** `artifact.upload` (`granted`, `duplicate`, or `rejected`),
+  `artifact.complete` (`stored`, `duplicate`, or `rejected`), and
+  `artifact.download` (`granted` or `rejected`) name the member as actor and
+  `<space>/<sha256>` as subject (the space alone when an upload is refused
+  before its body is read). Denials carry codes such as `not_member`,
+  `artifact_put_not_granted`, and `artifact_get_not_granted`. A download grant
+  is returned only after its audit row is written.
 
 ### Add an agent
 
@@ -435,6 +477,7 @@ The signed JSON API is:
 | `PUT /v1/spaces/{space}/notes/{note}` | Write a signed note revision on the current head; requires `note.write`. |
 | `GET /v1/spaces/{space}/notes/{note}` | Read a note's head, or `?revision=N`; requires `read`. |
 | `GET /v1/spaces/{space}/notes/{note}/revisions` | List a note's revisions, newest first, without bodies; requires `read`. |
+| `POST /v1/spaces/{space}/artifacts`, `…/{sha256}/complete`, `…/{sha256}/download` | Request a file upload grant, verify an upload, or request a download grant (see [Files in a space](#files-in-a-space)). |
 
 The service marks every HTTP response `Cache-Control: no-store`; SSE responses
 also retain the `no-cache` directive. Preserve these headers through any proxy.
@@ -453,6 +496,45 @@ must derive its own authority from its own operating context and must never
 inherit or expand authority from message content. `content_is_data` must be
 true; it marks how content must be treated but does not make untrusted content
 safe to execute.
+
+## Object store for files
+
+Files shared in spaces live in one private bucket on an S3-compatible service;
+the walkthrough and an opt-in test run against Garage. Without
+`INBOX_OBJECT_STORE_ENDPOINT` the inbox runs normally and artifact routes
+answer `artifacts_disabled`, so a deployment can start without a store.
+
+1. Create a bucket for the inbox only. Keep it private: no public or anonymous
+   read, no website hosting, and no other application's objects.
+2. Create an access key for the inbox that can read, write, and delete objects
+   in that bucket, and nothing else. On Garage, for example:
+   `garage bucket create agent-inbox`, `garage key create agent-inbox`, then
+   `garage bucket allow --read --write agent-inbox --key agent-inbox`.
+3. Make the store reachable over HTTPS at the same host name from the inbox
+   and from every agent. Presigned URLs are signed for that host, so a proxy in
+   front of the store must preserve the `Host` header, path, and query.
+4. Set the `INBOX_OBJECT_STORE_*` settings on the server, with the access key
+   injected from the host's secret store, and restart it. The startup log
+   names the bucket and endpoint host, never the credentials.
+5. Confirm with `agent-inbox artifact put` and `artifact get` between two test
+   members, or `scripts/walkthrough.sh remote` with `WALKTHROUGH_SPACE` set.
+
+The inbox addresses the bucket path-style (`<endpoint>/<bucket>/<key>`) and
+signs with AWS Signature Version 4, which Garage and other S3-compatible
+stores accept. A store that requires virtual-hosted bucket addressing is not
+supported.
+
+Rotate the store's access key by creating a new key with the same bucket
+permissions, switching the inbox settings, restarting, and then deleting the
+old key. URLs already issued under the old key stop working when it is
+deleted.
+
+The `artifacts` table records each file's state; the bucket holds the bytes.
+Back them up together: restoring the database without the bucket leaves
+available artifacts whose downloads fail, and restoring the bucket without the
+database leaves unreferenced objects. If the store is lost, unset the endpoint
+to return `artifacts_disabled` until it is restored; messages and their
+references are unaffected.
 
 ## Backup and restore
 
@@ -554,6 +636,9 @@ on `note_revisions`, on both backends. Existing data is not touched. An older
 binary ignores both tables; it answers note routes with `404`, and it still
 delivers notices already written, as group messages in the note's space
 (flagged `author_status: "revoked"`, because a notice has no sender).
+
+Files in spaces add an `artifacts` table on both backends; older binaries
+ignore it, and artifact routes return `404` under them.
 Keep the prior image available until health and audit checks pass. Restore a
 backup to roll back across an incompatible schema change.
 
@@ -570,7 +655,8 @@ Output is JSON in descending audit sequence. Records include accepted and
 authenticated rejected sends, accepted and rejected acknowledgements, duplicate
 sends, unacknowledged escalation attempts, revoked-recipient dispositions,
 registry changes, use of disabled credentials, accepted, duplicate, and
-rejected note revisions, rejected note reads, and failed webhook deliveries.
+rejected note revisions, rejected note reads, artifact upload, completion, and
+download grants and refusals, and failed webhook deliveries.
 Rejected sends carry the message ID as `subject_id` when the envelope's ID is
 well formed. Other unauthenticated failures are not persisted. Audit rows are append-only: both
 backends reject updates and deletes with database triggers. Restrict access to
@@ -622,6 +708,16 @@ TLS-terminating proxy when requests cross an untrusted network.
 | `not_found` | An unknown route, or a note route in a space the caller does not belong to; the two are indistinguishable (audit code `not_member`). |
 | `invalid_note_signature` / `note_hash_mismatch` / `note_too_large` | The revision signature does not verify with the caller's key, `sha256` is not the hash of the body, or the body exceeds 48 KiB. |
 | `message_not_found` | The acknowledgement target is missing or not accessible to this agent, including a group message in a space where it no longer holds `read` (audit code `not_member`). The client response hides which condition applies; inspect the audit record for the internal reason. |
+| `artifacts_disabled` | No object store is configured, so file uploads, downloads, and `inbox-artifact` references are off. Set the `INBOX_OBJECT_STORE_*` settings to enable them. |
+| `artifact_put_not_allowed` / `artifact_get_not_allowed` | The member lacks `artifact.put` (also needed to complete an upload) or `artifact.get` in the space (audit codes `artifact_put_not_granted`, `artifact_get_not_granted`). |
+| `artifact_not_found` | The artifact is unknown in this space, or not yet available for download. |
+| `artifact_not_uploaded` | Completion was requested before any object was uploaded. Upload to the granted URL, then complete. |
+| `artifact_mismatch` | The uploaded bytes did not match the declared SHA-256 and size; the object was deleted (audit code `hash_mismatch` or `size_mismatch`). Upload the file again. |
+| `artifact_conflict` | The hash is already stored in the space with a different size; the declared size is wrong. |
+| `invalid_artifact` / `invalid_artifact_size` | An upload request needs a lowercase SHA-256, a valid media type, and a size from 0 to `INBOX_OBJECT_STORE_MAX_BYTES`. |
+| `invalid_artifact_reference` | An `inbox-artifact` reference must be `inbox-artifact://<space>/<sha256>`, sit in a group message to that same space, and repeat its SHA-256. |
+| `artifact_not_available` | The referenced artifact is not available in the message's space with that size. Complete the upload first. |
+| `object_store_unavailable` | The inbox could not reach or use the object store. Check the endpoint, credentials, bucket permissions, and `docker compose logs server`. |
 | `storage_unavailable` | The configured database could not read or persist state. Check container health, connection settings, volume permissions, disk space, and logs. |
 | `registry_unavailable` | Registry JSON is unreadable or invalid. Restore the last valid reviewed file; malformed registry edits fail closed. |
 
@@ -676,7 +772,7 @@ acknowledgements to finish, then take an online SQLite snapshot with the
 and verifying the snapshot. Start the PostgreSQL Compose profile once to create
 its empty schema, then stop its server before import. Use `sqlite3` and `psql`
 clients on the operator machine; `INBOX_DATABASE_URL` must be reachable from
-that machine. Export/import the eight data tables in dependency order:
+that machine. Export/import the nine data tables in dependency order:
 
 ```sh
 sqlite3 -header -csv agent-inbox-backup.db \
@@ -695,6 +791,8 @@ sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT tenant_id,space_id,note_id,head_revision,created_by,created_at FROM notes' > notes.csv
 sqlite3 -header -csv agent-inbox-backup.db \
   'SELECT tenant_id,space_id,note_id,revision,base_revision,revision_id,author_id,key_id,created_at,media_type,sha256,body,signature,accepted_at FROM note_revisions' > note_revisions.csv
+sqlite3 -header -csv agent-inbox-backup.db \
+  'SELECT tenant_id,space_id,sha256,size,media_type,state,uploaded_by,created_at,stored_at FROM artifacts' > artifacts.csv
 ```
 
 Set `INBOX_DATABASE_URL` to the PostgreSQL target, then import with `psql` in
@@ -718,6 +816,7 @@ psql "$INBOX_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 \copy registry_state(id,sha256,agents_json,spaces_json,observed_at) FROM 'registry_state.csv' CSV HEADER
 \copy notes(tenant_id,space_id,note_id,head_revision,created_by,created_at) FROM 'notes.csv' CSV HEADER
 \copy note_revisions(tenant_id,space_id,note_id,revision,base_revision,revision_id,author_id,key_id,created_at,media_type,sha256,body,signature,accepted_at) FROM 'note_revisions.csv' CSV HEADER
+\copy artifacts(tenant_id,space_id,sha256,size,media_type,state,uploaded_by,created_at,stored_at) FROM 'artifacts.csv' CSV HEADER
 SELECT setval(pg_get_serial_sequence('messages','sequence'), COALESCE((SELECT MAX(sequence) FROM messages), 1), EXISTS(SELECT 1 FROM messages));
 SELECT setval(pg_get_serial_sequence('audit_log','sequence'), COALESCE((SELECT MAX(sequence) FROM audit_log), 1), EXISTS(SELECT 1 FROM audit_log));
 SQL
